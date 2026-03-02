@@ -2608,20 +2608,23 @@ class DeepseekV2Model(nn.Module):
         if (
             _use_aiter_gfx95
             and config.n_routed_experts == 256
-            and not isinstance(self.embed_tokens, PPMissingLayer) 
+            and not isinstance(self.embed_tokens, PPMissingLayer)
             and self.embed_tokens.embedding_dim == 7168
         ):
             num_moe_layers = sum(
                 [
                     1
                     for i in range(len(self.layers))
-                    if not isinstance(self.layers[i], PPMissingLayer) and isinstance(self.layers[i].mlp, DeepseekV2MoE)
+                    if not isinstance(self.layers[i], PPMissingLayer)
+                    and isinstance(self.layers[i].mlp, DeepseekV2MoE)
                 ]
             )
 
             allocate_size = 0
             for i in range(len(self.layers)):
-                if not isinstance(self.layers[i], PPMissingLayer) and isinstance(self.layers[i].mlp, DeepseekV2MoE):
+                if not isinstance(self.layers[i], PPMissingLayer) and isinstance(
+                    self.layers[i].mlp, DeepseekV2MoE
+                ):
                     # tp_size = get_tensor_model_parallel_world_size()
                     a2a_backend = get_moe_a2a_backend()
                     is_a2a_moe = (
