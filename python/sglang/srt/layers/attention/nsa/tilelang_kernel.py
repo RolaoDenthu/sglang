@@ -1066,34 +1066,29 @@ def tilelang_sparse_fwd(
     return kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
 
 
-@tilelang.jit(out_idx=[4], pass_configs=pass_configs)
-def fp8_dequant_paged_kernel(dim_nope=512, dim_rope=64, group_size=128):
-    """Dequantize paged FP8 KV cache to BF16."""
+@tilelang.jit(out_idx=[3], pass_configs=pass_configs)
+def fp8_dequant_kernel(dim_nope=512, dim_rope=64, group_size=128):
+    """Dequantize contiguous FP8 KV data to BF16 (no page indirection)."""
     num_tokens = T.symbolic("num_tokens")
-    pool_size = T.symbolic("pool_size")
     num_tiles = dim_nope // group_size
 
     @T.prim_func
-    def fp8_dequant_paged_(
-        nope_fp8: T.Tensor[(pool_size, dim_nope), FP8],
-        nope_scale: T.Tensor[(pool_size, num_tiles), FP32],
-        rope_bf16: T.Tensor[(pool_size, dim_rope), BF16],
-        page_indices: T.Tensor[(num_tokens,), "int32"],
+    def fp8_dequant_(
+        nope_fp8: T.Tensor[(num_tokens, dim_nope), FP8],
+        nope_scale: T.Tensor[(num_tokens, num_tiles), FP32],
+        rope_bf16: T.Tensor[(num_tokens, dim_rope), BF16],
         output: T.Tensor[(num_tokens, dim_nope + dim_rope), BF16],
     ):
         with T.Kernel(num_tokens, threads=128) as (pid,):
             for tile in T.serial(num_tiles):
                 for j in T.Parallel(group_size):
                     col = tile * group_size + j
-                    output[pid, col] = (
-                        nope_fp8[page_indices[pid], col]
-                        * nope_scale[page_indices[pid], tile]
-                    )
+                    output[pid, col] = nope_fp8[pid, col] * nope_scale[pid, tile]
 
             for j in T.Parallel(dim_rope):
-                output[pid, dim_nope + j] = rope_bf16[page_indices[pid], j]
+                output[pid, dim_nope + j] = rope_bf16[pid, j]
 
-    return fp8_dequant_paged_
+    return fp8_dequant_
 
 
 def fp8_dequant_paged(
@@ -1119,18 +1114,18 @@ def fp8_dequant_paged(
     dim_rope = 64
     num_tiles = dim_nope // group_size
 
-    nope_fp8 = kv_cache_flat[:, :dim_nope].contiguous()
+    selected = torch.index_select(kv_cache_flat, 0, page_indices)
+    nope_fp8 = selected[:, :dim_nope].contiguous()
     nope_scale = (
-        kv_cache_flat[:, dim_nope : dim_nope + num_tiles * 4]
+        selected[:, dim_nope : dim_nope + num_tiles * 4]
         .view(torch.float32)
         .contiguous()
     )
     rope_bf16 = (
-        kv_cache_flat[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16).contiguous()
+        selected[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16).contiguous()
     )
 
-    kernel = fp8_dequant_paged_kernel(dim_nope, dim_rope, group_size)
-    output = kernel(nope_fp8, nope_scale, rope_bf16, page_indices)
-
     num_tokens = page_indices.shape[0]
+    kernel = fp8_dequant_kernel(dim_nope, dim_rope, group_size)
+    output = kernel(nope_fp8, nope_scale, rope_bf16)
     return output.view(num_tokens, 1, dim_nope + dim_rope)

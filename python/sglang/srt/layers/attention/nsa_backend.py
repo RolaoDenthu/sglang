@@ -1813,14 +1813,18 @@ class NativeSparseAttnBackend(
                 fp8_dequant_paged,
             )
 
-            page_table_flat = page_table_1[page_table_1 >= 0]
-            kv_cache = fp8_dequant_paged(kv_cache, page_table_flat)
-            valid_mask = page_table_1 >= 0
-            remapped = torch.full_like(page_table_1, -1)
-            remapped[valid_mask] = torch.arange(
-                valid_mask.sum(), device=page_table_1.device, dtype=page_table_1.dtype
+            orig_shape = page_table_1.shape
+            flat_indices = page_table_1.reshape(-1)
+            safe_indices = flat_indices.clamp(min=0)
+
+            kv_cache = fp8_dequant_paged(kv_cache, safe_indices)
+
+            num_flat = flat_indices.shape[0]
+            arange_idx = torch.arange(
+                num_flat, device=flat_indices.device, dtype=flat_indices.dtype
             )
-            page_table_1 = remapped
+            remapped = torch.where(flat_indices >= 0, arange_idx, -1)
+            page_table_1 = remapped.view(orig_shape)
 
         return tilelang_sparse_fwd(
             q=q_all,
