@@ -1066,6 +1066,55 @@ def tilelang_sparse_fwd(
     return kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
 
 
+def fp8_quant_kv_cache_separate(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    group_size: int = 128,
+) -> tuple:
+    """Tilelang-based KV cache quantization, drop-in replacement for quantize_k_cache_separate.
+
+    Uses the existing tilelang act_quant kernel for nope FP8 quantization
+    and copies rope as raw BF16 bytes.
+
+    Args:
+        k_nope: (num_tokens, dim_nope) or (num_tokens, 1, dim_nope), BF16
+        k_rope: (num_tokens, dim_rope) or (num_tokens, 1, dim_rope), BF16
+        group_size: quantization tile size (default 128)
+
+    Returns:
+        Tuple of (nope_part_u8, rope_part_u8):
+        - nope_part_u8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
+        - rope_part_u8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
+    """
+    k_nope_2d = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
+    k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
+
+    num_tokens = k_nope_2d.shape[0]
+    dim_nope = k_nope_2d.shape[1]
+    dim_rope = k_rope_2d.shape[1]
+    assert dim_nope == 512, f"Expected dim_nope=512, got {dim_nope}"
+    assert dim_rope == 64, f"Expected dim_rope=64, got {dim_rope}"
+
+    k_nope_2d = k_nope_2d.contiguous()
+    k_rope_2d = k_rope_2d.contiguous()
+
+    nope_fp8, nope_scale = act_quant(k_nope_2d, block_size=group_size)
+
+    num_tiles = dim_nope // group_size
+    nope_part_bytes = dim_nope + num_tiles * 4
+    rope_part_bytes = dim_rope * k_rope_2d.element_size()
+
+    nope_part_u8 = torch.empty(
+        num_tokens, nope_part_bytes, dtype=torch.uint8, device=k_nope_2d.device
+    )
+    nope_part_u8[:, :dim_nope] = nope_fp8.view(torch.uint8)
+    nope_part_u8[:, dim_nope:] = nope_scale.contiguous().view(torch.uint8)
+
+    rope_part_u8 = k_rope_2d.view(torch.uint8).contiguous()
+
+    return nope_part_u8.unsqueeze(1), rope_part_u8.unsqueeze(1)
+
+
 @tilelang.jit(out_idx=[3], pass_configs=pass_configs)
 def fp8_dequant_kernel(dim_nope=512, dim_rope=64, group_size=128):
     """Dequantize contiguous FP8 KV data to BF16 (no page indirection)."""
