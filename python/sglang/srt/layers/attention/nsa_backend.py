@@ -1808,6 +1808,20 @@ class NativeSparseAttnBackend(
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.nsa.tilelang_kernel import tilelang_sparse_fwd
 
+        if self.nsa_kv_cache_store_fp8:
+            from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+                fp8_dequant_paged,
+            )
+
+            page_table_flat = page_table_1[page_table_1 >= 0]
+            kv_cache = fp8_dequant_paged(kv_cache, page_table_flat)
+            valid_mask = page_table_1 >= 0
+            remapped = torch.full_like(page_table_1, -1)
+            remapped[valid_mask] = torch.arange(
+                valid_mask.sum(), device=page_table_1.device, dtype=page_table_1.dtype
+            )
+            page_table_1 = remapped
+
         return tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
