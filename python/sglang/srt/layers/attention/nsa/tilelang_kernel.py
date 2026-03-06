@@ -1115,29 +1115,38 @@ def fp8_quant_kv_cache_separate(
     return nope_part_u8.unsqueeze(1), rope_part_u8.unsqueeze(1)
 
 
-@tilelang.jit(out_idx=[3], pass_configs=pass_configs)
-def fp8_dequant_kernel(dim_nope=512, dim_rope=64, group_size=128):
-    """Dequantize contiguous FP8 KV data to BF16 (no page indirection)."""
+@tilelang.jit(out_idx=[4], pass_configs=pass_configs)
+def fp8_dequant_paged_fused_kernel(dim_nope=512, dim_rope=64, group_size=128):
+    """Fused paged gather + FP8 dequant: reads directly from paged KV cache pool."""
     num_tokens = T.symbolic("num_tokens")
+    num_pages = T.symbolic("num_pages")
     num_tiles = dim_nope // group_size
+    dim_quant_fp8 = dim_nope + num_tiles * 4 + dim_rope * 2
+    dim_quant_f32 = dim_quant_fp8 // 4
+    dim_quant_bf16 = dim_quant_fp8 // 2
+    scale_offset_f32 = dim_nope // 4
+    rope_offset_bf16 = (dim_nope + num_tiles * 4) // 2
+    indices_dtype = "int32"
 
     @T.prim_func
-    def fp8_dequant_(
-        nope_fp8: T.Tensor[(num_tokens, dim_nope), FP8],
-        nope_scale: T.Tensor[(num_tokens, num_tiles), FP32],
-        rope_bf16: T.Tensor[(num_tokens, dim_rope), BF16],
+    def fused_dequant(
+        kv_fp8: T.Tensor[(num_pages, dim_quant_fp8), FP8],
+        kv_f32: T.Tensor[(num_pages, dim_quant_f32), FP32],
+        kv_bf16: T.Tensor[(num_pages, dim_quant_bf16), BF16],
+        page_indices: T.Tensor[(num_tokens,), indices_dtype],
         output: T.Tensor[(num_tokens, dim_nope + dim_rope), BF16],
     ):
         with T.Kernel(num_tokens, threads=128) as (pid,):
+            page_idx = page_indices[pid]
             for tile in T.serial(num_tiles):
+                scale = kv_f32[page_idx, scale_offset_f32 + tile]
                 for j in T.Parallel(group_size):
                     col = tile * group_size + j
-                    output[pid, col] = nope_fp8[pid, col] * nope_scale[pid, tile]
-
+                    output[pid, col] = kv_fp8[page_idx, col] * scale
             for j in T.Parallel(dim_rope):
-                output[pid, dim_nope + j] = rope_bf16[pid, j]
+                output[pid, dim_nope + j] = kv_bf16[page_idx, rope_offset_bf16 + j]
 
-    return fp8_dequant_
+    return fused_dequant
 
 
 def fp8_dequant_paged(
@@ -1145,7 +1154,10 @@ def fp8_dequant_paged(
     page_indices: torch.Tensor,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """Dequantize FP8 KV cache with paged layout.
+    """Fused paged gather + FP8 dequant.
+
+    Reads directly from the paged KV cache pool using indirect indexing,
+    avoiding intermediate buffers and .contiguous() copies.
 
     Args:
         kv_cache: FP8 KV cache from the pool, any shape with last dim = 656.
@@ -1159,22 +1171,13 @@ def fp8_dequant_paged(
     assert dim_quant == 656, f"Expected dim_quant=656, got {dim_quant}"
     kv_cache_flat = kv_cache.view(-1, dim_quant)
 
+    fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
+    kv_fp8 = kv_cache_flat.view(fp8_dtype)
+    kv_f32 = kv_cache_flat.view(torch.float32)
+    kv_bf16 = kv_cache_flat.view(torch.bfloat16)
+
     dim_nope = 512
     dim_rope = 64
-    num_tiles = dim_nope // group_size
-
-    selected = torch.index_select(kv_cache_flat, 0, page_indices)
-    nope_fp8 = selected[:, :dim_nope].contiguous()
-    nope_scale = (
-        selected[:, dim_nope : dim_nope + num_tiles * 4]
-        .view(torch.float32)
-        .contiguous()
-    )
-    rope_bf16 = (
-        selected[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16).contiguous()
-    )
-
-    num_tokens = page_indices.shape[0]
-    kernel = fp8_dequant_kernel(dim_nope, dim_rope, group_size)
-    output = kernel(nope_fp8, nope_scale, rope_bf16)
-    return output.view(num_tokens, 1, dim_nope + dim_rope)
+    kernel = fp8_dequant_paged_fused_kernel(dim_nope, dim_rope, group_size)
+    output = kernel(kv_fp8, kv_f32, kv_bf16, page_indices)
+    return output.view(page_indices.shape[0], 1, dim_nope + dim_rope)
