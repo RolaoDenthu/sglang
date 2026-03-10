@@ -1543,7 +1543,7 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
 
         if self.nsa_kv_cache_store_fp8:
-            if is_hip():
+            if _is_hip:
                 from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                     fp8_quant_kv_cache_separate,
                 )

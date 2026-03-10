@@ -1102,13 +1102,12 @@ def fp8_quant_kv_cache_separate(
 
     num_tiles = dim_nope // group_size
     nope_part_bytes = dim_nope + num_tiles * 4
-    rope_part_bytes = dim_rope * k_rope_2d.element_size()
 
     nope_part_u8 = torch.empty(
         num_tokens, nope_part_bytes, dtype=torch.uint8, device=k_nope_2d.device
     )
     nope_part_u8[:, :dim_nope] = nope_fp8.view(torch.uint8)
-    nope_part_u8[:, dim_nope:] = nope_scale.contiguous().view(torch.uint8)
+    nope_part_u8[:, dim_nope:] = nope_scale.view(torch.uint8)
 
     rope_part_u8 = k_rope_2d.view(torch.uint8).contiguous()
 
