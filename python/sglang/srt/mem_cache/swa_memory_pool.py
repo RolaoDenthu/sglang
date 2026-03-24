@@ -114,6 +114,10 @@ class SWAKVPool(KVCache):
 
         return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
 
+    def get_v_head_dim(self):
+        first_layer_id = next(iter(self.layers_mapping))
+        return self.get_value_buffer(first_layer_id).shape[-1]
+
     def get_key_buffer(self, layer_id: int):
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
