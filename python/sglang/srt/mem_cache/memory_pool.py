@@ -1951,6 +1951,71 @@ class NSATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
 
+class NSATokenToKVPoolFP4(NSATokenToKVPool):
+    """NSA KV Pool with FP4 (E2M1) quantized nope, bf16 rope.
+
+    Buffer layout per token (416 bytes, uint8):
+        [nope_fp4_packed(256) | scales(32) | rope_bf16(128)]
+    """
+
+    def _create_buffers(self):
+        from sglang.srt.layers.attention.nsa.quant_k_cache_fp4 import DIM_QUANT_FP4
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                self.store_dtype = torch.uint8
+                self.dim_quant_fp4 = DIM_QUANT_FP4  # 416
+
+                self.kv_buffer = [
+                    torch.zeros(
+                        (m, 1, self.dim_quant_fp4),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def _clear_buffers(self):
+        del self.kv_buffer
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        from sglang.srt.layers.attention.nsa.dequant_k_cache_fp4 import (
+            dequantize_k_cache_fp4,
+        )
+
+        return dequantize_k_cache_fp4(self.kv_buffer[layer_id - self.start_layer])
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        from sglang.srt.layers.attention.nsa.quant_k_cache_fp4 import (
+            quantize_k_cache_fp4_separate,
+        )
+
+        layer_id = layer.layer_id
+
+        nope_part, rope_part = quantize_k_cache_fp4_separate(cache_k_nope, cache_k_rope)
+
+        set_mla_kv_buffer_triton(
+            self.kv_buffer[layer_id - self.start_layer],
+            loc,
+            nope_part,
+            rope_part,
+        )
+
+
 class DoubleSparseTokenToKVPool(KVCache):
     def __init__(
         self,

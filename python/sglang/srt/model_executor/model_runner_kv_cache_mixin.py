@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
+    NSATokenToKVPoolFP4,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
@@ -499,7 +500,9 @@ class ModelRunnerKVCacheMixin:
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
             )
-            if self.enable_hisparse:
+            if self.server_args.kv_cache_dtype == "fp4_e2m1":
+                self.token_to_kv_pool = NSATokenToKVPoolFP4(**nsa_pool_kwargs)
+            elif self.enable_hisparse:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 hisparse_cfg = parse_hisparse_config(self.server_args)
@@ -613,7 +616,7 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                if self.server_args.kv_cache_dtype == "fp4_e2m1":
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,

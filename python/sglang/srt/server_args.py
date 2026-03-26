@@ -1411,7 +1411,8 @@ class ServerArgs:
         assert self.kv_cache_dtype in [
             "bfloat16",
             "fp8_e4m3",
-        ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+            "fp4_e2m1",
+        ], "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3, or fp4_e2m1 kv_cache_dtype"
 
     def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
@@ -2485,7 +2486,10 @@ class ServerArgs:
                             f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {self.attention_backend}"
                         )
         else:
-            raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
+            if is_hip():
+                logger.warning("KV4 on AMD/HIP is experimental.")
+            else:
+                raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 
     def _handle_page_size(self):
         if self.page_size is None:
