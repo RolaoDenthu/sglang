@@ -1993,6 +1993,12 @@ class NSATokenToKVPoolFP4(NSATokenToKVPool):
 
         return dequantize_k_cache_fp4(self.kv_buffer[layer_id - self.start_layer])
 
+    def get_raw_kv_buffer(self, layer_id: int):
+        """Return the raw FP4 uint8 buffer without dequantization."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.kv_buffer[layer_id - self.start_layer]
+
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
