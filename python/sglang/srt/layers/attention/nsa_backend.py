@@ -65,33 +65,6 @@ else:
     from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
-def _fp4_selective_dequant(
-    raw_fp4_buffer: torch.Tensor,
-    page_table_1: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dequant only the tokens referenced by page_table_1, return compact buffer + remapped indices.
-
-    All operations are fixed-size to be compatible with CUDA graph capture.
-    Invalid indices (-1) are clamped to 0 for dequant (the output is unused).
-    """
-    from sglang.srt.layers.attention.nsa.dequant_k_cache_fp4 import (
-        dequantize_k_cache_fp4_paged,
-    )
-
-    orig_shape = page_table_1.shape
-    flat = page_table_1.reshape(-1)
-
-    safe_flat = flat.clamp(min=0)
-    compact_kv = dequantize_k_cache_fp4_paged(raw_fp4_buffer, safe_flat)
-
-    n = flat.shape[0]
-    sequential = torch.arange(n, device=flat.device, dtype=flat.dtype)
-    new_flat = torch.where(flat >= 0, sequential, flat)
-    new_page_table_1 = new_flat.reshape(orig_shape)
-
-    return compact_kv, new_page_table_1
-
-
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
 
@@ -1413,9 +1386,7 @@ class NativeSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if is_fp4_tilelang:
-                kv_cache, page_table_1 = _fp4_selective_dequant(
-                    pool.get_raw_kv_buffer(layer.layer_id), page_table_1
-                )
+                kv_cache = pool.get_key_buffer_extend(layer.layer_id, page_table_1)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1607,8 +1578,8 @@ class NativeSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if is_fp4_tilelang:
-                kv_cache, page_table_1 = _fp4_selective_dequant(
-                    pool.get_raw_kv_buffer(layer.layer_id), page_table_1
+                kv_cache, page_table_1 = pool.get_key_buffer_decode(
+                    layer.layer_id, page_table_1
                 )
             return self._forward_tilelang(
                 q_all=q_all,

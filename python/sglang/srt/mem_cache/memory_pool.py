@@ -1952,11 +1952,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
 
 class NSATokenToKVPoolFP4(NSATokenToKVPool):
-    """NSA KV Pool with FP4 (E2M1) quantized nope, bf16 rope.
-
-    Buffer layout per token (416 bytes, uint8):
-        [nope_fp4_packed(256) | scales(32) | rope_bf16(128)]
-    """
+    """NSA KV Pool with FP4 (E2M1) quantized nope, bf16 rope."""
 
     def _create_buffers(self):
         from sglang.srt.layers.attention.nsa.quant_k_cache_fp4 import DIM_QUANT_FP4
@@ -1969,7 +1965,7 @@ class NSATokenToKVPoolFP4(NSATokenToKVPool):
             ):
                 m = self.size + self.page_size
                 self.store_dtype = torch.uint8
-                self.dim_quant_fp4 = DIM_QUANT_FP4  # 416
+                self.dim_quant_fp4 = DIM_QUANT_FP4
 
                 self.kv_buffer = [
                     torch.zeros(
@@ -1993,11 +1989,69 @@ class NSATokenToKVPoolFP4(NSATokenToKVPool):
 
         return dequantize_k_cache_fp4(self.kv_buffer[layer_id - self.start_layer])
 
-    def get_raw_kv_buffer(self, layer_id: int):
-        """Return the raw FP4 uint8 buffer without dequantization."""
+    def _get_dequant_workspace(self) -> torch.Tensor:
+        if not hasattr(self, "_dequant_workspace"):
+            from sglang.srt.layers.attention.nsa.dequant_k_cache_fp4 import (
+                DIM_NOPE,
+                DIM_ROPE,
+            )
+
+            m = self.size + self.page_size
+            self._dequant_workspace = torch.empty(
+                (m, 1, DIM_NOPE + DIM_ROPE),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+        return self._dequant_workspace
+
+    def get_key_buffer_extend(
+        self, layer_id: int, page_table_1: torch.Tensor
+    ) -> torch.Tensor:
+        """Scatter-dequant referenced tokens into a fixed-size workspace.
+
+        The workspace shape is always [pool_size, 1, 576], so tilelang
+        never sees a new shape and won't JIT-recompile.
+        """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.kv_buffer[layer_id - self.start_layer]
+
+        from sglang.srt.layers.attention.nsa.dequant_k_cache_fp4 import (
+            dequantize_k_cache_fp4_paged,
+        )
+
+        raw = self.kv_buffer[layer_id - self.start_layer]
+        workspace = self._get_dequant_workspace()
+
+        flat = page_table_1.reshape(-1)
+        unique_indices = torch.unique(flat[flat >= 0])
+        if unique_indices.numel() > 0:
+            compact = dequantize_k_cache_fp4_paged(raw, unique_indices)
+            workspace[unique_indices] = compact
+
+        return workspace
+
+    def get_key_buffer_decode(
+        self, layer_id: int, page_table_1: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compact-dequant for decode (CUDA graph compatible, fixed-size ops)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        from sglang.srt.layers.attention.nsa.dequant_k_cache_fp4 import (
+            dequantize_k_cache_fp4_paged,
+        )
+
+        raw = self.kv_buffer[layer_id - self.start_layer]
+        orig_shape = page_table_1.shape
+        flat = page_table_1.reshape(-1)
+
+        compact_kv = dequantize_k_cache_fp4_paged(raw, flat.clamp(min=0))
+
+        n = flat.shape[0]
+        sequential = torch.arange(n, device=flat.device, dtype=flat.dtype)
+        new_page_table_1 = torch.where(flat >= 0, sequential, flat).reshape(orig_shape)
+
+        return compact_kv, new_page_table_1
 
     def set_mla_kv_buffer(
         self,
