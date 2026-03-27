@@ -616,7 +616,10 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
-                if self.server_args.kv_cache_dtype == "fp4_e2m1":
+                if (
+                    is_float4_e2m1fn_x2(self.kv_cache_dtype)
+                    or self.server_args.kv_cache_dtype == "fp4_e2m1"
+                ):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
