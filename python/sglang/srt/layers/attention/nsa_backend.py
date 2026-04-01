@@ -9,6 +9,10 @@ import torch
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.nsa.dequant_fp4_to_fp8 import (
+    dequant_fp4_paged_decode,
+    dequant_fp4_paged_extend,
+)
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     NativeSparseAttnBackendMTPPrecomputeMixin,
@@ -308,6 +312,9 @@ class NativeSparseAttnBackend(
         self.nsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
+        self.nsa_kv_cache_store_fp4 = getattr(
+            model_runner.token_to_kv_pool, "nsa_kv_cache_store_fp4", False
+        )
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -334,6 +341,11 @@ class NativeSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
+
+        if self.nsa_kv_cache_store_fp4:
+            assert (
+                self.nsa_decode_impl == "tilelang"
+            ), f"FP4 KV cache requires tilelang decode backend, got {self.nsa_decode_impl}"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -1415,6 +1427,10 @@ class NativeSparseAttnBackend(
         if nsa_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.nsa_kv_cache_store_fp4:
+                kv_cache, page_table_1 = dequant_fp4_paged_extend(
+                    kv_cache, page_table_1
+                )
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1599,6 +1615,10 @@ class NativeSparseAttnBackend(
         elif self.nsa_decode_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.nsa_kv_cache_store_fp4:
+                kv_cache, page_table_1 = dequant_fp4_paged_decode(
+                    kv_cache, page_table_1
+                )
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
