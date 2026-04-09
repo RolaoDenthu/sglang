@@ -286,7 +286,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _NSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "triton", "trtllm"
 ]
 
 
@@ -345,9 +345,10 @@ class NativeSparseAttnBackend(
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
 
         if self.nsa_kv_cache_store_fp4:
-            assert (
-                self.nsa_decode_impl == "tilelang"
-            ), f"FP4 KV cache requires tilelang decode backend, got {self.nsa_decode_impl}"
+            assert self.nsa_decode_impl in (
+                "tilelang",
+                "triton",
+            ), f"FP4 KV cache requires tilelang or triton decode backend, got {self.nsa_decode_impl}"
             assert self.nsa_prefill_impl in (
                 "tilelang",
                 "flashmla_auto",
@@ -1524,6 +1525,20 @@ class NativeSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
+        elif nsa_impl == "triton":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.nsa_kv_cache_store_fp4:
+                kv_cache, page_table_1 = dequant_fp4_paged_extend(
+                    kv_cache, page_table_1
+                )
+            return self._forward_triton(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         elif nsa_impl == "aiter":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -1660,6 +1675,26 @@ class NativeSparseAttnBackend(
                 )
                 page_table_1 = self._fp4_new_page_table[:bs]
             return self._forward_tilelang(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif self.nsa_decode_impl == "triton":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.nsa_kv_cache_store_fp4:
+                bs = page_table_1.shape[0]
+                pt_valid = page_table_1[:, : self.nsa_index_topk].contiguous()
+                kv_cache = dequant_fp4_paged_decode(
+                    kv_cache,
+                    pt_valid,
+                    fp8_workspace=self._fp4_fp8_workspace,
+                    new_page_table=self._fp4_new_page_table,
+                )
+                page_table_1 = self._fp4_new_page_table[:bs]
+            return self._forward_triton(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -1926,6 +1961,45 @@ class NativeSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
         )
+
+    def _forward_triton(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        head_dim = q_all.shape[-1]
+        is_fp8_kv = kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+        if is_fp8_kv:
+            from sglang.srt.layers.attention.nsa.triton_sparse_mla import (
+                triton_sparse_mla_decode_fp8,
+            )
+
+            q_fp8 = q_all.to(kv_cache.dtype)
+            kv = kv_cache.view(-1, 1, 1, head_dim)
+            return triton_sparse_mla_decode_fp8(
+                q=q_fp8,
+                kv=kv,
+                topk_indices=page_table_1,
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
+        else:
+            from sglang.srt.layers.attention.nsa.triton_sparse_mla import (
+                triton_sparse_mla_decode,
+            )
+
+            kv = kv_cache.view(-1, 1, 1, head_dim)
+            return triton_sparse_mla_decode(
+                q=q_all,
+                kv=kv,
+                topk_indices=page_table_1,
+                sm_scale=sm_scale,
+                kv_lora_rank=v_head_dim,
+            )
 
     def _forward_aiter(
         self,
