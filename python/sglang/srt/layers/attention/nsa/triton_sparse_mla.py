@@ -435,12 +435,12 @@ def _triton_sparse_mla_fp8_partial(
         S *= scale
         S = tl.where(head_mask[:, None] & valid_t[None, :], S, float("-inf"))
 
-        # Online softmax
+        # Online softmax (scale already includes log2(e), so use exp2)
         m_j = tl.maximum(M_val, tl.max(S, axis=1))
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
-        P = tl.exp(S - m_j[:, None])
+        P = tl.math.exp2(S - m_j[:, None])
         l_j = tl.sum(P, axis=1)
-        alpha = tl.exp(M_val - m_j)
+        alpha = tl.math.exp2(M_val - m_j)
 
         acc0 *= alpha[:, None]
         acc1 *= alpha[:, None]
@@ -490,7 +490,7 @@ def _triton_sparse_mla_fp8_partial(
     acc2 *= inv_L[:, None]
     acc3 *= inv_L[:, None]
 
-    lse = tl.where(L_val > 0, tl.log(L_val) + M_val, float("-inf"))
+    lse = tl.where(L_val > 0, tl.math.log2(L_val) + M_val, float("-inf"))
 
     # Store partial_o  [num_tokens, N_GROUPS, num_heads, D_V]
     po_base = (
@@ -579,7 +579,7 @@ def _triton_sparse_mla_fp8_combine(
         )
 
         new_max = tl.maximum(lse_max, lse_k)
-        correction = tl.exp(lse_max - new_max)
+        correction = tl.math.exp2(lse_max - new_max)
 
         weight_sum = weight_sum * correction
         acc0 *= correction[:, None]
@@ -587,7 +587,7 @@ def _triton_sparse_mla_fp8_combine(
         acc2 *= correction[:, None]
         acc3 *= correction[:, None]
 
-        w_k = tl.exp(lse_k - new_max)
+        w_k = tl.math.exp2(lse_k - new_max)
         weight_sum += w_k
 
         po_base = po_tok_base + k * po_grp_stride + offs_m[:, None] * D_V
@@ -726,7 +726,7 @@ def triton_sparse_mla_decode_fp8(
         query_ptr=q,
         kv_cache_ptr=kv_flat,
         topk_indices_ptr=topk_indices,
-        scale=sm_scale,
+        scale=sm_scale * 1.44269504,
         fp8_max_val=fp8_max_val,
         fp8_inv_scale=fp8_inv_scale,
         num_query_heads=num_heads,
