@@ -76,6 +76,7 @@ else:
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
 
+
 # Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip

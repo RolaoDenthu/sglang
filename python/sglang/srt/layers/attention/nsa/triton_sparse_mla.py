@@ -13,6 +13,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx95_supported, is_hip
+
+_is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
+
 
 @triton.jit
 def _find_seq_idx(
@@ -243,7 +248,17 @@ def triton_sparse_mla_decode(
     v = kv[..., :kv_lora_rank]
 
     BLOCK_M = min(16, num_heads)
-    TILE_SIZE = block_size if block_size > 1 else min(topk_count, 64)
+    if block_size > 1:
+        TILE_SIZE = block_size
+    elif _is_hip and not _is_gfx95:
+        TILE_SIZE = min(topk_count, 32)
+    else:
+        TILE_SIZE = min(topk_count, 64)
+
+    if _is_hip and not _is_gfx95:
+        nwarps = 2
+    else:
+        nwarps = 4
 
     total_num_q_blocks = num_tokens * (num_heads // BLOCK_M)
 
@@ -276,14 +291,14 @@ def triton_sparse_mla_decode(
         ROPE_RANK=rope_rank,
         KV_LORA_RANK=kv_lora_rank,
         TILE_SIZE=TILE_SIZE,
-        num_warps=4,
+        num_warps=nwarps,
         num_stages=1,
     )
 
     return out
 
 
-def _pick_inner_iter(seq: int, ni: int, cu: int = 304, block_per_cu: int = 1) -> int:
+def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     """Largest power-of-two inner_iter that keeps enough work per CU."""
     max_it = int(seq * ni / (cu * block_per_cu))
     it = ni
@@ -320,10 +335,9 @@ def _triton_sparse_mla_fp8_partial(
     IS_FNUZ: tl.constexpr,
 ):
     """
-    grid: (num_tokens * ceil(heads / BLOCK_M), n_groups)
+    grid: (num_tokens * ceil(heads / BLOCK_M), N_GROUPS)
     Each block processes BLOCK_I * INNER_ITER KV tokens with 4x128 chunked FP8 GEMM.
-    Outputs partial_o (bf16) + partial_lse (fp32) per group.
-    """
+    Outputs partial_o (bf16) + partial_lse (fp32) per group."""
     head_blocks: tl.constexpr = num_query_heads // BLOCK_M
     po_grp_stride: tl.constexpr = num_query_heads * D_V
     lse_grp_stride: tl.constexpr = num_query_heads
@@ -527,7 +541,8 @@ def _triton_sparse_mla_fp8_combine(
 ):
     """
     grid: (num_tokens * ceil(heads / BLOCK_M),)
-    Log-sum-exp weighted merge of partial_o across n_groups.
+    Online log-sum-exp weighted merge of partial_o across N_GROUPS.
+    Single pass: reads each partial_lse element exactly once (vs 3× in naive approach).
     """
     head_blocks: tl.constexpr = num_query_heads // BLOCK_M
     po_grp_stride: tl.constexpr = num_query_heads * D_V
@@ -544,74 +559,72 @@ def _triton_sparse_mla_fp8_combine(
     head_mask = offs_m < num_query_heads
 
     lse_tok_base = token_idx * N_GROUPS * lse_grp_stride
+    po_tok_base = token_idx * N_GROUPS * po_grp_stride
 
-    # Pass 1: max LSE across groups
-    lse_max = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-    for k in range(N_GROUPS):
-        lse_k = tl.load(
-            partial_lse_ptr + lse_tok_base + k * lse_grp_stride + offs_m,
-            mask=head_mask,
-            other=float("-inf"),
-        )
-        lse_max = tl.maximum(lse_max, lse_k)
-
-    # Pass 2: sum of exp(lse - max)
-    weight_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
-    for k in range(N_GROUPS):
-        lse_k = tl.load(
-            partial_lse_ptr + lse_tok_base + k * lse_grp_stride + offs_m,
-            mask=head_mask,
-            other=float("-inf"),
-        )
-        weight_sum += tl.exp(lse_k - lse_max)
-
-    inv_weight_sum = 1.0 / tl.maximum(weight_sum, 1e-10)
-
-    # Pass 3: weighted accumulation of partial outputs (4 chunks of GROUP_SIZE)
     offs_g = tl.arange(0, GROUP_SIZE)
+    po_mask = head_mask[:, None]
+
+    lse_max = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    weight_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc0 = tl.zeros([BLOCK_M, GROUP_SIZE], dtype=tl.float32)
     acc1 = tl.zeros([BLOCK_M, GROUP_SIZE], dtype=tl.float32)
     acc2 = tl.zeros([BLOCK_M, GROUP_SIZE], dtype=tl.float32)
     acc3 = tl.zeros([BLOCK_M, GROUP_SIZE], dtype=tl.float32)
 
-    po_tok_base = token_idx * N_GROUPS * po_grp_stride
-
     for k in range(N_GROUPS):
         lse_k = tl.load(
             partial_lse_ptr + lse_tok_base + k * lse_grp_stride + offs_m,
             mask=head_mask,
             other=float("-inf"),
         )
-        w = tl.exp(lse_k - lse_max) * inv_weight_sum
+
+        new_max = tl.maximum(lse_max, lse_k)
+        correction = tl.exp(lse_max - new_max)
+
+        weight_sum = weight_sum * correction
+        acc0 *= correction[:, None]
+        acc1 *= correction[:, None]
+        acc2 *= correction[:, None]
+        acc3 *= correction[:, None]
+
+        w_k = tl.exp(lse_k - new_max)
+        weight_sum += w_k
 
         po_base = po_tok_base + k * po_grp_stride + offs_m[:, None] * D_V
-        po_mask = head_mask[:, None]
 
         po0 = tl.load(
             partial_o_ptr + po_base + offs_g[None, :], mask=po_mask, other=0.0
         ).to(tl.float32)
-        acc0 += w[:, None] * po0
+        acc0 += w_k[:, None] * po0
 
         po1 = tl.load(
             partial_o_ptr + po_base + (offs_g + GROUP_SIZE)[None, :],
             mask=po_mask,
             other=0.0,
         ).to(tl.float32)
-        acc1 += w[:, None] * po1
+        acc1 += w_k[:, None] * po1
 
         po2 = tl.load(
             partial_o_ptr + po_base + (offs_g + 2 * GROUP_SIZE)[None, :],
             mask=po_mask,
             other=0.0,
         ).to(tl.float32)
-        acc2 += w[:, None] * po2
+        acc2 += w_k[:, None] * po2
 
         po3 = tl.load(
             partial_o_ptr + po_base + (offs_g + 3 * GROUP_SIZE)[None, :],
             mask=po_mask,
             other=0.0,
         ).to(tl.float32)
-        acc3 += w[:, None] * po3
+        acc3 += w_k[:, None] * po3
+
+        lse_max = new_max
+
+    inv_weight_sum = 1.0 / tl.maximum(weight_sum, 1e-10)
+    acc0 *= inv_weight_sum[:, None]
+    acc1 *= inv_weight_sum[:, None]
+    acc2 *= inv_weight_sum[:, None]
+    acc3 *= inv_weight_sum[:, None]
 
     out_base = token_idx * num_query_heads * D_V + offs_m[:, None] * D_V
     out_mask = head_mask[:, None]
@@ -677,7 +690,15 @@ def triton_sparse_mla_decode_fp8(
 
     ni = topk_count // BLOCK_I
     assert ni * BLOCK_I == topk_count, "topk must be divisible by BLOCK_I"
-    inner_iter = _pick_inner_iter(num_tokens, ni)
+
+    if _is_hip:
+        if _is_gfx95:
+            block_per_cu, cu = 2, 256
+        else:
+            block_per_cu, cu = 1, 304
+        inner_iter = _pick_inner_iter(num_tokens, ni, cu, block_per_cu)
+    else:
+        inner_iter = 1
     n_groups = ni // inner_iter
 
     fnuz = is_fp8_fnuz()
