@@ -3371,6 +3371,14 @@ def is_gfx95_supported():
         return False
 
 
+@lru_cache(maxsize=1)
+def get_hip_version():
+    # torch.version.hip looks like "7.0.51831-a3e329ad8"; drop the git hash.
+    if torch.version.hip:
+        return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
+    return (0, 0, 0)
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
