@@ -397,40 +397,44 @@ def _triton_sparse_mla_fp8_partial(
 
         kv_base = topk_pos * kv_stride
 
-        # QK: 4x128 chunked FP8 GEMM + rope tail
-        S = tl.zeros([BLOCK_M, BLOCK_I], dtype=tl.float32)
-        k_mask = valid_t[None, :]
+        # Load each KV tile once as [BI, GROUP_SIZE]; reuse for QK (via tl.trans)
+        # and SV to halve HBM traffic (mirrors tilelang's shared kv_tile approach).
+        kv_mask = valid_t[:, None]
 
-        K0 = tl.load(
-            kv_cache_ptr + kv_base[None, :] + offs_g[:, None],
-            mask=k_mask,
+        KV0 = tl.load(
+            kv_cache_ptr + kv_base[:, None] + offs_g[None, :],
+            mask=kv_mask,
             other=0.0,
         )
-        S += tl.dot(Q0, K0)
-        K1 = tl.load(
-            kv_cache_ptr + kv_base[None, :] + (offs_g + GROUP_SIZE)[:, None],
-            mask=k_mask,
+        KV1 = tl.load(
+            kv_cache_ptr + kv_base[:, None] + (offs_g + GROUP_SIZE)[None, :],
+            mask=kv_mask,
             other=0.0,
         )
-        S += tl.dot(Q1, K1)
-        K2 = tl.load(
-            kv_cache_ptr + kv_base[None, :] + (offs_g + 2 * GROUP_SIZE)[:, None],
-            mask=k_mask,
+        KV2 = tl.load(
+            kv_cache_ptr + kv_base[:, None] + (offs_g + 2 * GROUP_SIZE)[None, :],
+            mask=kv_mask,
             other=0.0,
         )
-        S += tl.dot(Q2, K2)
-        K3 = tl.load(
-            kv_cache_ptr + kv_base[None, :] + (offs_g + 3 * GROUP_SIZE)[:, None],
-            mask=k_mask,
+        KV3 = tl.load(
+            kv_cache_ptr + kv_base[:, None] + (offs_g + 3 * GROUP_SIZE)[None, :],
+            mask=kv_mask,
             other=0.0,
         )
-        S += tl.dot(Q3, K3)
+        # rope tail is only used in QK, load once as [BI, D_TAIL]
         K_tail = tl.load(
-            kv_cache_ptr + kv_base[None, :] + (offs_tail + D_V)[:, None],
-            mask=k_mask,
+            kv_cache_ptr + kv_base[:, None] + (offs_tail + D_V)[None, :],
+            mask=kv_mask,
             other=0.0,
         )
-        S += tl.dot(Q_tail, K_tail)
+
+        # QK: 4x128 chunked FP8 GEMM + rope tail (transpose KV on the fly)
+        S = tl.zeros([BLOCK_M, BLOCK_I], dtype=tl.float32)
+        S += tl.dot(Q0, tl.trans(KV0))
+        S += tl.dot(Q1, tl.trans(KV1))
+        S += tl.dot(Q2, tl.trans(KV2))
+        S += tl.dot(Q3, tl.trans(KV3))
+        S += tl.dot(Q_tail, tl.trans(K_tail))
 
         S *= scale
         S = tl.where(head_mask[:, None] & valid_t[None, :], S, float("-inf"))
@@ -449,38 +453,17 @@ def _triton_sparse_mla_fp8_partial(
         L_val = L_val * alpha + l_j
         M_val = m_j
 
-        # SV: scale P to fp8, 4x128 chunked GEMM
+        # SV: scale P to fp8, 4x128 chunked GEMM reusing the already-loaded KV tiles
         P_scaled = tl.clamp(P * fp8_max_val, -fp8_max_val, fp8_max_val)
         if IS_FNUZ:
             P_fp8 = P_scaled.to(tl.float8e4b8)
         else:
             P_fp8 = P_scaled.to(tl.float8e4nv)
 
-        v_mask = valid_t[:, None]
-        V0 = tl.load(
-            kv_cache_ptr + kv_base[:, None] + offs_g[None, :],
-            mask=v_mask,
-            other=0.0,
-        )
-        acc0 += tl.dot(P_fp8, V0) * fp8_inv_scale
-        V1 = tl.load(
-            kv_cache_ptr + kv_base[:, None] + (offs_g + GROUP_SIZE)[None, :],
-            mask=v_mask,
-            other=0.0,
-        )
-        acc1 += tl.dot(P_fp8, V1) * fp8_inv_scale
-        V2 = tl.load(
-            kv_cache_ptr + kv_base[:, None] + (offs_g + 2 * GROUP_SIZE)[None, :],
-            mask=v_mask,
-            other=0.0,
-        )
-        acc2 += tl.dot(P_fp8, V2) * fp8_inv_scale
-        V3 = tl.load(
-            kv_cache_ptr + kv_base[:, None] + (offs_g + 3 * GROUP_SIZE)[None, :],
-            mask=v_mask,
-            other=0.0,
-        )
-        acc3 += tl.dot(P_fp8, V3) * fp8_inv_scale
+        acc0 += tl.dot(P_fp8, KV0) * fp8_inv_scale
+        acc1 += tl.dot(P_fp8, KV1) * fp8_inv_scale
+        acc2 += tl.dot(P_fp8, KV2) * fp8_inv_scale
+        acc3 += tl.dot(P_fp8, KV3) * fp8_inv_scale
 
     # Normalise partial output
     safe_L = tl.where(L_val > 0, L_val, 1.0)
@@ -744,7 +727,7 @@ def triton_sparse_mla_decode_fp8(
         N_GROUPS=n_groups,
         IS_FNUZ=fnuz,
         num_warps=4,
-        num_stages=1,
+        num_stages=2,
     )
 
     out = torch.empty(
@@ -765,7 +748,7 @@ def triton_sparse_mla_decode_fp8(
         N_GROUPS=n_groups,
         BLOCK_M=BLOCK_M_COMBINE,
         num_warps=4,
-        num_stages=1,
+        num_stages=2,
     )
 
     return out
