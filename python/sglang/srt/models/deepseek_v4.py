@@ -588,32 +588,11 @@ class MQALayer(nn.Module):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        """ATOM-style ROCm path: overlap compressors, keep Q/KV on main stream."""
         assert self.alt_streams is not None
-        assert len(self.alt_streams) >= 1
 
         current_stream = torch.cuda.current_stream()
         stream_compressor = self.alt_streams[0]
-        stream_indexer_compressor = (
-            self.alt_streams[1] if len(self.alt_streams) > 1 else None
-        )
-
-        if self.compressor is not None:
-            stream_compressor.wait_stream(current_stream)
-            with torch.cuda.stream(stream_compressor):
-                attn_backend.forward_core_compressor(
-                    x, forward_batch, self.layer_id, self.compressor
-                )
-
-        if self.indexer is not None and stream_indexer_compressor is not None:
-            stream_indexer_compressor.wait_stream(current_stream)
-            with torch.cuda.stream(stream_indexer_compressor):
-                attn_backend.forward_indexer_compressor(
-                    x=x,
-                    forward_batch=forward_batch,
-                    layer_id=self.indexer.layer_id,
-                    compressor=self.indexer.compressor,
-                )
+        stream_compressor.wait_stream(current_stream)
 
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
@@ -677,9 +656,6 @@ class MQALayer(nn.Module):
         del qkv_a
 
         if self.indexer is not None:
-            current_stream.wait_stream(stream_compressor)
-            if stream_indexer_compressor is not None:
-                current_stream.wait_stream(stream_indexer_compressor)
             self.indexer(
                 x=x,
                 q_lora=q_lora,
@@ -687,9 +663,21 @@ class MQALayer(nn.Module):
                 attn_backend=attn_backend,
                 skip_compressor=True,
             )
-        elif self.compressor is not None:
-            current_stream.wait_stream(stream_compressor)
 
+        with torch.cuda.stream(stream_compressor):
+            attn_backend.forward_core_compressor(
+                x, forward_batch, self.layer_id, self.compressor
+            )
+
+            if self.indexer is not None:
+                attn_backend.forward_indexer_compressor(
+                    x=x,
+                    forward_batch=forward_batch,
+                    layer_id=self.indexer.layer_id,
+                    compressor=self.indexer.compressor,
+                )
+
+        stream_compressor.wait_stream(current_stream)
         return q
 
     def _forward_prepare(
@@ -1474,7 +1462,7 @@ class DeepseekV4Model(nn.Module):
                 or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             )
         )
-        num_alt_streams = 5 if _is_cuda else 2
+        num_alt_streams = 5 if _is_cuda else 1
         self.alt_streams = (
             [torch.cuda.Stream() for _ in range(num_alt_streams)]
             if use_stream_pool
