@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, Tuple, Union
@@ -81,6 +83,8 @@ if TYPE_CHECKING:
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+
+logger = logging.getLogger(__name__)
 
 
 def _copy_metadata(
@@ -1098,6 +1102,48 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 extra_indices_in_kvcache=extra_indices,
                 extra_topk_length=extra_topk_lengths,
             )
+
+            # ------- FlyDSL dual-scope prefill override (gfx950) -------
+            # When SGLANG_FLYDSL_PREFILL=1, route prefill through a single fused
+            # FlyDSL dual-scope kernel that mirrors the Triton
+            # `_fused_gather_attn_dsv4_dual_scope_kernel` reference: SWA + C4/C128
+            # gathered and attended in one online-softmax pass (no Python-side
+            # LSE merge). Falls back to the FlashMLA/Triton baseline whenever the
+            # kernel is unavailable (not yet implemented) or raises.
+            if (
+                os.environ.get("SGLANG_FLYDSL_PREFILL", "0") == "1"
+                and forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True)
+            ):
+                try:
+                    from sglang.srt.layers.attention.nsa.flydsl_dual_scope_prefill import (
+                        flydsl_dual_scope_prefill,
+                    )
+
+                    o = flydsl_dual_scope_prefill(
+                        q=q,
+                        swa_k_cache=swa_k_cache,
+                        swa_indices=swa_page_indices,
+                        swa_topk_length=swa_topk_lengths,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                        compress_ratio=compress_ratio,
+                        softmax_scale=self.softmax_scale,
+                        attn_sink=attn_sink,
+                        head_dim_v=self.head_dim_v,
+                    )
+                    return o.squeeze(1) if o.ndim == 4 else o
+                except ImportError:
+                    # FlyDSL dual-scope kernel not implemented yet — use baseline.
+                    pass
+                except Exception:
+                    import traceback
+
+                    logger.warning(
+                        "[FlyDSL] dual-scope prefill failed, falling back to "
+                        "baseline:\n%s",
+                        traceback.format_exc(),
+                    )
 
             backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
             o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
