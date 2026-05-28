@@ -358,6 +358,17 @@ def _build_dual_scope_kernel(
     KV_TILES_MAIN = topk_main // block_n
     KV_TILES_EXTRA = topk_extra // block_n
 
+    # Head tiling: one CTA per query token (grid.y), heads tiled by BLOCK_H
+    # (grid.x).  The zero-stub writeback distributes the head_dim_v output
+    # columns of each owned head across the BLOCK_SIZE-thread wave.
+    BLOCK_H = block_h
+    assert head_dim_v % BLOCK_SIZE == 0, (
+        f"head_dim_v={head_dim_v} must be divisible by BLOCK_SIZE={BLOCK_SIZE}"
+    )
+    ELEMS_PER_THREAD = head_dim_v // BLOCK_SIZE     # 512 // 64 = 8
+    TOK_OUT_STRIDE = h_q * head_dim_v               # Out token stride (elems)
+    HEAD_OUT_STRIDE = head_dim_v                    # Out head stride (elems)
+
     # ---- LDS layout -------------------------------------------------------
     # KV tile staged as i64 packs (8 bf16/fp8 lanes per i64); P (attn weights)
     # staged as f32.  Same shape as the artefact kernels.
@@ -378,77 +389,105 @@ def _build_dual_scope_kernel(
         Q: fx.Tensor,             # [T, h_q, head_dim]            bf16
         KV_Main: fx.Tensor,       # [Nb_main, per_block_bytes]    uint8 raw pool
         Indices_Main: fx.Tensor,  # [T, topk_main]                int32
-        TopkLen_Main: fx.Tensor,  # [batch]                       int32
+        TopkLen_Main: fx.Tensor,  # [T]                           int32 (1:1 per tok)
         KV_Extra: fx.Tensor,      # [Nb_extra, per_block_bytes]   uint8 raw pool
         Indices_Extra: fx.Tensor, # [T, topk_extra]               int32
-        TopkLen_Extra: fx.Tensor, # [batch]                       int32
+        TopkLen_Extra: fx.Tensor, # [T]                           int32 (1:1 per tok)
         AttnSink: fx.Tensor,      # [h_q]                         f32
         Out: fx.Tensor,           # [T, h_q, head_dim_v]          bf16
         total_tokens: fx.Int32,
     ):
         # ----------------------------------------------------------------
-        # Thread / block ids and Q preload (mirrors artefact kernels).
+        # LLVM pointer helpers (mirror the artefact kernels exactly).
         # ----------------------------------------------------------------
-        # TODO(phase1): compute pid_t (program_id over tokens), pid_h (BLOCK_H
-        #   head tile), lane / k_group decomposition; q_start = pid_t.
+        def _ptr_ty():
+            return ir.Type.parse("!llvm.ptr")
+
+        def _as_ptr(t):
+            v = t
+            if hasattr(v, "ir_value") and not isinstance(v, ir.Value):
+                v = v.ir_value()
+            return _fly.extract_aligned_pointer_as_index(_ptr_ty(), v)
+
+        out_ptr = _as_ptr(Out)
+
+        # ----------------------------------------------------------------
+        # Thread / block ids.
+        #   grid = (cdiv(h_q, BLOCK_H), total_tokens); block = (BLOCK_SIZE,1,1).
+        #   One CTA per query token (s_q == 1); heads tiled by BLOCK_H.  This
+        #   intentionally differs from the artefacts' (cdiv(tokens, TILE_M), h_q)
+        #   grid -- keeping one CTA per token avoids the tile-anchor index bug
+        #   and matches topk_length being 1:1 per query token.
+        # ----------------------------------------------------------------
+        tid        = fx.Index(gpu.thread_idx.x)
+        bid_h_tile = fx.Index(gpu.block_idx.x)   # head-tile id
+        pid_t      = fx.Index(gpu.block_idx.y)   # query-token id
+
+        # ----------------------------------------------------------------
+        # LDS allocation (declared + finalized now; real KV/P staging is phase1).
+        # A trivial store + barrier exercises the LDS path so the JIT'd kernel
+        # references the finalized shared-memory global.
+        # ----------------------------------------------------------------
+        lds_base   = alloc.get_base()
+        lds_kv_i64 = SmemPtr(lds_base, kv_lds_off, T.i64, shape=(LDS_KV_I64,)).get()
+        lds_p_f32  = SmemPtr(lds_base, p_lds_off,  T.f32, shape=(LDS_P_F32,)).get()  # noqa: F841
+        _memref.store(_raw(fx.Int64(0)), lds_kv_i64, [_raw(tid)])
+        gpu.barrier()
+
+        # ================================================================
+        # phase1 inner-math TODOs (intentionally NOT implemented here).
+        # ----------------------------------------------------------------
         # TODO(phase1): pre-load this token's Q head tile into K_STEPS_QK i64
-        #   register packs (bf16, 8 lanes per i64) exactly like the artefact.
-        # TODO(phase1): init online-softmax carry: m_i=-inf (4), l_i=0 (4),
-        #   o_acc=0 (D_BLKS x v4f32).
-        # NOTE: phase1 dequants KV to bf16 and does bf16 MFMA only; NO re-quant
-        #   to fp8 (fp8 re-quant overflow previously produced m_raw=+inf / NaN).
-
-        def _process_kv_tile(carry, kv_cache, idx_tensor, kv_pos_base, block_size, valid_predicate):
-            """Process one BLOCK_N tile of keys into the shared softmax state.
-
-            Stubbed for phase1.  When implemented it will, per tile:
-
-            TODO(phase1) gather: for each of BLOCK_N keys, load idx from
-                ``idx_tensor`` at (token, kv_pos_base + row); mask idx==-1 and
-                beyond topk_length to invalid (branchless bitmask select -- keep
-                a single LDS store per thread; MLIR SelectOp races caused a prior
-                NameError, so the write must stay branchless).
-            TODO(phase1) decompose: block_idx = idx // block_size,
-                off = idx % block_size (power-of-2 fast path: shift / mask).
-                data_base = block_idx*per_block_bytes + off*576;
-                scale_base = block_idx*per_block_bytes + block_size*576 + off*8.
-            TODO(phase1) dequant nope: load 448 fp8 bytes; fp8->f32 via
-                rocdl.cvt_f32_fp8; multiply by exp2(scale_byte[d//64]-127)
-                (ue8m0); keep result in bf16.  NO fp8 re-quant.
-            TODO(phase1) dequant rope: load 128 raw bytes as 64 bf16 (LE);
-                bitcast to bf16; concat after nope -> 512-dim bf16 K (== V).
-            TODO(phase1) stage K -> LDS i64; barrier.
-            TODO(phase1) QK GEMM: S[BLOCK_H,BLOCK_N] += Q_tile @ K_tile^T using
-                rocdl.mfma_f32_16x16x32_bf16 (bf16 in, f32 accum), K_STEPS_QK steps.
-            TODO(phase1) mask: where ~valid set S = -inf BEFORE the softmax max so
-                zero-padded invalid keys never enter the denominator.
-            TODO(phase1) online softmax (log2 space): row-max via warp shuffle_xor,
-                m_new = max(m_run, row_max); corr = exp2((m_run-m_new)*LOG2E*?);
-                p = exp2((S*sm_scale*LOG2E) - m_new); l_new = corr*l_run + sum(p);
-                scale o_acc by corr.  (sm_scale folded into the exp2 argument.)
-            TODO(phase1) stage P (f32) -> LDS; barrier.
-            TODO(phase1) PV GEMM: o_acc[D_BLKS] += P @ V using
-                rocdl.mfma_f32_16x16x32_bf16 (P bf16, V bf16, f32 accum).
-            """
-            # TODO(phase1): replace identity passthrough with the real tile math.
-            return carry
+        #   register packs (bf16, 8 lanes per i64); init online-softmax carry
+        #   m_i=-inf (4), l_i=0 (4), o_acc=0 (D_BLKS x v4f32).
+        # TODO(phase1) _process_kv_tile(carry, kv_cache, idx_tensor, kv_pos_base,
+        #   block_size, topk_len): per BLOCK_N tile --
+        #     gather: load idx at (token, kv_pos_base+row); mask idx==-1 and
+        #       beyond topk_len -> invalid via BRANCHLESS bitmask (single LDS
+        #       store per thread; MLIR SelectOp caused a prior NameError).
+        #     decompose: block_idx = idx // block_size, off = idx % block_size
+        #       (power-of-2 shift/mask); data_base = block_idx*per_block_bytes +
+        #       off*576; scale_base = block_idx*per_block_bytes +
+        #       block_size*576 + off*8.
+        #     dequant nope (448 fp8): fp8->f32 via the gfx950 OCP e4m3fn path
+        #       (NOT the fnuz rocdl.cvt_f32_fp8 used by the artefacts) * ue8m0
+        #       exp2(scale_byte[d//64]-127); keep bf16.  NO fp8 re-quant.
+        #     dequant rope (128 raw bytes -> 64 bf16 LE): bitcast; concat after
+        #       nope -> 512-dim bf16 K (== V).  Stage K -> LDS i64; barrier.
+        #     QK GEMM: S[BLOCK_H,BLOCK_N] += Q_tile @ K_tile^T via
+        #       rocdl.mfma_f32_16x16x32_bf16 (bf16 in, f32 accum), K_STEPS_QK steps.
+        #     mask invalid -> S=-inf BEFORE the softmax max.
+        #     online softmax (log2 space): warp shuffle_xor row-max; m_new=
+        #       max(m_run,row_max); corr=exp2(m_run-m_new); p=exp2(S*sm_scale*
+        #       LOG2E - m_new); l_new=corr*l_run+sum(p); scale o_acc by corr.
+        #     stage P (f32) -> LDS; barrier; PV GEMM: o_acc += P @ V via MFMA.
+        # TODO(phase1): SWA (main) tiles first (KV_TILES_MAIN), then EXTRA tiles
+        #   (KV_TILES_EXTRA), into ONE shared online-softmax state; early-skip
+        #   tiles beyond TopkLen_Main / TopkLen_Extra.
+        # TODO(phase1): finalize -- denom = l_i + (exp2((AttnSink-m_i)*LOG2E) if
+        #   HAS_ATTN_SINK); output_scale = 1/denom; lonely (l_i==0) -> zero row;
+        #   o = (o_acc * output_scale).to(bf16); store [head_dim_v].
+        # ================================================================
 
         # ----------------------------------------------------------------
-        # Dual-scope loop: SWA (main) FIRST, then EXTRA, into ONE shared state.
+        # phase1 writeback: store ZEROS for every (token, head) this CTA owns.
+        # Each of the BLOCK_SIZE threads strides over the head_dim_v columns
+        # (ELEMS_PER_THREAD each) for each of the BLOCK_H heads in this tile.
         # ----------------------------------------------------------------
-        # TODO(phase1): for kv_tile in range(KV_TILES_MAIN): early-skip tiles
-        #   beyond TopkLen_Main; carry = _process_kv_tile(carry, KV_Main,
-        #   Indices_Main, kv_tile*BLOCK_N, block_size_main, ...).
-        # TODO(phase1): for kv_tile in range(KV_TILES_EXTRA): early-skip tiles
-        #   beyond TopkLen_Extra; carry = _process_kv_tile(carry, KV_Extra,
-        #   Indices_Extra, kv_tile*BLOCK_N, block_size_extra, ...).
-
-        # ----------------------------------------------------------------
-        # Finalize: fold attn_sink into the denominator, normalize, store.
-        # ----------------------------------------------------------------
-        # TODO(phase1): denom = l_i + (exp2((AttnSink-m_i)*LOG2E) if HAS_ATTN_SINK).
-        # TODO(phase1): output_scale = 1/denom; lonely (l_i==0) -> emit 0 row.
-        # TODO(phase1): o = (o_acc * output_scale).to(bf16); store [head_dim_v].
+        zero_bf16 = fx.Float32(0.0).to(fx.BFloat16).ir_value()
+        for h_local in range_constexpr(BLOCK_H):
+            head = bid_h_tile * fx.Index(BLOCK_H) + fx.Index(h_local)
+            for je in range_constexpr(ELEMS_PER_THREAD):
+                d = tid + fx.Index(je * BLOCK_SIZE)
+                out_elem = (
+                    pid_t * fx.Index(TOK_OUT_STRIDE)
+                    + head * fx.Index(HEAD_OUT_STRIDE)
+                    + d
+                )
+                out_gep = buffer_ops.get_element_ptr(
+                    out_ptr, fx.Int64(out_elem), elem_type=T.bf16
+                )
+                _llvm.StoreOp(zero_bf16, out_gep)
         return
 
     @flyc.jit
@@ -456,16 +495,56 @@ def _build_dual_scope_kernel(
         Q, KV_Main, Indices_Main, TopkLen_Main,
         KV_Extra, Indices_Extra, TopkLen_Extra,
         AttnSink, Out, total_tokens,
-        stream=None,
+        stream: "fx.Stream" = fx.Stream(None),
     ):
-        # TODO(phase1): finalize the LDS allocator, compute grid =
-        #   (cdiv(h_q, BLOCK_H), total_tokens), block = (BLOCK_SIZE, 1, 1), set
-        #   fast-fp-math passthrough attrs + waves_per_eu, launch the kernel.
-        raise NotImplementedError(
-            "FlyDSL dual-scope prefill kernel inner-math not implemented (phase1 stub)"
+        alloc.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            alloc.finalize()
+
+        tokens_idx = fx.Index(total_tokens)
+        grid_h = fx.Index((h_q + BLOCK_H - 1) // BLOCK_H)
+        launcher = dual_scope_prefill_kernel(
+            Q, KV_Main, Indices_Main, TopkLen_Main,
+            KV_Extra, Indices_Extra, TopkLen_Extra,
+            AttnSink, Out, total_tokens,
         )
 
-    return launch_dual_scope_prefill
+        passthrough = []
+        for pair in [
+            ("denormal-fp-math-f32", "preserve-sign,preserve-sign"),
+            ("no-nans-fp-math", "true"),
+            ("unsafe-fp-math", "true"),
+        ]:
+            passthrough.append(
+                ir.ArrayAttr.get(
+                    [ir.StringAttr.get(pair[0]), ir.StringAttr.get(pair[1])]
+                )
+            )
+        for op in ctx.gpu_module_body.operations:
+            if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
+                op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough)
+                op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                    T.i32, int(waves_per_eu)
+                )
+
+        launcher.launch(
+            grid=(grid_h, tokens_idx, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    _hints = {
+        "fast_fp_math": True,
+        "unsafe_fp_math": True,
+        "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
+    }
+
+    def _launch(*args, **kwargs):
+        with CompilationContext.compile_hints(_hints):
+            return launch_dual_scope_prefill(*args, **kwargs)
+
+    return _launch
 
 
 def _flydsl_dual_scope_kernel_impl(
@@ -483,14 +562,83 @@ def _flydsl_dual_scope_kernel_impl(
 ) -> torch.Tensor:
     """Thin launcher: normalize inputs, build/cache the kernel, launch, return.
 
-    STUBBED for phase1 -- raises NotImplementedError.  Wired behind
-    ``_USE_FLYDSL_KERNEL`` so we can flip reference -> kernel later without
-    touching the backend hook.
+    COMPILE-FIRST milestone: this allocates the output [T, H, head_dim_v] bf16
+    and launches the FlyDSL skeleton kernel, which writes ZEROS (inner math is
+    still a phase1 TODO).  It is wired behind ``_USE_FLYDSL_KERNEL`` (currently
+    False) so the public live path keeps using ``_torch_reference_dual_scope``;
+    the kernel is exercised only via the dedicated launch test.
     """
-    raise NotImplementedError(
-        "FlyDSL dual-scope kernel launcher not implemented yet (phase1 stub); "
-        "the live path uses _torch_reference_dual_scope."
+    import flydsl.expr as fx  # remote-container dependency; import lazily.
+
+    q3 = _normalize_q(q)                         # [T, H, D_QK]
+    device = q3.device
+    T_tok, H, _ = q3.shape
+
+    block_h = 16
+    h_q_pad = ((H + block_h - 1) // block_h) * block_h
+
+    # --- main (SWA) scope tensors ---------------------------------------
+    swa_idx = _normalize_indices(swa_indices).to(torch.int32).contiguous()  # [T, topk_m]
+    topk_main = swa_idx.shape[1]
+    swa_u8, _nb_main, bs_main = _block_layout(swa_k_cache)                   # [Nb, pbb] u8
+
+    # --- extra scope tensors (dummy, non-indexed, when absent) ----------
+    has_extra = extra_k_cache is not None and extra_indices is not None
+    if has_extra:
+        extra_idx = _normalize_indices(extra_indices).to(torch.int32).contiguous()
+        topk_extra = extra_idx.shape[1]
+        extra_u8, _nb_extra, bs_extra = _block_layout(extra_k_cache)
+    else:
+        topk_extra = topk_main
+        extra_idx = torch.zeros((T_tok, topk_extra), dtype=torch.int32, device=device)
+        extra_u8 = swa_u8
+        bs_extra = bs_main
+
+    # --- per-token topk_length (dummy full-length when absent) ----------
+    if swa_topk_length is not None:
+        topklen_main = swa_topk_length.to(torch.int32).contiguous()
+    else:
+        topklen_main = torch.full((T_tok,), topk_main, dtype=torch.int32, device=device)
+    if has_extra and extra_topk_length is not None:
+        topklen_extra = extra_topk_length.to(torch.int32).contiguous()
+    else:
+        topklen_extra = torch.full((T_tok,), topk_extra, dtype=torch.int32, device=device)
+
+    # --- attn_sink (padded/dummy to h_q_pad) ----------------------------
+    if attn_sink is not None:
+        sink = attn_sink.to(torch.float32).reshape(-1).contiguous()
+        if sink.shape[0] < h_q_pad:
+            sink = torch.cat(
+                [sink, torch.zeros(h_q_pad - sink.shape[0], dtype=torch.float32, device=device)]
+            )
+    else:
+        sink = torch.zeros(h_q_pad, dtype=torch.float32, device=device)
+
+    # Output is pre-zeroed; the kernel also stores zeros, exercising writeback.
+    out = torch.zeros((T_tok, h_q_pad, head_dim_v), dtype=torch.bfloat16, device=device)
+
+    kernel = _build_dual_scope_kernel(
+        h_q=h_q_pad,
+        head_dim=D_QK,
+        head_dim_v=head_dim_v,
+        topk_main=topk_main,
+        topk_extra=topk_extra,
+        block_size_main=bs_main,
+        block_size_extra=bs_extra,
+        sm_scale=float(softmax_scale),
+        has_attn_sink=attn_sink is not None,
+        has_topk_length_main=swa_topk_length is not None,
+        has_topk_length_extra=(has_extra and extra_topk_length is not None),
     )
+
+    stream = torch.cuda.current_stream()
+    kernel(
+        q3.contiguous(), swa_u8, swa_idx, topklen_main,
+        extra_u8, extra_idx, topklen_extra,
+        sink, out, total_tokens=int(T_tok),
+        stream=fx.Stream(stream.cuda_stream),
+    )
+    return out[:, :H].contiguous()
 
 
 # ============================================================================

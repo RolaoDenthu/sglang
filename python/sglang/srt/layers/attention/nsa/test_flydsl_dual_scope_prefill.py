@@ -36,6 +36,8 @@ from sglang.srt.layers.attention.nsa.flydsl_dual_scope_prefill import (
     D_V,
     N_NOPE_TILES,
     QUANT_BLOCK,
+    _flydsl_available,
+    _flydsl_dual_scope_kernel_impl,
     _torch_reference_dual_scope,
     flydsl_dual_scope_prefill,
 )
@@ -326,6 +328,46 @@ def run_case(label: str, **kwargs) -> None:
     #       assert (1.0 - _cosine(kernel_out, ref)) < 3e-2
 
 
+def run_kernel_launch_case(label: str, **kwargs) -> None:
+    """COMPILE-FIRST milestone test: build tiny synthetic inputs, launch the
+    FlyDSL skeleton kernel directly, and assert it COMPILES, LAUNCHES, and
+    returns a correct shape/dtype tensor that is all-zeros (inner math is a
+    phase1 TODO).  Skips cleanly when CUDA / FlyDSL (gfx950) is unavailable so
+    the CPU reference harness still runs.
+    """
+    print(f"\n=== [kernel-launch] {label} ===")
+    if not torch.cuda.is_available():
+        print("  [SKIP] no CUDA device (FlyDSL kernel requires gfx950 GPU)")
+        return
+    if not _flydsl_available():
+        print("  [SKIP] FlyDSL / gfx950 not available")
+        return
+
+    s = build_synthetic_dual_scope(device="cuda", **kwargs)
+    out = _flydsl_dual_scope_kernel_impl(
+        q=s.q,
+        swa_k_cache=s.swa_k_cache,
+        swa_indices=s.swa_indices,
+        swa_topk_length=s.swa_topk_length,
+        extra_k_cache=s.extra_k_cache,
+        extra_indices=s.extra_indices,
+        extra_topk_length=s.extra_topk_length,
+        compress_ratio=s.compress_ratio,
+        softmax_scale=s.softmax_scale,
+        attn_sink=s.attn_sink,
+        head_dim_v=s.head_dim_v,
+    )
+
+    T, _, H, _ = s.q.shape
+    _check(
+        f"kernel out shape == [T={T}, H={H}, {s.head_dim_v}]",
+        tuple(out.shape) == (T, H, s.head_dim_v),
+    )
+    _check("kernel out dtype == bf16", out.dtype == torch.bfloat16)
+    _check("kernel out all-zeros (phase1 stub)", bool((out.to(torch.float32) == 0).all()))
+    print("  kernel COMPILED + LAUNCHED + wrote correct-shape zero output")
+
+
 def main() -> None:
     torch.manual_seed(0)
     run_case("dual scope (SWA + C4 extra), sink + topk_length", compress_ratio=4)
@@ -334,6 +376,11 @@ def main() -> None:
     run_case("SWA only (no extra scope)", with_extra=False)
     run_case("C128 extra (compress_ratio=128)", compress_ratio=128)
     print("\nAll dual-scope reference equivalence checks passed.")
+
+    # Compile-first FlyDSL kernel launch tests (skip cleanly off-box).
+    run_kernel_launch_case("dual scope (SWA + extra)", compress_ratio=4)
+    run_kernel_launch_case("SWA only (no extra scope)", with_extra=False)
+    run_kernel_launch_case("no attn_sink / no topk_length", with_attn_sink=False, with_topk_length=False)
 
 
 if __name__ == "__main__":
