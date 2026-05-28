@@ -48,6 +48,47 @@ from typing import Optional, Tuple
 import torch
 
 # ----------------------------------------------------------------------------
+# FlyDSL is a remote-container (gfx950) dependency.  Import its API surface at
+# MODULE level -- guarded so the module still imports on a CPU host where FlyDSL
+# is absent (the PyTorch reference path + CPU harness need no FlyDSL).
+#
+# IMPORTANT: these MUST be module globals (not imported inside the kernel
+# builder).  When the FlyDSL names live in the builder's local scope they become
+# closure free-vars of the @flyc.kernel function (and its nested _as_ptr helper),
+# which trips FlyDSL's ASTRewriter freevar-count check
+# ("requires N free vars, not N-1").  The known-good artefact kernels
+# (flydsl_nsa_prefill.py / flydsl_swa_prefill.py) import at module level for
+# exactly this reason; we mirror that import surface here.
+# ----------------------------------------------------------------------------
+try:  # pragma: no cover - exercised only on the gfx950 box
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from flydsl.compiler.kernel_function import CompilationContext
+    from flydsl.expr import (
+        arith,
+        buffer_ops,
+        const_expr,
+        gpu,
+        range_constexpr,
+        rocdl,
+    )
+    from flydsl.expr.typing import T, Vector as Vec
+    from flydsl.expr.utils.arith import _to_raw as _raw
+    from flydsl.runtime.device import get_rocm_arch
+    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+    from flydsl._mlir import ir
+    from flydsl._mlir.dialects import (
+        arith as _mlir_arith,
+        fly as _fly,
+        llvm as _llvm,
+        memref as _memref,
+    )
+
+    _HAS_FLYDSL = True
+except Exception:  # FlyDSL absent (CPU host): reference path + harness still run
+    _HAS_FLYDSL = False
+
+# ----------------------------------------------------------------------------
 # Layout / dim constants (must stay in sync with the pool + Triton reference).
 # ----------------------------------------------------------------------------
 D_QK: int = 512                 # query / key head dim (448 nope + 64 rope)
@@ -287,9 +328,9 @@ def _torch_reference_dual_scope(
 # ============================================================================
 def _flydsl_available() -> bool:
     """True only on a gfx950 host with FlyDSL importable."""
+    if not _HAS_FLYDSL:
+        return False
     try:
-        from flydsl.runtime.device import get_rocm_arch  # noqa: WPS433
-
         return str(get_rocm_arch()).startswith("gfx950")
     except Exception:
         return False
@@ -322,20 +363,11 @@ def _build_dual_scope_kernel(
     NOTE (phase1): this is a STRUCTURE-ONLY skeleton.  The gather / dequant /
     QK / online-softmax / PV math is intentionally left as TODO(phase1) stubs.
     It must not be wired into the live path until those land.
-    """
-    # FlyDSL is a remote-container dependency; import lazily so this module
-    # imports cleanly on CPU hosts.  The whole skeleton lives behind this import.
-    import flydsl.compiler as flyc  # noqa: F401
-    import flydsl.expr as fx  # noqa: F401
-    from flydsl.compiler.kernel_function import CompilationContext  # noqa: F401
-    from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl  # noqa: F401,E501
-    from flydsl.expr.typing import T, Vector as Vec  # noqa: F401
-    from flydsl.expr.utils.arith import _to_raw as _raw  # noqa: F401
-    from flydsl.runtime.device import get_rocm_arch
-    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # noqa: F401
-    from flydsl._mlir import ir  # noqa: F401
-    from flydsl._mlir.dialects import arith as _mlir_arith, fly as _fly, llvm as _llvm, memref as _memref  # noqa: F401,E501
 
+    FlyDSL is imported at MODULE level (guarded); this builder is only reachable
+    on the gfx950 box where the import succeeds.
+    """
+    assert _HAS_FLYDSL, "FlyDSL is not importable (build is gfx950-container only)"
     assert head_dim == D_QK, f"phase1 supports head_dim={D_QK} only"
     assert tile_m == 16 and block_n == 32, "phase1 MFMA tiling is fixed at 16x32"
 
@@ -568,8 +600,6 @@ def _flydsl_dual_scope_kernel_impl(
     False) so the public live path keeps using ``_torch_reference_dual_scope``;
     the kernel is exercised only via the dedicated launch test.
     """
-    import flydsl.expr as fx  # remote-container dependency; import lazily.
-
     q3 = _normalize_q(q)                         # [T, H, D_QK]
     device = q3.device
     T_tok, H, _ = q3.shape
