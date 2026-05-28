@@ -725,7 +725,7 @@ def _build_dual_scope_kernel(
             lonely_f = _fsub(c_one, _fmin(_fmul(l_r, c_big), c_one))
             one_m = _fsub(c_one, lonely_f)
             m_safe = _fmul(m_r, one_m)          # 0 when lonely (mirrors ref)
-            if has_attn_sink:
+            if const_expr(has_attn_sink):
                 sink = load_f32_elem(sink_ptr, head)
                 sink_term = _exp2(_fsub(_fmul(sink, c_log2e), m_safe))
                 denom = _fadd(l_r, sink_term)
