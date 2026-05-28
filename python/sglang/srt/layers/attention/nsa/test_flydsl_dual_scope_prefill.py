@@ -329,11 +329,11 @@ def run_case(label: str, **kwargs) -> None:
 
 
 def run_kernel_launch_case(label: str, **kwargs) -> None:
-    """COMPILE-FIRST milestone test: build tiny synthetic inputs, launch the
-    FlyDSL skeleton kernel directly, and assert it COMPILES, LAUNCHES, and
-    returns a correct shape/dtype tensor that is all-zeros (inner math is a
-    phase1 TODO).  Skips cleanly when CUDA / FlyDSL (gfx950) is unavailable so
-    the CPU reference harness still runs.
+    """Phase-1 inner-math test: build synthetic inputs, launch the FlyDSL
+    dual-scope kernel, and assert it numerically MATCHES the PyTorch reference
+    (cosine > 0.97).  Reports cosine / max-abs / max-rel per case.  Skips
+    cleanly when CUDA / FlyDSL (gfx950) is unavailable so the CPU reference
+    harness still runs.
     """
     print(f"\n=== [kernel-launch] {label} ===")
     if not torch.cuda.is_available():
@@ -358,14 +358,37 @@ def run_kernel_launch_case(label: str, **kwargs) -> None:
         head_dim_v=s.head_dim_v,
     )
 
+    ref = _torch_reference_dual_scope(
+        q=s.q,
+        swa_k_cache=s.swa_k_cache,
+        swa_indices=s.swa_indices,
+        swa_topk_length=s.swa_topk_length,
+        extra_k_cache=s.extra_k_cache,
+        extra_indices=s.extra_indices,
+        extra_topk_length=s.extra_topk_length,
+        compress_ratio=s.compress_ratio,
+        softmax_scale=s.softmax_scale,
+        attn_sink=s.attn_sink,
+        head_dim_v=s.head_dim_v,
+    ).to(out.device)
+
     T, _, H, _ = s.q.shape
     _check(
         f"kernel out shape == [T={T}, H={H}, {s.head_dim_v}]",
         tuple(out.shape) == (T, H, s.head_dim_v),
     )
     _check("kernel out dtype == bf16", out.dtype == torch.bfloat16)
-    _check("kernel out all-zeros (phase1 stub)", bool((out.to(torch.float32) == 0).all()))
-    print("  kernel COMPILED + LAUNCHED + wrote correct-shape zero output")
+    _check("kernel out all finite", bool(torch.isfinite(out.to(torch.float32)).all()))
+
+    of = out.to(torch.float32)
+    rf = ref.to(torch.float32)
+    cos = _cosine(of, rf)
+    max_abs = float((of - rf).abs().max())
+    denom = rf.abs().clamp_min(1e-4)
+    max_rel = float(((of - rf).abs() / denom).max())
+    print(f"  cosine(kernel, ref) = {cos:.6f}   max_abs = {max_abs:.3e}   "
+          f"max_rel = {max_rel:.3e}")
+    _check("cosine(kernel, ref) > 0.97", cos > 0.97)
 
 
 def main() -> None:

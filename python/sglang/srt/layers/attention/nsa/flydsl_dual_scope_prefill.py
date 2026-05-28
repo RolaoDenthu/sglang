@@ -377,9 +377,10 @@ def _build_dual_scope_kernel(
     gpu_arch = get_rocm_arch()
 
     # ---- tiling -----------------------------------------------------------
-    # One CTA per query token (heads tiled by BLOCK_H), matching the Triton
-    # baseline grid (cdiv(h_q, BLOCK_H), total_tokens).  DO NOT tile multiple
-    # query tokens per block (that reintroduces the tile-anchor indexing bug).
+    # One CTA per query token (grid.y); BLOCK_H heads tiled in grid.x.  The
+    # 16x16x32 bf16 MFMA M-dimension is the BLOCK_H=16 heads of this token
+    # (NOT 16 tokens like the artefacts), the N-dimension is BLOCK_N keys, the
+    # K-dimension is head_dim.  topk_length is read 1:1 per query token.
     WARP_SIZE = 64
     MFMA_N = 16
     MFMA_K = 32
@@ -390,24 +391,32 @@ def _build_dual_scope_kernel(
     KV_TILES_MAIN = topk_main // block_n
     KV_TILES_EXTRA = topk_extra // block_n
 
-    # Head tiling: one CTA per query token (grid.y), heads tiled by BLOCK_H
-    # (grid.x).  The zero-stub writeback distributes the head_dim_v output
-    # columns of each owned head across the BLOCK_SIZE-thread wave.
     BLOCK_H = block_h
-    assert head_dim_v % BLOCK_SIZE == 0, (
-        f"head_dim_v={head_dim_v} must be divisible by BLOCK_SIZE={BLOCK_SIZE}"
-    )
-    ELEMS_PER_THREAD = head_dim_v // BLOCK_SIZE     # 512 // 64 = 8
+    assert BLOCK_H == tile_m == MFMA_N, "phase1: BLOCK_H must equal MFMA M=16"
     TOK_OUT_STRIDE = h_q * head_dim_v               # Out token stride (elems)
     HEAD_OUT_STRIDE = head_dim_v                    # Out head stride (elems)
+    Q_STOK = h_q * head_dim                         # Q token stride (elems)
+
+    # ---- pool byte geometry (data-major: 576 data + 8 scale per slot) -----
+    SLOT_DATA_BYTES = D_NOPE + D_ROPE * 2           # 576
+    SLOT_SCALE_BYTES = BYTES_PER_TOKEN_SCALE        # 8
+    PBB_MAIN = block_size_main * (SLOT_DATA_BYTES + SLOT_SCALE_BYTES)
+    PBB_EXTRA = block_size_extra * (SLOT_DATA_BYTES + SLOT_SCALE_BYTES)
+    NOPE_HALF = D_NOPE // 2                          # 224
+    NOPE_CHUNKS = NOPE_HALF // 8                     # 28
+    ROPE_HALF = D_ROPE // 2                          # 32
+    ROPE_CHUNKS = ROPE_HALF // 8                     # 4
+
+    SM_LOG2E = float(sm_scale) * _LOG2E
+    BIG = 1.0e30                                     # finite mask sentinel
 
     # ---- LDS layout -------------------------------------------------------
-    # KV tile staged as i64 packs (8 bf16/fp8 lanes per i64); P (attn weights)
-    # staged as f32.  Same shape as the artefact kernels.
-    LDS_KV_I64 = block_n * head_dim // 8
-    LDS_KV_BYTES = LDS_KV_I64 * 8
-    LDS_P_F32 = tile_m * block_n
-    LDS_P_BYTES = LDS_P_F32 * 4
+    # KV tile staged as dequantized bf16 [block_n, head_dim]; P (attn weights)
+    # staged as f32 [BLOCK_H, block_n].
+    LDS_KV_BF16 = block_n * head_dim                # 16384 bf16
+    LDS_KV_BYTES = LDS_KV_BF16 * 2                  # 32768
+    LDS_P_F32 = BLOCK_H * block_n                    # 512
+    LDS_P_BYTES = LDS_P_F32 * 4                      # 2048
     LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES
 
     alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name="dual_scope_smem")
@@ -441,85 +450,298 @@ def _build_dual_scope_kernel(
                 v = v.ir_value()
             return _fly.extract_aligned_pointer_as_index(_ptr_ty(), v)
 
-        out_ptr = _as_ptr(Out)
+        q_ptr           = _as_ptr(Q)
+        out_ptr         = _as_ptr(Out)
+        sink_ptr        = _as_ptr(AttnSink)
+        main_pool_ptr   = _as_ptr(KV_Main)
+        main_idx_ptr    = _as_ptr(Indices_Main)
+        main_tkl_ptr    = _as_ptr(TopkLen_Main)
+        extra_pool_ptr  = _as_ptr(KV_Extra)
+        extra_idx_ptr   = _as_ptr(Indices_Extra)
+        extra_tkl_ptr   = _as_ptr(TopkLen_Extra)
 
-        # ----------------------------------------------------------------
-        # Thread / block ids.
+        # ---- typed constants / fast-math wrappers ----------------------
+        v4f32_type  = Vec.make_type(4, fx.Float32)
+        vec8bf16_ty = Vec.make_type(8, fx.BFloat16)
+        fm = arith.FastMathFlags.fast
+
+        def _fadd(a, b): return arith.addf(_raw(a), _raw(b), fastmath=fm)
+        def _fmul(a, b): return arith.mulf(_raw(a), _raw(b), fastmath=fm)
+        def _fsub(a, b): return arith.subf(_raw(a), _raw(b), fastmath=fm)
+        def _fmax(a, b): return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm).result
+        def _fmin(a, b): return arith.MinNumFOp(_raw(a), _raw(b), fastmath=fm).result
+        def _exp2(x):    return rocdl.exp2(T.f32, _raw(x))
+
+        c_one  = fx.Float32(1.0)
+        c_big  = fx.Float32(BIG)
+        c_log2e = fx.Float32(_LOG2E)
+        c_sm_log2e = fx.Float32(SM_LOG2E)
+
+        # ---- load helpers ----------------------------------------------
+        def load_i32(ptr, eoff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(eoff), elem_type=T.i32)
+            return _llvm.LoadOp(T.i32, gep).result
+
+        def load_bf16_elem(ptr, eoff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(eoff), elem_type=T.bf16)
+            return _llvm.LoadOp(T.bf16, gep).result
+
+        def load_f32_elem(ptr, eoff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(eoff), elem_type=T.f32)
+            return _llvm.LoadOp(T.f32, gep).result
+
+        def load_u8_i32(ptr, boff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(boff), elem_type=T.i8)
+            u8 = _llvm.LoadOp(T.i8, gep).result
+            return _mlir_arith.ExtUIOp(T.i32, u8).result
+
+        def load_i64(ptr, boff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(boff), elem_type=T.i8)
+            return _llvm.LoadOp(T.i64, gep).result
+
+        def load_bf16_byte(ptr, boff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(boff), elem_type=T.i8)
+            return _llvm.LoadOp(T.bf16, gep).result
+
+        def extract_byte_i32(v_i64, j):
+            sh  = _mlir_arith.ShRUIOp(v_i64, _raw(fx.Int64(j * 8))).result
+            msk = _mlir_arith.AndIOp(sh, _raw(fx.Int64(0xFF))).result
+            return _mlir_arith.TruncIOp(T.i32, msk).result
+
+        def fp8_to_f32(byte_i32):
+            return rocdl.cvt_f32_fp8(T.f32, byte_i32, fx.Int32(0))
+
+        def ue8m0_to_f32(u8_i32):
+            f = _mlir_arith.UIToFPOp(T.f32, u8_i32).result
+            return _exp2(_fsub(f, fx.Float32(127.0)))
+
+        def to_bf16(f32val):
+            return fx.Float32(f32val).to(fx.BFloat16)
+
+        def mfma_bf16(acc, a, b):
+            return rocdl.mfma_f32_16x16x32_bf16(v4f32_type, [a, b, acc, 0, 0, 0])
+
+        # ---- thread / block ids ----------------------------------------
         #   grid = (cdiv(h_q, BLOCK_H), total_tokens); block = (BLOCK_SIZE,1,1).
-        #   One CTA per query token (s_q == 1); heads tiled by BLOCK_H.  This
-        #   intentionally differs from the artefacts' (cdiv(tokens, TILE_M), h_q)
-        #   grid -- keeping one CTA per token avoids the tile-anchor index bug
-        #   and matches topk_length being 1:1 per query token.
-        # ----------------------------------------------------------------
         tid        = fx.Index(gpu.thread_idx.x)
-        bid_h_tile = fx.Index(gpu.block_idx.x)   # head-tile id
-        pid_t      = fx.Index(gpu.block_idx.y)   # query-token id
+        bid_h_tile = fx.Index(gpu.block_idx.x)
+        pid_t      = fx.Index(gpu.block_idx.y)
 
-        # ----------------------------------------------------------------
-        # LDS allocation (declared + finalized now; real KV/P staging is phase1).
-        # A trivial store + barrier exercises the LDS path so the JIT'd kernel
-        # references the finalized shared-memory global.
-        # ----------------------------------------------------------------
-        lds_base   = alloc.get_base()
-        lds_kv_i64 = SmemPtr(lds_base, kv_lds_off, T.i64, shape=(LDS_KV_I64,)).get()
-        lds_p_f32  = SmemPtr(lds_base, p_lds_off,  T.f32, shape=(LDS_P_F32,)).get()  # noqa: F841
-        _memref.store(_raw(fx.Int64(0)), lds_kv_i64, [_raw(tid)])
-        gpu.barrier()
+        lane     = tid % fx.Index(MFMA_N)        # 0..15 : MFMA row(A)/col(B/C)
+        k_group  = tid // fx.Index(MFMA_N)       # 0..3  : MFMA K-subgroup
+        head_base = bid_h_tile * fx.Index(BLOCK_H)
+        kv_row   = tid % fx.Index(block_n)       # 0..31 : gather key row
+        g_half   = tid // fx.Index(block_n)      # 0/1   : gather head-dim half
 
-        # ================================================================
-        # phase1 inner-math TODOs (intentionally NOT implemented here).
-        # ----------------------------------------------------------------
-        # TODO(phase1): pre-load this token's Q head tile into K_STEPS_QK i64
-        #   register packs (bf16, 8 lanes per i64); init online-softmax carry
-        #   m_i=-inf (4), l_i=0 (4), o_acc=0 (D_BLKS x v4f32).
-        # TODO(phase1) _process_kv_tile(carry, kv_cache, idx_tensor, kv_pos_base,
-        #   block_size, topk_len): per BLOCK_N tile --
-        #     gather: load idx at (token, kv_pos_base+row); mask idx==-1 and
-        #       beyond topk_len -> invalid via BRANCHLESS bitmask (single LDS
-        #       store per thread; MLIR SelectOp caused a prior NameError).
-        #     decompose: block_idx = idx // block_size, off = idx % block_size
-        #       (power-of-2 shift/mask); data_base = block_idx*per_block_bytes +
-        #       off*576; scale_base = block_idx*per_block_bytes +
-        #       block_size*576 + off*8.
-        #     dequant nope (448 fp8): fp8->f32 via the gfx950 OCP e4m3fn path
-        #       (NOT the fnuz rocdl.cvt_f32_fp8 used by the artefacts) * ue8m0
-        #       exp2(scale_byte[d//64]-127); keep bf16.  NO fp8 re-quant.
-        #     dequant rope (128 raw bytes -> 64 bf16 LE): bitcast; concat after
-        #       nope -> 512-dim bf16 K (== V).  Stage K -> LDS i64; barrier.
-        #     QK GEMM: S[BLOCK_H,BLOCK_N] += Q_tile @ K_tile^T via
-        #       rocdl.mfma_f32_16x16x32_bf16 (bf16 in, f32 accum), K_STEPS_QK steps.
-        #     mask invalid -> S=-inf BEFORE the softmax max.
-        #     online softmax (log2 space): warp shuffle_xor row-max; m_new=
-        #       max(m_run,row_max); corr=exp2(m_run-m_new); p=exp2(S*sm_scale*
-        #       LOG2E - m_new); l_new=corr*l_run+sum(p); scale o_acc by corr.
-        #     stage P (f32) -> LDS; barrier; PV GEMM: o_acc += P @ V via MFMA.
-        # TODO(phase1): SWA (main) tiles first (KV_TILES_MAIN), then EXTRA tiles
-        #   (KV_TILES_EXTRA), into ONE shared online-softmax state; early-skip
-        #   tiles beyond TopkLen_Main / TopkLen_Extra.
-        # TODO(phase1): finalize -- denom = l_i + (exp2((AttnSink-m_i)*LOG2E) if
-        #   HAS_ATTN_SINK); output_scale = 1/denom; lonely (l_i==0) -> zero row;
-        #   o = (o_acc * output_scale).to(bf16); store [head_dim_v].
-        # ================================================================
+        # ---- LDS ------------------------------------------------------
+        lds_base = alloc.get_base()
+        lds_kv = SmemPtr(lds_base, kv_lds_off, T.bf16, shape=(LDS_KV_BF16,)).get()
+        lds_p  = SmemPtr(lds_base, p_lds_off,  T.f32,  shape=(LDS_P_F32,)).get()
 
-        # ----------------------------------------------------------------
-        # phase1 writeback: store ZEROS for every (token, head) this CTA owns.
-        # Each of the BLOCK_SIZE threads strides over the head_dim_v columns
-        # (ELEMS_PER_THREAD each) for each of the BLOCK_H heads in this tile.
-        # ----------------------------------------------------------------
-        zero_bf16 = fx.Float32(0.0).to(fx.BFloat16).ir_value()
-        for h_local in range_constexpr(BLOCK_H):
-            head = bid_h_tile * fx.Index(BLOCK_H) + fx.Index(h_local)
-            for je in range_constexpr(ELEMS_PER_THREAD):
-                d = tid + fx.Index(je * BLOCK_SIZE)
-                out_elem = (
-                    pid_t * fx.Index(TOK_OUT_STRIDE)
-                    + head * fx.Index(HEAD_OUT_STRIDE)
-                    + d
+        topklen_main_val  = load_i32(main_tkl_ptr,  pid_t)
+        topklen_extra_val = load_i32(extra_tkl_ptr, pid_t)
+
+        # ---- preload Q head tile into K_STEPS_QK x vector<8xbf16> -------
+        # A-operand row m = lane -> head (head_base + lane); k_group selects
+        # the 8 contraction dims [ks*32 + k_group*8 : +8].
+        q_packs = []
+        for ks in range_constexpr(K_STEPS_QK):
+            q_elems = []
+            for j in range_constexpr(8):
+                q_eoff = (
+                    pid_t * fx.Index(Q_STOK)
+                    + (head_base + lane) * fx.Index(head_dim)
+                    + fx.Index(ks * MFMA_K + j) + k_group * fx.Index(8)
                 )
+                q_elems.append(load_bf16_elem(q_ptr, q_eoff))
+            q_packs.append(Vec.from_elements(q_elems, fx.BFloat16))
+
+        # ---- online-softmax carry (finite -BIG sentinel, never -inf) ---
+        m_run = [_raw(fx.Float32(-BIG)) for _ in range_constexpr(4)]
+        l_run = [_raw(fx.Float32(0.0)) for _ in range_constexpr(4)]
+        o_acc = [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(D_BLKS)]
+
+        def emit_tile(kv_tile, pool_ptr, idx_ptr, tkl_val, topk, bs, pbb):
+            # python-side carry references via closure (rebound after)
+            kv_pos_base = kv_tile * block_n
+
+            # === gather + dequant one BLOCK_N tile -> LDS (bf16) =========
+            idx_i32 = load_i32(idx_ptr, pid_t * fx.Index(topk)
+                               + fx.Index(kv_pos_base) + kv_row)
+            idx_c = _mlir_arith.MaxSIOp(idx_i32, _raw(fx.Int32(0))).result
+            blk = _mlir_arith.DivUIOp(idx_c, _raw(fx.Int32(bs))).result
+            off = _mlir_arith.RemUIOp(idx_c, _raw(fx.Int32(bs))).result
+            blk_i = fx.Index(blk)
+            off_i = fx.Index(off)
+            data_base = blk_i * fx.Index(pbb) + off_i * fx.Index(SLOT_DATA_BYTES)
+            scale_base = (blk_i * fx.Index(pbb)
+                          + fx.Index(bs * SLOT_DATA_BYTES)
+                          + off_i * fx.Index(SLOT_SCALE_BYTES))
+
+            # phase A: nope (448 fp8) -> bf16, per-64 ue8m0 scale folded in
+            for dc in range_constexpr(NOPE_CHUNKS):
+                abs_dim = g_half * fx.Index(NOPE_HALF) + fx.Index(dc * 8)
+                tile = abs_dim // fx.Index(QUANT_BLOCK)
+                scale_f = ue8m0_to_f32(load_u8_i32(pool_ptr, scale_base + tile))
+                raw_i64 = load_i64(pool_ptr, data_base + abs_dim)
+                bvals = []
+                for j in range_constexpr(8):
+                    fv = _fmul(fp8_to_f32(extract_byte_i32(raw_i64, j)), scale_f)
+                    bvals.append(to_bf16(fv))
+                Vec.from_elements(bvals, fx.BFloat16).store(
+                    lds_kv, [kv_row * fx.Index(head_dim) + abs_dim]
+                )
+
+            # phase B: rope (128 raw bytes -> 64 bf16 LE) -> bf16
+            for dc in range_constexpr(ROPE_CHUNKS):
+                rope_idx = g_half * fx.Index(ROPE_HALF) + fx.Index(dc * 8)
+                bvals = []
+                for j in range_constexpr(8):
+                    boff = (data_base + fx.Index(D_NOPE)
+                            + (rope_idx + fx.Index(j)) * fx.Index(2))
+                    bvals.append(load_bf16_byte(pool_ptr, boff))
+                Vec.from_elements(bvals, fx.BFloat16).store(
+                    lds_kv, [kv_row * fx.Index(head_dim) + fx.Index(D_NOPE) + rope_idx]
+                )
+
+            gpu.barrier()
+
+            # === QK GEMM : S[BLOCK_H, BLOCK_N] = Q @ K^T (bf16 MFMA) =====
+            s_acc = [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(N_BLKS_S)]
+            for ks in range_constexpr(K_STEPS_QK):
+                q_a = q_packs[ks]
+                for nb in range_constexpr(N_BLKS_S):
+                    key = fx.Index(nb * MFMA_N) + lane
+                    koff = (key * fx.Index(head_dim)
+                            + fx.Index(ks * MFMA_K) + k_group * fx.Index(8))
+                    k_b = Vec.load(vec8bf16_ty, lds_kv, [koff])
+                    s_acc[nb] = mfma_bf16(s_acc[nb], q_a, k_b)
+
+            # === validity mask (recomputed per key column) ==============
+            mask_f = []
+            for nb in range_constexpr(N_BLKS_S):
+                key_pos = fx.Index(kv_pos_base + nb * MFMA_N) + lane
+                ki = load_i32(idx_ptr, pid_t * fx.Index(topk) + key_pos)
+                ne = arith.cmpi(arith.CmpIPredicate.ne, ki, fx.Int32(-1))
+                kp_i32 = _mlir_arith.IndexCastOp(T.i32, _raw(key_pos)).result
+                lt = arith.cmpi(arith.CmpIPredicate.slt, kp_i32, tkl_val)
+                good = _mlir_arith.AndIOp(_raw(ne), _raw(lt)).result
+                mask_f.append(_mlir_arith.UIToFPOp(T.f32, good).result)
+
+            # === online softmax (log2 space) ===========================
+            s_scaled = [
+                [_fmul(Vec(s_acc[nb])[r], c_sm_log2e) for r in range_constexpr(4)]
+                for nb in range_constexpr(N_BLKS_S)
+            ]
+            # masked columns: drive far negative for the max (finite, no NaN)
+            s_for_max = [
+                [_fadd(s_scaled[nb][r], _fmul(_fsub(mask_f[nb], c_one), c_big))
+                 for r in range_constexpr(4)]
+                for nb in range_constexpr(N_BLKS_S)
+            ]
+            local_max = [_fmax(s_for_max[0][r], s_for_max[1][r]) for r in range_constexpr(4)]
+            row_max = list(local_max)
+            for xor_off in [8, 4, 2, 1]:
+                so = fx.Int32(xor_off)
+                for r in range_constexpr(4):
+                    row_max[r] = _fmax(
+                        row_max[r],
+                        fx.Float32(row_max[r]).shuffle_xor(so, fx.Int32(WARP_SIZE)),
+                    )
+
+            m_new = [_fmax(m_run[r], row_max[r]) for r in range_constexpr(4)]
+            corr  = [_exp2(_fsub(m_run[r], m_new[r])) for r in range_constexpr(4)]
+
+            p_vals   = [[None] * 4 for _ in range_constexpr(N_BLKS_S)]
+            tile_sum = [_raw(fx.Float32(0.0)) for _ in range_constexpr(4)]
+            for nb in range_constexpr(N_BLKS_S):
+                for r in range_constexpr(4):
+                    p = _fmul(_exp2(_fsub(s_scaled[nb][r], m_new[r])), mask_f[nb])
+                    p_vals[nb][r] = p
+                    tile_sum[r] = _fadd(tile_sum[r], p)
+            for xor_off in [8, 4, 2, 1]:
+                so = fx.Int32(xor_off)
+                for r in range_constexpr(4):
+                    tile_sum[r] = _fadd(
+                        tile_sum[r],
+                        fx.Float32(tile_sum[r]).shuffle_xor(so, fx.Int32(WARP_SIZE)),
+                    )
+
+            l_new = [_fadd(_fmul(corr[r], l_run[r]), tile_sum[r]) for r in range_constexpr(4)]
+            new_o = []
+            for d in range_constexpr(D_BLKS):
+                ov = Vec(o_acc[d])
+                new_o.append(
+                    Vec.from_elements(
+                        [_fmul(ov[r], corr[r]) for r in range_constexpr(4)], fx.Float32
+                    )
+                )
+
+            # === stage P (f32) -> LDS, transposed [head_row][key] =======
+            for nb in range_constexpr(N_BLKS_S):
+                for r in range_constexpr(4):
+                    p_row = k_group * fx.Index(4) + fx.Index(r)
+                    p_col = fx.Index(nb * MFMA_N) + lane
+                    _memref.store(_raw(p_vals[nb][r]), lds_p,
+                                  [_raw(p_row * fx.Index(block_n) + p_col)])
+            gpu.barrier()
+
+            # === PV GEMM : O += P @ V (bf16 MFMA) =======================
+            p_base = lane * fx.Index(block_n) + k_group * fx.Index(8)
+            p_a = Vec.from_elements(
+                [to_bf16(_memref.load(lds_p, [_raw(p_base + fx.Index(j))]))
+                 for j in range_constexpr(8)],
+                fx.BFloat16,
+            )
+            for d in range_constexpr(D_BLKS):
+                vvals = []
+                for j in range_constexpr(8):
+                    key = k_group * fx.Index(8) + fx.Index(j)
+                    voff = key * fx.Index(head_dim) + fx.Index(d * MFMA_N) + lane
+                    vvals.append(_memref.load(lds_kv, [_raw(voff)]))
+                v_b = Vec.from_elements(vvals, fx.BFloat16)
+                new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
+            gpu.barrier()
+            return m_new, l_new, new_o
+
+        # ==== dual-scope online softmax: SWA (main) then EXTRA ==========
+        for kv_tile in range_constexpr(KV_TILES_MAIN):
+            m_run, l_run, o_acc = emit_tile(
+                kv_tile, main_pool_ptr, main_idx_ptr, topklen_main_val,
+                topk_main, block_size_main, PBB_MAIN,
+            )
+        for kv_tile in range_constexpr(KV_TILES_EXTRA):
+            m_run, l_run, o_acc = emit_tile(
+                kv_tile, extra_pool_ptr, extra_idx_ptr, topklen_extra_val,
+                topk_extra, block_size_extra, PBB_EXTRA,
+            )
+
+        # ==== finalize : normalize, fold attn_sink, lonely -> zero ======
+        for r in range_constexpr(4):
+            head = head_base + k_group * fx.Index(4) + fx.Index(r)
+            l_r = l_run[r]
+            m_r = m_run[r]
+            # lonely (l==0): l>=1 whenever any key was valid (max key p=1)
+            lonely_f = _fsub(c_one, _fmin(_fmul(l_r, c_big), c_one))
+            one_m = _fsub(c_one, lonely_f)
+            m_safe = _fmul(m_r, one_m)          # 0 when lonely (mirrors ref)
+            if has_attn_sink:
+                sink = load_f32_elem(sink_ptr, head)
+                sink_term = _exp2(_fsub(_fmul(sink, c_log2e), m_safe))
+                denom = _fadd(l_r, sink_term)
+            else:
+                denom = l_r
+            safe_denom = _fadd(_fmul(denom, one_m), lonely_f)   # ==1 when lonely
+            inv = arith.divf(_raw(c_one), _raw(safe_denom), fastmath=fm)
+            for d in range_constexpr(D_BLKS):
+                o_norm = _fmul(Vec(o_acc[d])[r], inv)
+                out_off = (pid_t * fx.Index(TOK_OUT_STRIDE)
+                           + head * fx.Index(HEAD_OUT_STRIDE)
+                           + fx.Index(d * MFMA_N) + lane)
                 out_gep = buffer_ops.get_element_ptr(
-                    out_ptr, fx.Int64(out_elem), elem_type=T.bf16
+                    out_ptr, fx.Int64(out_off), elem_type=T.bf16
                 )
-                _llvm.StoreOp(zero_bf16, out_gep)
+                _llvm.StoreOp(to_bf16(o_norm).ir_value(), out_gep)
         return
 
     @flyc.jit
@@ -619,8 +841,11 @@ def _flydsl_dual_scope_kernel_impl(
         topk_extra = extra_idx.shape[1]
         extra_u8, _nb_extra, bs_extra = _block_layout(extra_k_cache)
     else:
+        # No extra scope: feed an all-invalid (-1) dummy so the kernel's extra
+        # tiles mask out to zero contribution (matches the reference, which
+        # skips the extra scope entirely).
         topk_extra = topk_main
-        extra_idx = torch.zeros((T_tok, topk_extra), dtype=torch.int32, device=device)
+        extra_idx = torch.full((T_tok, topk_extra), -1, dtype=torch.int32, device=device)
         extra_u8 = swa_u8
         bs_extra = bs_main
 
@@ -644,7 +869,11 @@ def _flydsl_dual_scope_kernel_impl(
     else:
         sink = torch.zeros(h_q_pad, dtype=torch.float32, device=device)
 
-    # Output is pre-zeroed; the kernel also stores zeros, exercising writeback.
+    # Q padded to h_q_pad heads (kernel computes a full BLOCK_H tile; extra
+    # heads are discarded by the [:, :H] slice on return).
+    q_pad = torch.zeros((T_tok, h_q_pad, D_QK), dtype=torch.bfloat16, device=device)
+    q_pad[:, :H] = q3.to(torch.bfloat16)
+
     out = torch.zeros((T_tok, h_q_pad, head_dim_v), dtype=torch.bfloat16, device=device)
 
     kernel = _build_dual_scope_kernel(
@@ -663,7 +892,7 @@ def _flydsl_dual_scope_kernel_impl(
 
     stream = torch.cuda.current_stream()
     kernel(
-        q3.contiguous(), swa_u8, swa_idx, topklen_main,
+        q_pad, swa_u8, swa_idx, topklen_main,
         extra_u8, extra_idx, topklen_extra,
         sink, out, total_tokens=int(T_tok),
         stream=fx.Stream(stream.cuda_stream),
