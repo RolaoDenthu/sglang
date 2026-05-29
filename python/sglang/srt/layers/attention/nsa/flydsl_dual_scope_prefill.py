@@ -7,18 +7,22 @@ online-softmax pass.  It is the FlyDSL analogue of the authoritative Triton
 reference ``_fused_gather_attn_dsv4_dual_scope_kernel`` in
 ``nsa/triton_decode/triton_mla_kernels_decode_fused.py``.
 
-INCREMENT 1 (this file): scaffold only.
-  * ``flydsl_dual_scope_prefill``      -- public entry matching the backend hook.
-  * ``_torch_reference_dual_scope``    -- faithful pure-PyTorch correctness oracle
-                                          (currently wired as the live TEMP path).
-  * ``_build_dual_scope_kernel``       -- FlyDSL kernel SKELETON (structure only,
-                                          inner math stubbed with TODO(phase1)).
-  * ``_flydsl_dual_scope_kernel_impl`` -- thin launcher, stubbed (NotImplemented),
-                                          gated behind ``_USE_FLYDSL_KERNEL``.
+Components:
+  * ``flydsl_dual_scope_prefill``      -- public entry matching the backend hook;
+                                          the live prefill path on gfx950.
+  * ``_build_dual_scope_kernel``       -- the FlyDSL kernel: gather + e4m3fn fp8
+                                          dequant + QK + exp2 online softmax + PV
+                                          over both scopes in one fused pass.
+  * ``_flydsl_dual_scope_kernel_impl`` -- thin launcher that normalizes inputs,
+                                          builds/caches the kernel, and launches it.
+  * ``_torch_reference_dual_scope``    -- faithful pure-PyTorch correctness ORACLE
+                                          used by the tests (NOT a live fallback).
 
-The FlyDSL import is lazy/guarded so this module imports cleanly on a CPU host
-where FlyDSL (a remote-container dependency) is absent; the reference path and
-the test harness run without FlyDSL present.
+The FlyDSL kernel is the live path (``_USE_FLYDSL_KERNEL = True``) and matches
+both the PyTorch oracle and the production Triton kernel on synthetic, scaled,
+and real captured tensors.  The FlyDSL import is lazy/guarded so this module
+still imports cleanly on a CPU host where FlyDSL (a remote-container dependency)
+is absent; the PyTorch oracle and the test harness run without FlyDSL present.
 
 ----------------------------------------------------------------------------
 Paged KV pool byte layout (per block of ``block_size`` token slots), mirrored
@@ -102,9 +106,11 @@ BYTES_PER_TOKEN_SCALE: int = 8                       # 7 ue8m0 + 1 pad
 
 _LOG2E: float = 1.4426950408889634
 
-# Internal flag: when True the public entry routes prefill through the FlyDSL
-# dual-scope kernel (_flydsl_dual_scope_kernel_impl); when False it uses the
-# PyTorch reference. The kernel inner-math (phase1) has landed and is validated.
+# Internal flag: when True (the production default) the public entry routes
+# prefill through the live FlyDSL dual-scope kernel
+# (_flydsl_dual_scope_kernel_impl). When False the public entry uses the
+# pure-PyTorch oracle (_torch_reference_dual_scope) -- this branch exists for
+# the tests/oracle path only, not as a runtime fallback.
 _USE_FLYDSL_KERNEL: bool = True
 
 
@@ -325,7 +331,8 @@ def _torch_reference_dual_scope(
 
 
 # ============================================================================
-# FlyDSL kernel SKELETON (structure only -- inner math stubbed for phase1)
+# FlyDSL fused dual-scope kernel (live prefill path): gather + fp8 dequant +
+# QK + exp2 online softmax + PV over SWA (main) and C4/C128 (extra) in one pass.
 # ============================================================================
 def _flydsl_available() -> bool:
     """True only on a gfx950 host with FlyDSL importable."""
@@ -358,19 +365,20 @@ def _build_dual_scope_kernel(
     """Build (and cache) the fused dual-scope FlyDSL kernel.
 
     The lru_cache key is the full set of compile-time-shaping args (dtype is
-    fixed bf16/fp8 by phase, dims/topk/block sizes/BLOCK_H/sink/length flags
-    select a distinct kernel specialization).  Returns a python launcher.
+    fixed bf16/fp8, dims/topk/block sizes/BLOCK_H/sink/length flags select a
+    distinct kernel specialization).  Returns a python launcher.
 
-    NOTE (phase1): this is a STRUCTURE-ONLY skeleton.  The gather / dequant /
-    QK / online-softmax / PV math is intentionally left as TODO(phase1) stubs.
-    It must not be wired into the live path until those land.
+    The kernel implements the full dual-scope inner math: per-tile gather +
+    e4m3fn fp8 dequant into LDS, bf16-MFMA QK, exp2 online softmax with running
+    (m, l, acc) state shared across the SWA then EXTRA scopes, and bf16-MFMA PV,
+    finalized with attn_sink folding and a lonely-query zero row.
 
     FlyDSL is imported at MODULE level (guarded); this builder is only reachable
     on the gfx950 box where the import succeeds.
     """
     assert _HAS_FLYDSL, "FlyDSL is not importable (build is gfx950-container only)"
-    assert head_dim == D_QK, f"phase1 supports head_dim={D_QK} only"
-    assert tile_m == 16 and block_n == 32, "phase1 MFMA tiling is fixed at 16x32"
+    assert head_dim == D_QK, f"only head_dim={D_QK} is supported"
+    assert tile_m == 16 and block_n == 32, "MFMA tiling is fixed at 16x32"
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
@@ -393,7 +401,7 @@ def _build_dual_scope_kernel(
     KV_TILES_EXTRA = topk_extra // block_n
 
     BLOCK_H = block_h
-    assert BLOCK_H == tile_m == MFMA_N, "phase1: BLOCK_H must equal MFMA M=16"
+    assert BLOCK_H == tile_m == MFMA_N, "BLOCK_H must equal MFMA M=16"
     TOK_OUT_STRIDE = h_q * head_dim_v               # Out token stride (elems)
     HEAD_OUT_STRIDE = head_dim_v                    # Out head stride (elems)
     Q_STOK = h_q * head_dim                         # Q token stride (elems)
@@ -850,11 +858,12 @@ def _flydsl_dual_scope_kernel_impl(
 ) -> torch.Tensor:
     """Thin launcher: normalize inputs, build/cache the kernel, launch, return.
 
-    COMPILE-FIRST milestone: this allocates the output [T, H, head_dim_v] bf16
-    and launches the FlyDSL skeleton kernel, which writes ZEROS (inner math is
-    still a phase1 TODO).  It is wired behind ``_USE_FLYDSL_KERNEL`` (currently
-    False) so the public live path keeps using ``_torch_reference_dual_scope``;
-    the kernel is exercised only via the dedicated launch test.
+    Allocates the output [T, H, head_dim_v] bf16 and launches the live FlyDSL
+    dual-scope kernel, which computes the full attention (gather + fp8 dequant +
+    QK + online softmax + PV).  Reached from the public entry whenever
+    ``_USE_FLYDSL_KERNEL`` is True and FlyDSL is available on the gfx950 host.
+    Q / attn_sink are padded to a multiple of BLOCK_H heads; the extra padding
+    heads are sliced off (``[:, :H]``) before returning.
     """
     q3 = _normalize_q(q)                         # [T, H, D_QK]
     device = q3.device
@@ -968,7 +977,15 @@ def flydsl_dual_scope_prefill(
     Returns [T, H, head_dim_v] bf16; the hook squeezes a 4D result, so a 3D
     return matches ``flash_mla_with_kvcache_entrypoint(...)[0].squeeze(1)``.
     """
-    if _USE_FLYDSL_KERNEL and _flydsl_available():
+    if _USE_FLYDSL_KERNEL:
+        # Live kernel path. If FlyDSL is unavailable here we must NOT silently
+        # degrade to the PyTorch oracle -- the kernel is the intended live path,
+        # so fail hard (strict mode) and let the server crash.
+        if not _flydsl_available():
+            raise RuntimeError(
+                "[FlyDSL] _USE_FLYDSL_KERNEL=True but FlyDSL runtime is "
+                "unavailable -- aborting (strict mode)"
+            )
         return _flydsl_dual_scope_kernel_impl(
             q=q,
             swa_k_cache=swa_k_cache,
@@ -983,7 +1000,7 @@ def flydsl_dual_scope_prefill(
             head_dim_v=head_dim_v,
         )
 
-    # TEMP: reference path until FlyDSL kernel inner-math lands.
+    # Oracle path: only reached when _USE_FLYDSL_KERNEL is False (tests).
     return _torch_reference_dual_scope(
         q=q,
         swa_k_cache=swa_k_cache,

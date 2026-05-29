@@ -1108,8 +1108,10 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             # FlyDSL dual-scope kernel that mirrors the Triton
             # `_fused_gather_attn_dsv4_dual_scope_kernel` reference: SWA + C4/C128
             # gathered and attended in one online-softmax pass (no Python-side
-            # LSE merge). Falls back to the FlashMLA/Triton baseline whenever the
-            # kernel is unavailable (not yet implemented) or raises.
+            # LSE merge). This is the intended live path, so there is NO silent
+            # fallback: any failure (import or runtime) is logged with full
+            # traceback and re-raised so the server crashes immediately (strict
+            # mode) rather than silently degrading to the FlashMLA/Triton baseline.
             if (
                 os.environ.get("SGLANG_FLYDSL_PREFILL", "0") == "1"
                 and forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True)
@@ -1133,17 +1135,14 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         head_dim_v=self.head_dim_v,
                     )
                     return o.squeeze(1) if o.ndim == 4 else o
-                except ImportError:
-                    # FlyDSL dual-scope kernel not implemented yet — use baseline.
-                    pass
                 except Exception:
-                    import traceback
-
-                    logger.warning(
-                        "[FlyDSL] dual-scope prefill failed, falling back to "
-                        "baseline:\n%s",
-                        traceback.format_exc(),
+                    # Strict mode: do not fall through to the baseline. Capture
+                    # the full stack and re-raise to abort the server.
+                    logger.exception(
+                        "[FlyDSL] prefill kernel failed and fallback is disabled "
+                        "(strict mode) — aborting server"
                     )
+                    raise
 
             backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
             o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
