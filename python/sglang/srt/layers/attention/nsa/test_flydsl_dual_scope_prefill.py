@@ -391,6 +391,22 @@ def run_kernel_launch_case(label: str, **kwargs) -> None:
     _check("cosine(kernel, ref) > 0.97", cos > 0.97)
 
 
+# Larger shape exercising grid_h>1 head-tiling and multi-tile runtime scf.for
+# loops: H=20 -> h_q_pad=32 -> grid_h=2; pool block_size=64; topk 128 (4 SWA
+# tiles) + 256 (8 EXTRA tiles).  Keyword set reused by both the CPU reference
+# checks and the on-box kernel-launch checks below.
+_LARGE_CASE = dict(
+    H=20,
+    topk_main=128,
+    topk_extra=256,
+    block_size_main=64,
+    block_size_extra=64,
+    num_blocks_main=8,
+    num_blocks_extra=8,
+    compress_ratio=4,
+)
+
+
 def main() -> None:
     torch.manual_seed(0)
     run_case("dual scope (SWA + C4 extra), sink + topk_length", compress_ratio=4)
@@ -398,12 +414,16 @@ def main() -> None:
     run_case("dual scope, no topk_length", with_topk_length=False)
     run_case("SWA only (no extra scope)", with_extra=False)
     run_case("C128 extra (compress_ratio=128)", compress_ratio=128)
+    run_case("LARGE: H=20 (grid_h>1), bs=64, multi-tile (4 SWA + 8 EXTRA)", **_LARGE_CASE)
     print("\nAll dual-scope reference equivalence checks passed.")
 
     # Compile-first FlyDSL kernel launch tests (skip cleanly off-box).
     run_kernel_launch_case("dual scope (SWA + extra)", compress_ratio=4)
     run_kernel_launch_case("SWA only (no extra scope)", with_extra=False)
     run_kernel_launch_case("no attn_sink / no topk_length", with_attn_sink=False, with_topk_length=False)
+    run_kernel_launch_case(
+        "LARGE: H=20 (grid_h>1), bs=64, multi-tile (4 SWA + 8 EXTRA)", **_LARGE_CASE
+    )
 
 
 if __name__ == "__main__":

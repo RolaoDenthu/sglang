@@ -557,17 +557,27 @@ def _build_dual_scope_kernel(
             q_packs.append(Vec.from_elements(q_elems, fx.BFloat16))
 
         # ---- online-softmax carry (finite -BIG sentinel, never -inf) ---
-        m_run = [_raw(fx.Float32(-BIG)) for _ in range_constexpr(4)]
-        l_run = [_raw(fx.Float32(0.0)) for _ in range_constexpr(4)]
-        o_acc = [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(D_BLKS)]
+        # Flat loop-carried state for the runtime scf.for tile loops:
+        #   [0:4]            m_i   -- per-row running max (4 MFMA rows / lane)
+        #   [4:8]            l_i   -- per-row running softmax denominator
+        #   [8:8+D_BLKS]     o_acc -- D_BLKS x vector<4xf32> output accumulator
+        # All entries are raw IR values (vector<4xf32> for o_acc) so they can be
+        # carried directly through scf.for / yield.
+        _init = (
+            [_raw(fx.Float32(-BIG)) for _ in range_constexpr(4)]
+            + [_raw(fx.Float32(0.0)) for _ in range_constexpr(4)]
+            + [_raw(Vec.filled(4, 0.0, fx.Float32)) for _ in range_constexpr(D_BLKS)]
+        )
 
-        def emit_tile(kv_tile, pool_ptr, idx_ptr, tkl_val, topk, bs, pbb):
-            # python-side carry references via closure (rebound after)
-            kv_pos_base = kv_tile * block_n
+        def emit_tile(kv_tile, m_run, l_run, o_acc,
+                      pool_ptr, idx_ptr, tkl_val, topk, bs, pbb):
+            # kv_tile is a RUNTIME scf.for induction value (fx.Index); the carry
+            # (m_run, l_run, o_acc) is passed in explicitly per iteration.
+            kv_pos_base = kv_tile * fx.Index(block_n)
 
             # === gather + dequant one BLOCK_N tile -> LDS (bf16) =========
             idx_i32 = load_i32(idx_ptr, pid_t * fx.Index(topk)
-                               + fx.Index(kv_pos_base) + kv_row)
+                               + kv_pos_base + kv_row)
             idx_c = _mlir_arith.MaxSIOp(idx_i32, _raw(fx.Int32(0))).result
             blk = _mlir_arith.DivUIOp(idx_c, _raw(fx.Int32(bs))).result
             off = _mlir_arith.RemUIOp(idx_c, _raw(fx.Int32(bs))).result
@@ -620,7 +630,7 @@ def _build_dual_scope_kernel(
             # === validity mask (recomputed per key column) ==============
             mask_f = []
             for nb in range_constexpr(N_BLKS_S):
-                key_pos = fx.Index(kv_pos_base + nb * MFMA_N) + lane
+                key_pos = kv_pos_base + fx.Index(nb * MFMA_N) + lane
                 ki = load_i32(idx_ptr, pid_t * fx.Index(topk) + key_pos)
                 ne = arith.cmpi(arith.CmpIPredicate.ne, ki, fx.Int32(-1))
                 kp_i32 = _mlir_arith.IndexCastOp(T.i32, _raw(key_pos)).result
@@ -705,18 +715,41 @@ def _build_dual_scope_kernel(
             return m_new, l_new, new_o
 
         # ==== dual-scope online softmax: SWA (main) then EXTRA ==========
-        for kv_tile in range_constexpr(KV_TILES_MAIN):
-            m_run, l_run, o_acc = emit_tile(
-                kv_tile, main_pool_ptr, main_idx_ptr, topklen_main_val,
+        # RUNTIME scf.for carry loops: the per-tile body is emitted ONCE (not
+        # compile-time unrolled), so code size / JIT time stay bounded even at
+        # production topk (e.g. extra topk 2048 / block_n 32 -> 64 tiles).  The
+        # trip count KV_TILES_* = ceil(topk / BLOCK_N) is derived from the tensor
+        # shapes; the EXTRA loop continues into the SAME shared carried state
+        # (m_i, l_i, o_acc) produced by the SWA loop.  Per-key masking beyond
+        # topk_length / idx==-1 still zeroes any over-run column exactly as
+        # before, so a fixed (padded) trip count is numerically safe.
+        loop_results = _init
+        for kv_tile, _carry in range(0, KV_TILES_MAIN, 1, init=_init):
+            m_run = [_carry[r] for r in range_constexpr(4)]
+            l_run = [_carry[4 + r] for r in range_constexpr(4)]
+            o_acc = [_carry[8 + d] for d in range_constexpr(D_BLKS)]
+            m_new, l_new, new_o = emit_tile(
+                kv_tile, m_run, l_run, o_acc,
+                main_pool_ptr, main_idx_ptr, topklen_main_val,
                 topk_main, block_size_main, PBB_MAIN,
             )
-        for kv_tile in range_constexpr(KV_TILES_EXTRA):
-            m_run, l_run, o_acc = emit_tile(
-                kv_tile, extra_pool_ptr, extra_idx_ptr, topklen_extra_val,
+            loop_results = yield list(m_new) + list(l_new) + list(new_o)
+
+        for kv_tile, _carry in range(0, KV_TILES_EXTRA, 1, init=loop_results):
+            m_run = [_carry[r] for r in range_constexpr(4)]
+            l_run = [_carry[4 + r] for r in range_constexpr(4)]
+            o_acc = [_carry[8 + d] for d in range_constexpr(D_BLKS)]
+            m_new, l_new, new_o = emit_tile(
+                kv_tile, m_run, l_run, o_acc,
+                extra_pool_ptr, extra_idx_ptr, topklen_extra_val,
                 topk_extra, block_size_extra, PBB_EXTRA,
             )
+            loop_results = yield list(m_new) + list(l_new) + list(new_o)
 
         # ==== finalize : normalize, fold attn_sink, lonely -> zero ======
+        m_run = [loop_results[r] for r in range_constexpr(4)]
+        l_run = [loop_results[4 + r] for r in range_constexpr(4)]
+        o_acc = [loop_results[8 + d] for d in range_constexpr(D_BLKS)]
         for r in range_constexpr(4):
             head = head_base + k_group * fx.Index(4) + fx.Index(r)
             l_r = l_run[r]
