@@ -1563,7 +1563,14 @@ class MQALayer(nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.eps = config.rms_norm_eps
-        compress_ratio = config.compress_ratios[layer_id]
+        # transformers>=5.8 built-in DeepseekV4Config renamed this field
+        # ``compress_ratios`` -> ``compress_rates``; accept both names.
+        compress_ratios = getattr(
+            config,
+            "compress_rates",
+            getattr(config, "compress_ratios", None),
+        )
+        compress_ratio = compress_ratios[layer_id]
         assert compress_ratio in [0, 4, 128]
         self.compress_ratio: Literal[0, 4, 128] = compress_ratio  # type: ignore
 

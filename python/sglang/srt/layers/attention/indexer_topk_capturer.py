@@ -19,7 +19,13 @@ INDEX_TOPK = 512
 
 def _count_indexer_layers(model_config: "ModelConfig") -> int:
     # TODO very hacky now
-    compress_ratios = getattr(model_config.hf_text_config, "compress_ratios", None)
+    # transformers>=5.8 built-in DeepseekV4Config renamed this field
+    # ``compress_ratios`` -> ``compress_rates``; accept both names.
+    compress_ratios = getattr(model_config.hf_text_config, "compress_rates", None)
+    if compress_ratios is None:
+        compress_ratios = getattr(
+            model_config.hf_text_config, "compress_ratios", None
+        )
     if compress_ratios is None:
         return 0
     return sum(1 for r in compress_ratios if r == 4)

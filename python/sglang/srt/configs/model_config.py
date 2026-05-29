@@ -568,7 +568,15 @@ class ModelConfig:
             if envs.SGLANG_DSV4_MODE.get() == "2604":
                 self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim
-            self.compress_ratios = self.hf_config.compress_ratios
+            # transformers>=5.8 ships a built-in DeepseekV4Config that supersedes
+            # the checkpoint's remote-code config (even with trust_remote_code)
+            # and renames this field ``compress_ratios`` -> ``compress_rates``.
+            # Accept both so old and new transformers/checkpoints load.
+            self.compress_ratios = getattr(
+                self.hf_config,
+                "compress_rates",
+                getattr(self.hf_config, "compress_ratios", None),
+            )
             self.attention_arch = AttentionArch.MHA
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
             if self.hf_config.rope_scaling:
