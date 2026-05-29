@@ -102,9 +102,10 @@ BYTES_PER_TOKEN_SCALE: int = 8                       # 7 ue8m0 + 1 pad
 
 _LOG2E: float = 1.4426950408889634
 
-# Internal flag: when False the public entry uses the PyTorch reference (TEMP);
-# flip to True once the FlyDSL kernel inner-math (phase1) lands and is validated.
-_USE_FLYDSL_KERNEL: bool = False
+# Internal flag: when True the public entry routes prefill through the FlyDSL
+# dual-scope kernel (_flydsl_dual_scope_kernel_impl); when False it uses the
+# PyTorch reference. The kernel inner-math (phase1) has landed and is validated.
+_USE_FLYDSL_KERNEL: bool = True
 
 
 # ============================================================================
