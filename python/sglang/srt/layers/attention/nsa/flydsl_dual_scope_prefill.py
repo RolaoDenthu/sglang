@@ -988,18 +988,44 @@ def _build_dual_scope_kernel_c4(
     SM_LOG2E = float(sm_scale) * _LOG2E
     BIG = 1.0e30
 
-    # ---- LDS layout -------------------------------------------------------
-    LDS_KV_BF16 = block_n * head_dim                 # 32768 bf16 (64KB)
-    LDS_KV_BYTES = LDS_KV_BF16 * 2                    # 65536
+    import os as _os
+    # P pre-scale constant: P (<=1 after max-subtraction) and the folded ue8m0 V
+    # scale are lifted into the e4m3 sweet-spot before fp8 quantization, then the
+    # constant is divided back out of the f32 accumulator in finalize.  Tunable
+    # via env for the offline cosine gate (default 16 == 2^4).
+    PV_PRESCALE = float(_os.environ.get("SGLANG_FLYDSL_PV_FP8_PRESCALE", "16.0"))
+
+    # ---- fp8-in-LDS derived constants (nope packed 8-fp8/i64) -------------
+    N_NOPE_TILES = D_NOPE // QUANT_BLOCK              # 7 ue8m0 tiles / key
+    NOPE_I64 = D_NOPE // 8                            # 56 i64 / key (nope fp8)
+    NOPE_QUARTER_I64 = NOPE_QUARTER // 8              # 14 i64 / gather quarter
+    KS_NOPE = D_NOPE // MFMA_K                        # 14 QK k-steps that are nope
+    D_NOPE_BLKS = D_NOPE // MFMA_N                    # 28 PV d-blocks that are nope
+
+    # ---- LDS layout (compact: nope fp8 packed i64 + bf16 rope + f32 P) -----
+    # nope KV stays RAW fp8 (8/i64), consumed natively by the fp8 PV MFMA (V) and
+    # dequant-on-read by QK (interim).  The 7 ue8m0 scale bytes/key are packed
+    # into ONE extra i64 (single race-free buffer) and exp2-decoded on read.
+    # block_n=64 with 4 gather quarters: each quarter writes its own scale region
+    # (quarter 0 == the read region, 1..3 == never-read scratch) so every address
+    # has a single affine writer.
+    LDS_NOPE_CHUNKS = block_n * NOPE_I64              # 3584 i64 (nope fp8)
+    SCALE_BASE_I64 = LDS_NOPE_CHUNKS                  # scale sub-region offset
+    LDS_SCALE_I64 = block_n * N_WAVES                 # 256 i64 (1 read + 3 scratch)
+    LDS_KV_NOPE_I64 = LDS_NOPE_CHUNKS + LDS_SCALE_I64  # 3840 i64
+    LDS_KV_NOPE_BYTES = LDS_KV_NOPE_I64 * 8           # 30720
+    LDS_KV_ROPE_BF16 = block_n * D_ROPE              # 4096 bf16
+    LDS_KV_ROPE_BYTES = LDS_KV_ROPE_BF16 * 2         # 8192
     LDS_P_F32 = BLOCK_H * block_n                     # 8192 f32 (32KB)
     LDS_P_BYTES = LDS_P_F32 * 4                        # 32768
-    LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES            # 98304 (< 160KB)
+    LDS_TOTAL = LDS_KV_NOPE_BYTES + LDS_KV_ROPE_BYTES + LDS_P_BYTES  # 71680
 
     alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name="dual_scope_c4_smem")
     base_off = alloc._align(alloc.ptr, 16)
     alloc.ptr = base_off + LDS_TOTAL
-    kv_lds_off = base_off
-    p_lds_off = base_off + LDS_KV_BYTES
+    kv_nope_lds_off = base_off
+    kv_rope_lds_off = kv_nope_lds_off + LDS_KV_NOPE_BYTES
+    p_lds_off = kv_rope_lds_off + LDS_KV_ROPE_BYTES
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def dual_scope_prefill_kernel_c4(
@@ -1050,6 +1076,8 @@ def _build_dual_scope_kernel_c4(
         c_big  = fx.Float32(BIG)
         c_log2e = fx.Float32(_LOG2E)
         c_sm_log2e = fx.Float32(SM_LOG2E)
+        c_pv_pre = fx.Float32(PV_PRESCALE)
+        c_inv_pv = fx.Float32(1.0 / PV_PRESCALE)
 
         # ---- load helpers ----------------------------------------------
         def load_i32(ptr, eoff):
@@ -1095,6 +1123,28 @@ def _build_dual_scope_kernel_c4(
         def mfma_bf16(acc, a, b):
             return rocdl.mfma_f32_16x16x32_bf16(v4f32_type, [a, b, acc, 0, 0, 0])
 
+        def mfma_fp8(acc, a_i64, b_i64):
+            return rocdl.mfma_f32_16x16x32_fp8_fp8(
+                v4f32_type, [a_i64, b_i64, acc, 0, 0, 0]
+            )
+
+        def extract_byte_i64(v_i64, shift_i64):
+            # Runtime byte select -> fp8 byte in the low 8 bits (kept i64).
+            sh = _mlir_arith.ShRUIOp(_raw(v_i64), _raw(shift_i64)).result
+            return _mlir_arith.AndIOp(sh, _raw(fx.Int64(0xFF))).result
+
+        def pack_fp8x8_i64(vals):
+            # 8 f32 -> 8 e4m3 fp8 packed in an i64 (byte j == fp8(vals[j])).
+            zero = _raw(fx.Int32(0))
+            lo = rocdl.cvt_pk_fp8_f32(T.i32, _raw(vals[0]), _raw(vals[1]), zero, False)
+            lo = rocdl.cvt_pk_fp8_f32(T.i32, _raw(vals[2]), _raw(vals[3]), lo, True)
+            hi = rocdl.cvt_pk_fp8_f32(T.i32, _raw(vals[4]), _raw(vals[5]), zero, False)
+            hi = rocdl.cvt_pk_fp8_f32(T.i32, _raw(vals[6]), _raw(vals[7]), hi, True)
+            lo64 = _mlir_arith.ExtUIOp(T.i64, lo).result
+            hi64 = _mlir_arith.ExtUIOp(T.i64, hi).result
+            hi64 = _mlir_arith.ShLIOp(hi64, _raw(fx.Int64(32))).result
+            return _mlir_arith.OrIOp(lo64, hi64).result
+
         # ---- thread / block ids ----------------------------------------
         #   grid = (h_q/BLOCK_H == 1, total_tokens); block = (256,1,1).
         #   wave = tid//64 (0..3) -> owns 32 heads.  lin = tid%64.
@@ -1110,7 +1160,12 @@ def _build_dual_scope_kernel_c4(
 
         # ---- LDS ------------------------------------------------------
         lds_base = alloc.get_base()
-        lds_kv = SmemPtr(lds_base, kv_lds_off, T.bf16, shape=(LDS_KV_BF16,)).get()
+        lds_kv_nope = SmemPtr(
+            lds_base, kv_nope_lds_off, T.i64, shape=(LDS_KV_NOPE_I64,)
+        ).get()
+        lds_kv_rope = SmemPtr(
+            lds_base, kv_rope_lds_off, T.bf16, shape=(LDS_KV_ROPE_BF16,)
+        ).get()
         lds_p  = SmemPtr(lds_base, p_lds_off,  T.f32,  shape=(LDS_P_F32,)).get()
 
         topklen_main_val  = load_i32(main_tkl_ptr,  pid_t)
@@ -1158,19 +1213,28 @@ def _build_dual_scope_kernel_c4(
                           + fx.Index(bs * SLOT_DATA_BYTES)
                           + off_i * fx.Index(SLOT_SCALE_BYTES))
 
-            # phase A: nope quarter (112 fp8) -> bf16, per-64 ue8m0 scale folded
+            # phase A: nope quarter (112 fp8) -> store RAW fp8 packed i64 (no
+            # dequant); the per-64 ue8m0 scale is folded later (PV: into fp8 P;
+            # QK: dequant-on-read).  i64 chunk = kv_row*56 + quarter*14 + dc.
             for dc in range_constexpr(NOPE_CHUNKS):
                 abs_dim = g_part * fx.Index(NOPE_QUARTER) + fx.Index(dc * 8)
-                tile = abs_dim // fx.Index(QUANT_BLOCK)
-                scale_f = ue8m0_to_f32(load_u8_i32(pool_ptr, scale_base + tile))
                 raw_i64 = load_i64(pool_ptr, data_base + abs_dim)
-                bvals = []
-                for j in range_constexpr(8):
-                    fv = _fmul(fp8_to_f32(extract_byte_i32(raw_i64, j)), scale_f)
-                    bvals.append(to_bf16(fv))
-                Vec.from_elements(bvals, fx.BFloat16).store(
-                    lds_kv, [kv_row * fx.Index(head_dim) + abs_dim]
-                )
+                i64_off = (kv_row * fx.Index(NOPE_I64)
+                           + g_part * fx.Index(NOPE_QUARTER_I64) + fx.Index(dc))
+                _memref.store(_raw(raw_i64), lds_kv_nope, [_raw(i64_off)])
+
+            # phase A': pack this key's 7 ue8m0 scale bytes into ONE i64 in the
+            # scale sub-region (exp2-decoded on read).  Single affine writer per
+            # address: quarter 0 -> read region; quarters 1..3 -> scratch.
+            sc_i64 = _raw(fx.Int64(0))
+            for t in range_constexpr(N_NOPE_TILES):
+                bt = load_u8_i32(pool_ptr, scale_base + fx.Index(t))
+                bt64 = _mlir_arith.ExtUIOp(T.i64, bt).result
+                sh = _mlir_arith.ShLIOp(bt64, _raw(fx.Int64(t * 8))).result
+                sc_i64 = _mlir_arith.OrIOp(sc_i64, sh).result
+            scale_chunk = (fx.Index(SCALE_BASE_I64)
+                           + g_part * fx.Index(block_n) + kv_row)
+            _memref.store(sc_i64, lds_kv_nope, [_raw(scale_chunk)])
 
             # phase B: rope quarter (32 raw bytes -> 16 bf16 LE) -> bf16
             for dc in range_constexpr(ROPE_CHUNKS):
@@ -1181,7 +1245,7 @@ def _build_dual_scope_kernel_c4(
                             + (rope_idx + fx.Index(j)) * fx.Index(2))
                     bvals.append(load_bf16_byte(pool_ptr, boff))
                 Vec.from_elements(bvals, fx.BFloat16).store(
-                    lds_kv, [kv_row * fx.Index(head_dim) + fx.Index(D_NOPE) + rope_idx]
+                    lds_kv_rope, [kv_row * fx.Index(D_ROPE) + rope_idx]
                 )
 
             gpu.barrier()
@@ -1197,6 +1261,18 @@ def _build_dual_scope_kernel_c4(
                 good = _mlir_arith.AndIOp(_raw(ne), _raw(lt)).result
                 mask_f.append(_mlir_arith.UIToFPOp(T.f32, good).result)
 
+            # Decode each QK key's 7 ue8m0 nope scales once (head-independent;
+            # QK nope k-steps dequant K on read).  key = nb*16 + lane.
+            qk_scale = []
+            for nb in range_constexpr(N_BLKS_S):
+                key = fx.Index(nb * MFMA_N) + lane
+                sc_i64 = _raw(_memref.load(
+                    lds_kv_nope, [_raw(fx.Index(SCALE_BASE_I64) + key)]))
+                qk_scale.append(
+                    [ue8m0_to_f32(extract_byte_i32(sc_i64, tl))
+                     for tl in range_constexpr(N_NOPE_TILES)]
+                )
+
             new_carry = []
             for m_sub in range_constexpr(M_SUBS):
                 base = m_sub * PER_SUB
@@ -1206,14 +1282,29 @@ def _build_dual_scope_kernel_c4(
                 hb = wave_head_base + fx.Index(m_sub * MFMA_N)
 
                 # === QK GEMM : S[16, BLOCK_N] = Q @ K^T (bf16 MFMA) =======
+                # nope k-steps (ks<14) dequant K on read from the packed fp8 LDS
+                # (fp8->f32 * exp2 scale -> bf16); rope k-steps load bf16.
                 s_acc = [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(N_BLKS_S)]
                 for ks in range_constexpr(K_STEPS_QK):
                     q_a = q_packs[m_sub][ks]
                     for nb in range_constexpr(N_BLKS_S):
                         key = fx.Index(nb * MFMA_N) + lane
-                        koff = (key * fx.Index(head_dim)
-                                + fx.Index(ks * MFMA_K) + k_group * fx.Index(8))
-                        k_b = Vec.load(vec8bf16_ty, lds_kv, [koff])
+                        if const_expr(ks < KS_NOPE):
+                            i64_off = (key * fx.Index(NOPE_I64)
+                                       + fx.Index(ks * 4) + k_group)
+                            raw_i64 = _raw(_memref.load(lds_kv_nope, [_raw(i64_off)]))
+                            scale_f = qk_scale[nb][ks // 2]
+                            k_b = Vec.from_elements(
+                                [to_bf16(_fmul(
+                                    fp8_to_f32(extract_byte_i32(raw_i64, j)), scale_f))
+                                 for j in range_constexpr(8)],
+                                fx.BFloat16,
+                            )
+                        else:
+                            rope_off = (key * fx.Index(D_ROPE)
+                                        + fx.Index((ks - KS_NOPE) * MFMA_K)
+                                        + k_group * fx.Index(8))
+                            k_b = Vec.load(vec8bf16_ty, lds_kv_rope, [rope_off])
                         s_acc[nb] = mfma_bf16(s_acc[nb], q_a, k_b)
 
                 # === online softmax (log2 space) =========================
@@ -1276,23 +1367,64 @@ def _build_dual_scope_kernel_c4(
                                       [_raw(p_row * fx.Index(block_n) + p_col)])
                 gpu.barrier()
 
-                # === PV GEMM : O += P @ V (bf16 MFMA), K=block_n=2x32 ======
+                # === PV GEMM : O += P @ V ==================================
+                # nope d-blocks: NATIVE fp8 MFMA.  Per ue8m0 tile t fold V's
+                # per-key scale[k][t] into P (P'_t = C*P*scale), quantize to e4m3
+                # fp8, MFMA against RAW fp8 V from LDS (V byte = lane%8 of the
+                # packed i64).  C is divided back out in finalize.  rope -> bf16.
+                lane_div8 = lane // fx.Index(8)
+                lane_shift = fx.Int64(lane % fx.Index(8)) * fx.Int64(8)
                 for ks_pv in range_constexpr(K_STEPS_PV):
                     p_base = ((hb + lane) * fx.Index(block_n)
                               + fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8))
-                    p_a = Vec.from_elements(
-                        [to_bf16(_memref.load(lds_p, [_raw(p_base + fx.Index(j))]))
+                    p_f32 = [_raw(_memref.load(lds_p, [_raw(p_base + fx.Index(j))]))
+                             for j in range_constexpr(8)]
+                    pv_scale = []
+                    for j in range_constexpr(8):
+                        key = (fx.Index(ks_pv * MFMA_K)
+                               + k_group * fx.Index(8) + fx.Index(j))
+                        sc_i64 = _raw(_memref.load(
+                            lds_kv_nope, [_raw(fx.Index(SCALE_BASE_I64) + key)]))
+                        pv_scale.append(
+                            [ue8m0_to_f32(extract_byte_i32(sc_i64, tl))
+                             for tl in range_constexpr(N_NOPE_TILES)]
+                        )
+                    # nope tiles: fp8 PV MFMA (4 d-blocks / 64-dim tile)
+                    for t in range_constexpr(N_NOPE_TILES):
+                        p_pre = [_fmul(_fmul(p_f32[j], pv_scale[j][t]), c_pv_pre)
+                                 for j in range_constexpr(8)]
+                        p_a8 = pack_fp8x8_i64(p_pre)
+                        for dd in range_constexpr(4):
+                            d = t * 4 + dd
+                            v_i64 = _raw(fx.Int64(0))
+                            for j in range_constexpr(8):
+                                key = (fx.Index(ks_pv * MFMA_K)
+                                       + k_group * fx.Index(8) + fx.Index(j))
+                                chunk = (key * fx.Index(NOPE_I64)
+                                         + fx.Index(d * 2) + lane_div8)
+                                raw_v = _memref.load(lds_kv_nope, [_raw(chunk)])
+                                byte_j = extract_byte_i64(raw_v, lane_shift)
+                                byte_j = _mlir_arith.ShLIOp(
+                                    byte_j, _raw(fx.Int64(j * 8))).result
+                                v_i64 = _mlir_arith.OrIOp(v_i64, byte_j).result
+                            new_o[d] = mfma_fp8(new_o[d], p_a8, v_i64)
+                    # rope d-blocks: bf16 MFMA (P pre-scaled by C too)
+                    p_a_rope = Vec.from_elements(
+                        [to_bf16(_fmul(p_f32[j], c_pv_pre))
                          for j in range_constexpr(8)],
                         fx.BFloat16,
                     )
-                    for d in range_constexpr(D_BLKS):
+                    for dd2 in range_constexpr(D_BLKS - D_NOPE_BLKS):
+                        d = D_NOPE_BLKS + dd2
                         vvals = []
                         for j in range_constexpr(8):
-                            key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
-                            voff = key * fx.Index(head_dim) + fx.Index(d * MFMA_N) + lane
-                            vvals.append(_memref.load(lds_kv, [_raw(voff)]))
+                            key = (fx.Index(ks_pv * MFMA_K)
+                                   + k_group * fx.Index(8) + fx.Index(j))
+                            voff = (key * fx.Index(D_ROPE)
+                                    + fx.Index((d - D_NOPE_BLKS) * MFMA_N) + lane)
+                            vvals.append(_memref.load(lds_kv_rope, [_raw(voff)]))
                         v_b = Vec.from_elements(vvals, fx.BFloat16)
-                        new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
+                        new_o[d] = mfma_bf16(new_o[d], p_a_rope, v_b)
                 gpu.barrier()
 
                 new_carry += list(m_new) + list(l_new) + list(new_o)
@@ -1339,6 +1471,7 @@ def _build_dual_scope_kernel_c4(
                     denom = l_r
                 safe_denom = _fadd(_fmul(denom, one_m), lonely_f)
                 inv = arith.divf(_raw(c_one), _raw(safe_denom), fastmath=fm)
+                inv = _fmul(inv, c_inv_pv)
                 for d in range_constexpr(D_BLKS):
                     o_norm = _fmul(Vec(o_acc[d])[r], inv)
                     out_off = (pid_t * fx.Index(TOK_OUT_STRIDE)
