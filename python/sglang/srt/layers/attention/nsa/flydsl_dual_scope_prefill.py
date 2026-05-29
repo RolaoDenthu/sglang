@@ -43,7 +43,6 @@ Dequant (per gathered key token):
 ----------------------------------------------------------------------------
 """
 
-from __future__ import annotations
 
 import functools
 import math
@@ -838,7 +837,7 @@ def _build_dual_scope_kernel(
     def launch_dual_scope_prefill(
         Q, KV_Main, Indices_Main, TopkLen_Main,
         KV_Extra, Indices_Extra, TopkLen_Extra,
-        AttnSink, Out, total_tokens,
+        AttnSink, Out, total_tokens: fx.Int32,
         stream: "fx.Stream" = fx.Stream(None),
     ):
         alloc.finalized = False
@@ -1354,7 +1353,7 @@ def _build_dual_scope_kernel_c4(
     def launch_dual_scope_prefill_c4(
         Q, KV_Main, Indices_Main, TopkLen_Main,
         KV_Extra, Indices_Extra, TopkLen_Extra,
-        AttnSink, Out, total_tokens,
+        AttnSink, Out, total_tokens: fx.Int32,
         stream: "fx.Stream" = fx.Stream(None),
     ):
         alloc.finalized = False
@@ -1927,7 +1926,7 @@ def _build_dual_scope_kernel_c128(
     def launch_dual_scope_prefill_c128(
         Q, KV_Main, Indices_Main, TopkLen_Main,
         KV_Extra, Indices_Extra, TopkLen_Extra,
-        AttnSink, Out, total_tokens,
+        AttnSink, Out, total_tokens: fx.Int32,
         stream: "fx.Stream" = fx.Stream(None),
     ):
         alloc.finalized = False
