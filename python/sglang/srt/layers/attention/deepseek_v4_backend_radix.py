@@ -86,6 +86,11 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 
 logger = logging.getLogger(__name__)
 
+# TEMP (#11 real-data cross-check): module-level one-shot guard for the
+# env-gated SGLANG_FLYDSL_CAPTURE instrumentation in the prefill hook. When the
+# env var is unset/0 this is never touched and behavior is 100% unchanged.
+_FLYDSL_CAPTURE_DONE = False
+
 
 def _copy_metadata(
     src,
@@ -1102,6 +1107,63 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 extra_indices_in_kvcache=extra_indices,
                 extra_topk_length=extra_topk_lengths,
             )
+
+            # ------- TEMP (#11): env-gated real-data capture (gfx950) -------
+            # When SGLANG_FLYDSL_CAPTURE=1 AND this is a prefill AND we have not
+            # captured yet, FORCE the production (FlashMLA/Triton) baseline path
+            # (bypassing the FlyDSL reference branch regardless of
+            # SGLANG_FLYDSL_PREFILL), dump the EXACT tensors that
+            # flydsl_dual_scope_prefill would receive plus the production output
+            # to /tmp/flydsl_capture.pt, then return the production output so the
+            # server keeps serving. No-op unless SGLANG_FLYDSL_CAPTURE=1.
+            global _FLYDSL_CAPTURE_DONE
+            if (
+                os.environ.get("SGLANG_FLYDSL_CAPTURE", "0") == "1"
+                and not _FLYDSL_CAPTURE_DONE
+                and forward_batch.forward_mode.is_prefill(
+                    include_draft_extend_v2=True
+                )
+            ):
+                backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
+                o_prod = flash_mla_with_kvcache_entrypoint(
+                    **input_dict, backend=backend
+                )[0]
+                o_prod = o_prod.squeeze(1)
+
+                def _cpu(t):
+                    if t is None or not isinstance(t, torch.Tensor):
+                        return t
+                    return t.detach().to("cpu").contiguous()
+
+                capture = {
+                    "q": _cpu(q),
+                    "swa_k_cache": _cpu(swa_k_cache),
+                    "swa_indices": _cpu(swa_page_indices),
+                    "swa_topk_length": _cpu(swa_topk_lengths),
+                    "extra_k_cache": _cpu(extra_k_cache),
+                    "extra_indices": _cpu(extra_indices),
+                    "extra_topk_length": _cpu(extra_topk_lengths),
+                    "compress_ratio": int(compress_ratio),
+                    "softmax_scale": float(self.softmax_scale),
+                    "attn_sink": _cpu(attn_sink),
+                    "head_dim_v": int(self.head_dim_v),
+                    "o_prod": _cpu(o_prod),
+                    "o_prod_dtype": str(o_prod.dtype),
+                    "o_prod_shape": tuple(o_prod.shape),
+                    "q_shape": tuple(q.shape),
+                }
+                torch.save(capture, "/tmp/flydsl_capture.pt")
+                _FLYDSL_CAPTURE_DONE = True
+                logger.warning(
+                    "[FLYDSL-CAPTURE] saved /tmp/flydsl_capture.pt "
+                    "(q_shape=%s, o_prod_shape=%s, o_prod_dtype=%s, "
+                    "compress_ratio=%s)",
+                    tuple(q.shape),
+                    tuple(o_prod.shape),
+                    o_prod.dtype,
+                    compress_ratio,
+                )
+                return o_prod
 
             # ------- FlyDSL dual-scope prefill override (gfx950) -------
             # When SGLANG_FLYDSL_PREFILL=1, route prefill through a single fused
