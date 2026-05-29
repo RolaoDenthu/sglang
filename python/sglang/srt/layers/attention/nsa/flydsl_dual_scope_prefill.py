@@ -113,6 +113,54 @@ _LOG2E: float = 1.4426950408889634
 # the tests/oracle path only, not as a runtime fallback.
 _USE_FLYDSL_KERNEL: bool = True
 
+# C128 / low-topk routing: the C128 regime is a TINY 192-key problem
+# (topk_main=128 + topk_extra=64, bs_main=256, bs_extra=2, H=128, head_dim=512).
+# A full manual tile/wave autotune of a fully-parameterized specialized C128
+# kernel over (BLOCK_H, BLOCK_N, N_WAVES) -- gated by cosine>0.9999 vs the
+# PyTorch reference, then live gsm8k (8-shot/200q) -- showed that NO specialized
+# C128 config beats simply routing ratio==128 to the BASE kernel:
+#   * base (ratio128 -> base, BLOCK_H=16, 8 CTAs/token):  188.4 s, acc 0.915
+#   * best specialized (BLOCK_H=128/BLOCK_N=64/N_WAVES=8): 203.3 s, acc 0.910
+#   * max-parallelism specialized (BLOCK_H=16/BN=32/w1):   GPU HSA exception
+# The base kernel's small BLOCK_H=16 already launches 8 CTAs/token (the parallelism
+# the tiny problem wants) without the redundant per-CTA fp8 dequant that a
+# specialized small-BLOCK_H kernel incurs, so it is both faster AND simpler.
+# => default plan is None (route ratio==128 to the base kernel).  The specialized
+# parameterized C128 builder is retained and remains reachable via the env
+# override below purely for future autotuning experiments.
+_C128_BLOCK_H: int = 128
+_C128_BLOCK_N: int = 64
+_C128_N_WAVES: int = 8
+
+
+def _c128_plan():
+    """C128 tiling plan: ``(block_h, block_n, n_waves)`` for the specialized
+    kernel, or ``None`` to route compress_ratio==128 to the BASE kernel.
+
+    The tuned DEFAULT is ``None`` (base kernel won the autotune -- see the comment
+    above).  Overridable for autotuning experiments via env ``SGLANG_C128_TILING``:
+        * "base"            -> route ratio==128 to the base kernel (the default)
+        * "BH,BN,NW"        -> specialized C128 with that tiling
+        * unset/invalid     -> the tuned default (base routing)
+    Parsed once at import (a server restart re-reads it).
+    """
+    import os as _os
+
+    raw = _os.environ.get("SGLANG_C128_TILING", "").strip().lower()
+    if raw == "base":
+        return None
+    if raw:
+        parts = raw.split(",")
+        if len(parts) == 3:
+            try:
+                return (int(parts[0]), int(parts[1]), int(parts[2]))
+            except ValueError:
+                pass
+    return None
+
+
+_C128_PLAN = _c128_plan()
+
 
 # ============================================================================
 # Shape / dtype normalization helpers
@@ -1402,6 +1450,7 @@ def _build_dual_scope_kernel_c128(
     block_size_extra: int = 2,
     block_n: int = 64,
     block_h: int = 128,
+    n_waves: int = 4,
     sm_scale: Optional[float] = None,
     has_attn_sink: bool = True,
     has_topk_length_main: bool = True,
@@ -1411,41 +1460,74 @@ def _build_dual_scope_kernel_c128(
     """Build (and cache) the C128 / low-topk fused dual-scope FlyDSL kernel.
 
     Numerically identical inner pipeline to ``_build_dual_scope_kernel`` and
-    ``_build_dual_scope_kernel_c4``; reuses the C4 tiling/wave structure
-    (BLOCK_N=64, BLOCK_H=128, 4 waves, 2 m-subtiles/wave -- see the banner
-    above) which is LDS-sound for the tiny C128 scopes.  The only regime
-    difference is the C128 dims (block_size_extra=2 etc.) folded into the
-    gather index math.  Returns a python launcher with the same call signature
-    as the base/C4 kernel launchers.
+    ``_build_dual_scope_kernel_c4`` (gather -> e4m3fn fp8 dequant -> bf16 QK
+    MFMA -> exp2 online softmax -> bf16 PV MFMA -> attn_sink fold + lonely-zero
+    writeback).  The ONLY differences are the TILING / WAVE structure, which is
+    fully PARAMETERIZED over ``(block_h, block_n, n_waves)`` so the C128 grid
+    point can be autotuned for its tiny 192-key problem:
+
+      * ``BLOCK_SIZE = 64 * n_waves`` threads (n_waves wavefronts of 64 lanes).
+      * Each wave OWNS ``HEADS_PER_WAVE = block_h // n_waves`` heads
+        (= ``M_SUBS = HEADS_PER_WAVE // 16`` MFMA m-subtiles), so the
+        online-softmax cross-key reduction stays inside a wave's 16-lane group
+        (shuffle_xor), exactly like the C4 kernel.
+      * ``grid_h = h_q // block_h`` CTAs per token (grid.x); each CTA handles a
+        distinct ``block_h``-head tile (head base folds in block_idx.x).
+      * The ``block_n``-key x head_dim dequant is staged into LDS cooperatively
+        by ALL ``BLOCK_SIZE`` threads: thread (g_part, kv_row) dequants key row
+        ``kv_row = tid % block_n`` and head-dim partition ``g_part = tid //
+        block_n`` (``G_PARTS = BLOCK_SIZE // block_n`` partitions of the 448
+        nope + 64 rope dims).  This generalizes the C4 fixed
+        BLOCK_N=64/quarter-per-wave gather to any valid thread count.
+
+    The default ``(block_h=128, block_n=64, n_waves=4)`` reproduces the original
+    C4-style C128 tiling byte-for-byte.  Returns a python launcher with the same
+    call signature as the base/C4 kernel launchers.
     """
     assert _HAS_FLYDSL, "FlyDSL is not importable (build is gfx950-container only)"
     assert head_dim == D_QK, f"only head_dim={D_QK} is supported"
-    assert block_n == 64, "C128 kernel tiling is fixed at BLOCK_N=64"
-    assert block_h == 128, "C128 kernel tiling is fixed at BLOCK_H=128"
+
+    WARP_SIZE = 64
+    MFMA_N = 16
+    MFMA_K = 32
+    N_WAVES = n_waves
+    BLOCK_SIZE = WARP_SIZE * N_WAVES
+    BLOCK_H = block_h
+    G_PARTS = BLOCK_SIZE // block_n                  # head-dim partitions / key row
+
+    assert block_n in (32, 64), "C128 kernel tiling supports BLOCK_N in {32, 64}"
+    assert block_n % MFMA_N == 0 and block_n % MFMA_K == 0, "BLOCK_N must tile MFMA"
     assert h_q % block_h == 0, f"h_q={h_q} must be a multiple of BLOCK_H={block_h}"
-    assert topk_main % block_n == 0, "topk_main must be a multiple of BLOCK_N=64"
-    assert topk_extra % block_n == 0, "topk_extra must be a multiple of BLOCK_N=64"
+    assert block_h % N_WAVES == 0, f"BLOCK_H={block_h} must be a multiple of n_waves={N_WAVES}"
+    assert (block_h // N_WAVES) % MFMA_N == 0, (
+        f"HEADS_PER_WAVE={block_h // N_WAVES} must be a multiple of MFMA_M={MFMA_N}"
+    )
+    assert BLOCK_SIZE % block_n == 0, (
+        f"BLOCK_SIZE={BLOCK_SIZE} must be a multiple of BLOCK_N={block_n}"
+    )
+    assert D_NOPE % G_PARTS == 0 and (D_NOPE // G_PARTS) % 8 == 0, (
+        f"D_NOPE={D_NOPE} not 8-divisible across G_PARTS={G_PARTS}"
+    )
+    assert D_ROPE % G_PARTS == 0 and (D_ROPE // G_PARTS) % 8 == 0, (
+        f"D_ROPE={D_ROPE} not 8-divisible across G_PARTS={G_PARTS}"
+    )
+    assert topk_main % block_n == 0, f"topk_main must be a multiple of BLOCK_N={block_n}"
+    assert topk_extra % block_n == 0, f"topk_extra must be a multiple of BLOCK_N={block_n}"
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
 
     gpu_arch = get_rocm_arch()
 
-    # ---- tiling (reused from C4: BLOCK_N=64, BLOCK_H=128, 4 waves) ---------
-    WARP_SIZE = 64
-    N_WAVES = 4                                     # == num_warps
-    BLOCK_SIZE = WARP_SIZE * N_WAVES                # 256
-    MFMA_N = 16
-    MFMA_K = 32
-    BLOCK_H = block_h                               # 128
-    HEADS_PER_WAVE = BLOCK_H // N_WAVES             # 32
-    M_SUBS = HEADS_PER_WAVE // MFMA_N               # 2 MFMA m-subtiles / wave
-    K_STEPS_QK = head_dim // MFMA_K                 # 16
-    N_BLKS_S = block_n // MFMA_N                     # 4
-    K_STEPS_PV = block_n // MFMA_K                   # 2
-    D_BLKS = head_dim // MFMA_N                      # 32
-    KV_TILES_MAIN = topk_main // block_n             # C128: 128/64 = 2
-    KV_TILES_EXTRA = topk_extra // block_n           # C128: 64/64 = 1
+    # ---- tiling (parameterized over block_h / block_n / n_waves) ----------
+    HEADS_PER_WAVE = BLOCK_H // N_WAVES              # heads owned by each wave
+    M_SUBS = HEADS_PER_WAVE // MFMA_N                # MFMA m-subtiles / wave
+    K_STEPS_QK = head_dim // MFMA_K                  # 16
+    N_BLKS_S = block_n // MFMA_N                      # 2 (bn=32) or 4 (bn=64)
+    K_STEPS_PV = block_n // MFMA_K                    # 1 (bn=32) or 2 (bn=64)
+    D_BLKS = head_dim // MFMA_N                       # 32
+    KV_TILES_MAIN = topk_main // block_n
+    KV_TILES_EXTRA = topk_extra // block_n
 
     TOK_OUT_STRIDE = h_q * head_dim_v
     HEAD_OUT_STRIDE = head_dim_v
@@ -1457,30 +1539,35 @@ def _build_dual_scope_kernel_c128(
     PBB_MAIN = block_size_main * (SLOT_DATA_BYTES + SLOT_SCALE_BYTES)
     PBB_EXTRA = block_size_extra * (SLOT_DATA_BYTES + SLOT_SCALE_BYTES)
 
-    # gather: 256 threads = 64 key rows x 4 head-dim quarters (one quarter/wave)
-    NOPE_QUARTER = D_NOPE // N_WAVES                 # 112
-    NOPE_CHUNKS = NOPE_QUARTER // 8                  # 14
-    ROPE_QUARTER = D_ROPE // N_WAVES                 # 16
-    ROPE_CHUNKS = ROPE_QUARTER // 8                  # 2
+    # gather: BLOCK_SIZE threads = block_n key rows x G_PARTS head-dim parts.
+    # thread (g_part, kv_row) dequants key row kv_row, head-dim partition g_part.
+    NOPE_PART = D_NOPE // G_PARTS
+    NOPE_CHUNKS = NOPE_PART // 8
+    ROPE_PART = D_ROPE // G_PARTS
+    ROPE_CHUNKS = ROPE_PART // 8
 
     SM_LOG2E = float(sm_scale) * _LOG2E
     BIG = 1.0e30
 
-    # ---- LDS layout (96KB, identical to C4) -------------------------------
-    LDS_KV_BF16 = block_n * head_dim                 # 32768 bf16 (64KB)
-    LDS_KV_BYTES = LDS_KV_BF16 * 2                    # 65536
-    LDS_P_F32 = BLOCK_H * block_n                     # 8192 f32 (32KB)
-    LDS_P_BYTES = LDS_P_F32 * 4                        # 32768
-    LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES            # 98304 (< 160KB)
+    # ---- LDS layout (KV block_n*512 bf16 + P block_h*block_n f32; < 160KB) -
+    LDS_KV_BF16 = block_n * head_dim
+    LDS_KV_BYTES = LDS_KV_BF16 * 2
+    LDS_P_F32 = BLOCK_H * block_n
+    LDS_P_BYTES = LDS_P_F32 * 4
+    LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES
+    assert LDS_TOTAL <= 160 * 1024, f"LDS {LDS_TOTAL} exceeds 160KB budget"
 
-    alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name="dual_scope_c128_smem")
+    alloc = SmemAllocator(
+        None, arch=gpu_arch,
+        global_sym_name=f"dual_scope_c128_smem_{block_h}_{block_n}_{n_waves}",
+    )
     base_off = alloc._align(alloc.ptr, 16)
     alloc.ptr = base_off + LDS_TOTAL
     kv_lds_off = base_off
     p_lds_off = base_off + LDS_KV_BYTES
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
-    def dual_scope_prefill_kernel_c128(
+    def dual_scope_prefill_kernel_c128(  # parameterized (block_h/block_n/n_waves)
         Q: fx.Tensor,             # [T, h_q, head_dim]            bf16
         KV_Main: fx.Tensor,       # [Nb_main, per_block_bytes]    uint8 raw pool
         Indices_Main: fx.Tensor,  # [T, topk_main]                int32
@@ -1574,17 +1661,24 @@ def _build_dual_scope_kernel_c128(
             return rocdl.mfma_f32_16x16x32_bf16(v4f32_type, [a, b, acc, 0, 0, 0])
 
         # ---- thread / block ids ----------------------------------------
-        #   grid = (h_q/BLOCK_H == 1, total_tokens); block = (256,1,1).
-        #   wave = tid//64 (0..3) -> owns 32 heads.  lin = tid%64.
+        #   grid = (h_q/BLOCK_H, total_tokens); block = (BLOCK_SIZE,1,1).
+        #   wave = tid//64 -> owns HEADS_PER_WAVE heads.  lin = tid%64.
+        #   gather: kv_row = tid%block_n, g_part = tid//block_n (G_PARTS parts).
         tid       = fx.Index(gpu.thread_idx.x)
+        bid_h_tile = fx.Index(gpu.block_idx.x)       # head-tile (grid_h CTAs/token)
         pid_t     = fx.Index(gpu.block_idx.y)
-        wave      = tid // fx.Index(WARP_SIZE)      # 0..3
+        wave      = tid // fx.Index(WARP_SIZE)      # 0..N_WAVES-1
         lin       = tid % fx.Index(WARP_SIZE)       # 0..63
         lane      = lin % fx.Index(MFMA_N)          # 0..15 MFMA row(A)/col(B/C)
         k_group   = lin // fx.Index(MFMA_N)         # 0..3  MFMA K-subgroup
-        wave_head_base = wave * fx.Index(HEADS_PER_WAVE)   # this wave's first head
-        kv_row    = lin                              # gather: key row (0..63)
-        g_part    = wave                             # gather: head-dim quarter
+        # head_tile = this CTA's GLOBAL head offset (grid_h CTAs/token);
+        # wave_head_base = this wave's LOCAL head base within the CTA tile.
+        # LDS-P / PV index by LOCAL head (lds_p is [BLOCK_H, block_n]); Q load,
+        # attn_sink and the output writeback index by head_tile + LOCAL head.
+        head_tile = bid_h_tile * fx.Index(BLOCK_H)
+        wave_head_base = wave * fx.Index(HEADS_PER_WAVE)
+        kv_row    = tid % fx.Index(block_n)          # gather: key row (0..block_n-1)
+        g_part    = tid // fx.Index(block_n)         # gather: head-dim partition
 
         # ---- LDS ------------------------------------------------------
         lds_base = alloc.get_base()
@@ -1597,13 +1691,14 @@ def _build_dual_scope_kernel_c128(
         # ---- preload Q head tiles (M_SUBS x K_STEPS_QK x vector<8xbf16>) -
         q_packs = [[] for _ in range_constexpr(M_SUBS)]
         for m_sub in range_constexpr(M_SUBS):
-            hb = wave_head_base + fx.Index(m_sub * MFMA_N)
+            hb = wave_head_base + fx.Index(m_sub * MFMA_N)        # LOCAL head base
+            hb_glb = head_tile + hb                              # GLOBAL head base
             for ks in range_constexpr(K_STEPS_QK):
                 q_elems = []
                 for j in range_constexpr(8):
                     q_eoff = (
                         pid_t * fx.Index(Q_STOK)
-                        + (hb + lane) * fx.Index(head_dim)
+                        + (hb_glb + lane) * fx.Index(head_dim)
                         + fx.Index(ks * MFMA_K + j) + k_group * fx.Index(8)
                     )
                     q_elems.append(load_bf16_elem(q_ptr, q_eoff))
@@ -1620,8 +1715,9 @@ def _build_dual_scope_kernel_c128(
         def emit_tile(kv_tile, carry, pool_ptr, idx_ptr, tkl_val, topk, bs, pbb):
             kv_pos_base = kv_tile * fx.Index(block_n)
 
-            # === gather + dequant one BLOCK_N=64 tile -> LDS (bf16) =======
-            # thread (wave w, lin l): key row l, head-dim quarter w.
+            # === gather + dequant one BLOCK_N tile -> LDS (bf16) =========
+            # thread (g_part, kv_row): key row kv_row, head-dim partition g_part
+            # (NOPE_PART nope + ROPE_PART rope dims), spread over G_PARTS parts.
             idx_i32 = load_i32(idx_ptr, pid_t * fx.Index(topk)
                                + kv_pos_base + kv_row)
             idx_c = _mlir_arith.MaxSIOp(idx_i32, _raw(fx.Int32(0))).result
@@ -1634,9 +1730,9 @@ def _build_dual_scope_kernel_c128(
                           + fx.Index(bs * SLOT_DATA_BYTES)
                           + off_i * fx.Index(SLOT_SCALE_BYTES))
 
-            # phase A: nope quarter (112 fp8) -> bf16, per-64 ue8m0 scale folded
+            # phase A: nope partition (NOPE_PART fp8) -> bf16, ue8m0 scale folded
             for dc in range_constexpr(NOPE_CHUNKS):
-                abs_dim = g_part * fx.Index(NOPE_QUARTER) + fx.Index(dc * 8)
+                abs_dim = g_part * fx.Index(NOPE_PART) + fx.Index(dc * 8)
                 tile = abs_dim // fx.Index(QUANT_BLOCK)
                 scale_f = ue8m0_to_f32(load_u8_i32(pool_ptr, scale_base + tile))
                 raw_i64 = load_i64(pool_ptr, data_base + abs_dim)
@@ -1648,9 +1744,9 @@ def _build_dual_scope_kernel_c128(
                     lds_kv, [kv_row * fx.Index(head_dim) + abs_dim]
                 )
 
-            # phase B: rope quarter (32 raw bytes -> 16 bf16 LE) -> bf16
+            # phase B: rope partition (ROPE_PART*2 raw bytes -> ROPE_PART bf16 LE)
             for dc in range_constexpr(ROPE_CHUNKS):
-                rope_idx = g_part * fx.Index(ROPE_QUARTER) + fx.Index(dc * 8)
+                rope_idx = g_part * fx.Index(ROPE_PART) + fx.Index(dc * 8)
                 bvals = []
                 for j in range_constexpr(8):
                     boff = (data_base + fx.Index(D_NOPE)
@@ -1799,9 +1895,10 @@ def _build_dual_scope_kernel_c128(
             m_run = [loop_results[base + r] for r in range_constexpr(4)]
             l_run = [loop_results[base + 4 + r] for r in range_constexpr(4)]
             o_acc = [loop_results[base + 8 + d] for d in range_constexpr(D_BLKS)]
-            hb = wave_head_base + fx.Index(m_sub * MFMA_N)
+            hb = wave_head_base + fx.Index(m_sub * MFMA_N)        # LOCAL head base
             for r in range_constexpr(4):
-                head = hb + k_group * fx.Index(4) + fx.Index(r)
+                # GLOBAL head index (head_tile folds in this CTA's grid_h offset)
+                head = head_tile + hb + k_group * fx.Index(4) + fx.Index(r)
                 l_r = l_run[r]
                 m_r = m_run[r]
                 lonely_f = _fsub(c_one, _fmin(_fmul(l_r, c_big), c_one))
@@ -1914,21 +2011,25 @@ def _flydsl_dual_scope_kernel_impl(
     #   * compress_ratio == 4   -> the C4 / high-topk BLOCK_H=128 / BLOCK_N=64,
     #                              4-wave kernel (1 CTA/token handles all 128
     #                              heads; gather+dequant done once for all heads).
-    #   * compress_ratio == 128 -> the C128 / low-topk kernel, which REUSES the
-    #                              same LDS-sound BLOCK_H=128 / BLOCK_N=64 4-wave
-    #                              tiling (only the C128 dims / block_size_extra
-    #                              differ) -- a separate specialized builder.
+    #   * compress_ratio == 128 -> the C128 / low-topk kernel at the tuned tiling
+    #                              from _C128_PLAN (block_h, block_n, n_waves), OR
+    #                              the base kernel when _C128_PLAN is None.
     #   * any other ratio       -> the original BLOCK_H=16 / BLOCK_N=32 base
     #                              kernel as a safe fallback.
-    # Both specialized kernels are fixed at BLOCK_N=64, so topk_main / topk_extra
-    # are padded up to a multiple of 64 with -1 sentinels (which mask out exactly
-    # like real padding); BLOCK_H=128 means h_q is padded to a multiple of 128.
+    # The selected (block_h, block_n) drive the padding: topk_main / topk_extra
+    # are padded up to a multiple of block_n with -1 sentinels (which mask out
+    # exactly like real padding); h_q is padded to a multiple of block_h.
     ratio = int(compress_ratio)
     use_c4 = ratio == 4
-    use_c128 = ratio == 128
+    c128_plan = _C128_PLAN if ratio == 128 else None
+    use_c128 = ratio == 128 and c128_plan is not None  # None -> route to base
     use_specialized = use_c4 or use_c128
-    block_h = 128 if use_specialized else 16
-    block_n = 64 if use_specialized else 32
+    if use_c4:
+        block_h, block_n = 128, 64
+    elif use_c128:
+        block_h, block_n = c128_plan[0], c128_plan[1]
+    else:
+        block_h, block_n = 16, 32
     h_q_pad = ((H + block_h - 1) // block_h) * block_h
 
     def _pad_topk(idx: torch.Tensor) -> torch.Tensor:
@@ -1993,17 +2094,12 @@ def _flydsl_dual_scope_kernel_impl(
     out = torch.zeros((T_tok, h_q_pad, head_dim_v), dtype=torch.bfloat16, device=device)
 
     # Dispatch on compress_ratio: compress_ratio==4 -> the specialized C4 /
-    # high-topk kernel; compress_ratio==128 -> the specialized C128 / low-topk
-    # kernel (both BLOCK_H=128/BLOCK_N=64, 4 waves); any other ratio -> the
-    # original BLOCK_H=16/BLOCK_N=32 base kernel as a safe fallback. All three
-    # builders expose the same launcher call signature.
-    if use_c4:
-        _build = _build_dual_scope_kernel_c4
-    elif use_c128:
-        _build = _build_dual_scope_kernel_c128
-    else:
-        _build = _build_dual_scope_kernel
-    kernel = _build(
+    # high-topk kernel (BLOCK_H=128/BLOCK_N=64, 4 waves); compress_ratio==128 ->
+    # the specialized C128 / low-topk kernel at the AUTOTUNED tiling
+    # (BLOCK_H=128/BLOCK_N=64, N_WAVES=8 -- see _C128_* above); any other ratio
+    # -> the original BLOCK_H=16/BLOCK_N=32 base kernel as a safe fallback. All
+    # three builders expose the same launcher call signature.
+    _build_kw = dict(
         h_q=h_q_pad,
         head_dim=D_QK,
         head_dim_v=head_dim_v,
@@ -2016,6 +2112,15 @@ def _flydsl_dual_scope_kernel_impl(
         has_topk_length_main=swa_topk_length is not None,
         has_topk_length_extra=(has_extra and extra_topk_length is not None),
     )
+    if use_c4:
+        kernel = _build_dual_scope_kernel_c4(**_build_kw)
+    elif use_c128:
+        kernel = _build_dual_scope_kernel_c128(
+            block_h=c128_plan[0], block_n=c128_plan[1],
+            n_waves=c128_plan[2], **_build_kw,
+        )
+    else:
+        kernel = _build_dual_scope_kernel(**_build_kw)
 
     stream = torch.cuda.current_stream()
     kernel(
