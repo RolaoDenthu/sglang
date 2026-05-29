@@ -1359,6 +1359,530 @@ def _build_dual_scope_kernel_c4(
     return _launch
 
 
+# ============================================================================
+# C128 / low-topk dual-scope kernel (separate specialized variant).
+#
+# This mirrors Triton's FIRST, low-topk config of the dual-scope kernel for the
+# C128 regime (compress_ratio == 128): topk_main=128, topk_extra=64
+# (total_topk=192), block_size_main=256, block_size_extra=2.  Like the C4
+# variant it is a DISTINCT function, NOT a parameterization of the base kernel.
+# The inner MATH is byte-for-byte the same pipeline as the base/C4 kernels
+# (gather -> e4m3fn fp8 dequant -> bf16 QK MFMA -> exp2 online softmax ->
+# bf16 PV MFMA -> attn_sink fold + lonely-zero writeback).
+#
+# DESIGN (tiling / wave choice + LDS budget):
+#   * Triton's low-topk config nominally uses BLOCK_N=256 / num_warps=8 /
+#     BLOCK_H=64.  We deliberately DO NOT copy those numbers: a flat
+#     BLOCK_N=256-key bf16 KV tile would be 256*512*2 = 256 KB of LDS, which
+#     EXCEEDS the 160 KB gfx950 (MI350X) group-segment limit.  The C128 scopes
+#     are tiny (128 main + 64 extra = 192 keys total), so we reuse the PROVEN,
+#     LDS-sound C4 tiling unchanged: BLOCK_N=64, BLOCK_H=128, 4 waves of 64
+#     lanes, 2 MFMA m-subtiles per wave.  This is the simplest provably-correct
+#     layout; the exact BLOCK_N will be revisited by the FlyDSL autotuner later.
+#   * 1 CTA per query token handles ALL BLOCK_H=128 heads, so the fp8
+#     gather+dequant of each 64-key KV tile is done ONCE for all 128 heads.
+#     With topk_main=128 / topk_extra=64 this is 2 main tiles + 1 extra tile.
+#   * Each wave OWNS 32 heads (2 m-subtiles), so the online-softmax cross-key
+#     reduction stays within a wave's 16-lane group (shuffle_xor), exactly like
+#     the C4 kernel.  The 64-key x 512-dim KV tile is staged into LDS
+#     cooperatively by all 256 threads (key row = lin, head-dim quarter = wave).
+#   * LDS: KV 64KB (64*512 bf16) + P 32KB (128*64 f32) = 96KB < 160KB.
+#   * bs_extra=2 (vs C4's 64) ONLY changes the block->slot index math
+#     (idx//bs, idx%bs) -- a compile-time constant; the gather/tile loop
+#     structure is otherwise identical to the C4 kernel.
+# ============================================================================
+@functools.lru_cache(maxsize=64)
+def _build_dual_scope_kernel_c128(
+    h_q: int,
+    head_dim: int = D_QK,
+    head_dim_v: int = D_V,
+    topk_main: int = 128,
+    topk_extra: int = 64,
+    block_size_main: int = 256,
+    block_size_extra: int = 2,
+    block_n: int = 64,
+    block_h: int = 128,
+    sm_scale: Optional[float] = None,
+    has_attn_sink: bool = True,
+    has_topk_length_main: bool = True,
+    has_topk_length_extra: bool = True,
+    waves_per_eu: int = 1,
+):
+    """Build (and cache) the C128 / low-topk fused dual-scope FlyDSL kernel.
+
+    Numerically identical inner pipeline to ``_build_dual_scope_kernel`` and
+    ``_build_dual_scope_kernel_c4``; reuses the C4 tiling/wave structure
+    (BLOCK_N=64, BLOCK_H=128, 4 waves, 2 m-subtiles/wave -- see the banner
+    above) which is LDS-sound for the tiny C128 scopes.  The only regime
+    difference is the C128 dims (block_size_extra=2 etc.) folded into the
+    gather index math.  Returns a python launcher with the same call signature
+    as the base/C4 kernel launchers.
+    """
+    assert _HAS_FLYDSL, "FlyDSL is not importable (build is gfx950-container only)"
+    assert head_dim == D_QK, f"only head_dim={D_QK} is supported"
+    assert block_n == 64, "C128 kernel tiling is fixed at BLOCK_N=64"
+    assert block_h == 128, "C128 kernel tiling is fixed at BLOCK_H=128"
+    assert h_q % block_h == 0, f"h_q={h_q} must be a multiple of BLOCK_H={block_h}"
+    assert topk_main % block_n == 0, "topk_main must be a multiple of BLOCK_N=64"
+    assert topk_extra % block_n == 0, "topk_extra must be a multiple of BLOCK_N=64"
+
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+    gpu_arch = get_rocm_arch()
+
+    # ---- tiling (reused from C4: BLOCK_N=64, BLOCK_H=128, 4 waves) ---------
+    WARP_SIZE = 64
+    N_WAVES = 4                                     # == num_warps
+    BLOCK_SIZE = WARP_SIZE * N_WAVES                # 256
+    MFMA_N = 16
+    MFMA_K = 32
+    BLOCK_H = block_h                               # 128
+    HEADS_PER_WAVE = BLOCK_H // N_WAVES             # 32
+    M_SUBS = HEADS_PER_WAVE // MFMA_N               # 2 MFMA m-subtiles / wave
+    K_STEPS_QK = head_dim // MFMA_K                 # 16
+    N_BLKS_S = block_n // MFMA_N                     # 4
+    K_STEPS_PV = block_n // MFMA_K                   # 2
+    D_BLKS = head_dim // MFMA_N                      # 32
+    KV_TILES_MAIN = topk_main // block_n             # C128: 128/64 = 2
+    KV_TILES_EXTRA = topk_extra // block_n           # C128: 64/64 = 1
+
+    TOK_OUT_STRIDE = h_q * head_dim_v
+    HEAD_OUT_STRIDE = head_dim_v
+    Q_STOK = h_q * head_dim
+
+    # ---- pool byte geometry (data-major: 576 data + 8 scale per slot) -----
+    SLOT_DATA_BYTES = D_NOPE + D_ROPE * 2           # 576
+    SLOT_SCALE_BYTES = BYTES_PER_TOKEN_SCALE        # 8
+    PBB_MAIN = block_size_main * (SLOT_DATA_BYTES + SLOT_SCALE_BYTES)
+    PBB_EXTRA = block_size_extra * (SLOT_DATA_BYTES + SLOT_SCALE_BYTES)
+
+    # gather: 256 threads = 64 key rows x 4 head-dim quarters (one quarter/wave)
+    NOPE_QUARTER = D_NOPE // N_WAVES                 # 112
+    NOPE_CHUNKS = NOPE_QUARTER // 8                  # 14
+    ROPE_QUARTER = D_ROPE // N_WAVES                 # 16
+    ROPE_CHUNKS = ROPE_QUARTER // 8                  # 2
+
+    SM_LOG2E = float(sm_scale) * _LOG2E
+    BIG = 1.0e30
+
+    # ---- LDS layout (96KB, identical to C4) -------------------------------
+    LDS_KV_BF16 = block_n * head_dim                 # 32768 bf16 (64KB)
+    LDS_KV_BYTES = LDS_KV_BF16 * 2                    # 65536
+    LDS_P_F32 = BLOCK_H * block_n                     # 8192 f32 (32KB)
+    LDS_P_BYTES = LDS_P_F32 * 4                        # 32768
+    LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES            # 98304 (< 160KB)
+
+    alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name="dual_scope_c128_smem")
+    base_off = alloc._align(alloc.ptr, 16)
+    alloc.ptr = base_off + LDS_TOTAL
+    kv_lds_off = base_off
+    p_lds_off = base_off + LDS_KV_BYTES
+
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def dual_scope_prefill_kernel_c128(
+        Q: fx.Tensor,             # [T, h_q, head_dim]            bf16
+        KV_Main: fx.Tensor,       # [Nb_main, per_block_bytes]    uint8 raw pool
+        Indices_Main: fx.Tensor,  # [T, topk_main]                int32
+        TopkLen_Main: fx.Tensor,  # [T]                           int32 (1:1 per tok)
+        KV_Extra: fx.Tensor,      # [Nb_extra, per_block_bytes]   uint8 raw pool
+        Indices_Extra: fx.Tensor, # [T, topk_extra]               int32
+        TopkLen_Extra: fx.Tensor, # [T]                           int32 (1:1 per tok)
+        AttnSink: fx.Tensor,      # [h_q]                         f32
+        Out: fx.Tensor,           # [T, h_q, head_dim_v]          bf16
+        total_tokens: fx.Int32,
+    ):
+        # ---- LLVM pointer helpers (mirror the base kernel exactly) ------
+        def _ptr_ty():
+            return ir.Type.parse("!llvm.ptr")
+
+        def _as_ptr(t):
+            v = t
+            if hasattr(v, "ir_value") and not isinstance(v, ir.Value):
+                v = v.ir_value()
+            return _fly.extract_aligned_pointer_as_index(_ptr_ty(), v)
+
+        q_ptr           = _as_ptr(Q)
+        out_ptr         = _as_ptr(Out)
+        sink_ptr        = _as_ptr(AttnSink)
+        main_pool_ptr   = _as_ptr(KV_Main)
+        main_idx_ptr    = _as_ptr(Indices_Main)
+        main_tkl_ptr    = _as_ptr(TopkLen_Main)
+        extra_pool_ptr  = _as_ptr(KV_Extra)
+        extra_idx_ptr   = _as_ptr(Indices_Extra)
+        extra_tkl_ptr   = _as_ptr(TopkLen_Extra)
+
+        # ---- typed constants / fast-math wrappers ----------------------
+        v4f32_type  = Vec.make_type(4, fx.Float32)
+        vec8bf16_ty = Vec.make_type(8, fx.BFloat16)
+        fm = arith.FastMathFlags.fast
+
+        def _fadd(a, b): return arith.addf(_raw(a), _raw(b), fastmath=fm)
+        def _fmul(a, b): return arith.mulf(_raw(a), _raw(b), fastmath=fm)
+        def _fsub(a, b): return arith.subf(_raw(a), _raw(b), fastmath=fm)
+        def _fmax(a, b): return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm).result
+        def _fmin(a, b): return arith.MinNumFOp(_raw(a), _raw(b), fastmath=fm).result
+        def _exp2(x):    return rocdl.exp2(T.f32, _raw(x))
+
+        c_one  = fx.Float32(1.0)
+        c_big  = fx.Float32(BIG)
+        c_log2e = fx.Float32(_LOG2E)
+        c_sm_log2e = fx.Float32(SM_LOG2E)
+
+        # ---- load helpers ----------------------------------------------
+        def load_i32(ptr, eoff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(eoff), elem_type=T.i32)
+            return _llvm.LoadOp(T.i32, gep).result
+
+        def load_bf16_elem(ptr, eoff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(eoff), elem_type=T.bf16)
+            return _llvm.LoadOp(T.bf16, gep).result
+
+        def load_f32_elem(ptr, eoff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(eoff), elem_type=T.f32)
+            return _llvm.LoadOp(T.f32, gep).result
+
+        def load_u8_i32(ptr, boff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(boff), elem_type=T.i8)
+            u8 = _llvm.LoadOp(T.i8, gep).result
+            return _mlir_arith.ExtUIOp(T.i32, u8).result
+
+        def load_i64(ptr, boff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(boff), elem_type=T.i8)
+            return _llvm.LoadOp(T.i64, gep).result
+
+        def load_bf16_byte(ptr, boff):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(boff), elem_type=T.i8)
+            return _llvm.LoadOp(T.bf16, gep).result
+
+        def extract_byte_i32(v_i64, j):
+            sh  = _mlir_arith.ShRUIOp(v_i64, _raw(fx.Int64(j * 8))).result
+            msk = _mlir_arith.AndIOp(sh, _raw(fx.Int64(0xFF))).result
+            return _mlir_arith.TruncIOp(T.i32, msk).result
+
+        def fp8_to_f32(byte_i32):
+            return rocdl.cvt_f32_fp8(T.f32, byte_i32, fx.Int32(0))
+
+        def ue8m0_to_f32(u8_i32):
+            f = _mlir_arith.UIToFPOp(T.f32, u8_i32).result
+            return _exp2(_fsub(f, fx.Float32(127.0)))
+
+        def to_bf16(f32val):
+            return fx.Float32(f32val).to(fx.BFloat16)
+
+        def mfma_bf16(acc, a, b):
+            return rocdl.mfma_f32_16x16x32_bf16(v4f32_type, [a, b, acc, 0, 0, 0])
+
+        # ---- thread / block ids ----------------------------------------
+        #   grid = (h_q/BLOCK_H == 1, total_tokens); block = (256,1,1).
+        #   wave = tid//64 (0..3) -> owns 32 heads.  lin = tid%64.
+        tid       = fx.Index(gpu.thread_idx.x)
+        pid_t     = fx.Index(gpu.block_idx.y)
+        wave      = tid // fx.Index(WARP_SIZE)      # 0..3
+        lin       = tid % fx.Index(WARP_SIZE)       # 0..63
+        lane      = lin % fx.Index(MFMA_N)          # 0..15 MFMA row(A)/col(B/C)
+        k_group   = lin // fx.Index(MFMA_N)         # 0..3  MFMA K-subgroup
+        wave_head_base = wave * fx.Index(HEADS_PER_WAVE)   # this wave's first head
+        kv_row    = lin                              # gather: key row (0..63)
+        g_part    = wave                             # gather: head-dim quarter
+
+        # ---- LDS ------------------------------------------------------
+        lds_base = alloc.get_base()
+        lds_kv = SmemPtr(lds_base, kv_lds_off, T.bf16, shape=(LDS_KV_BF16,)).get()
+        lds_p  = SmemPtr(lds_base, p_lds_off,  T.f32,  shape=(LDS_P_F32,)).get()
+
+        topklen_main_val  = load_i32(main_tkl_ptr,  pid_t)
+        topklen_extra_val = load_i32(extra_tkl_ptr, pid_t)
+
+        # ---- preload Q head tiles (M_SUBS x K_STEPS_QK x vector<8xbf16>) -
+        q_packs = [[] for _ in range_constexpr(M_SUBS)]
+        for m_sub in range_constexpr(M_SUBS):
+            hb = wave_head_base + fx.Index(m_sub * MFMA_N)
+            for ks in range_constexpr(K_STEPS_QK):
+                q_elems = []
+                for j in range_constexpr(8):
+                    q_eoff = (
+                        pid_t * fx.Index(Q_STOK)
+                        + (hb + lane) * fx.Index(head_dim)
+                        + fx.Index(ks * MFMA_K + j) + k_group * fx.Index(8)
+                    )
+                    q_elems.append(load_bf16_elem(q_ptr, q_eoff))
+                q_packs[m_sub].append(Vec.from_elements(q_elems, fx.BFloat16))
+
+        # ---- online-softmax carry: per m_sub [m(4), l(4), o_acc(D_BLKS)] -
+        PER_SUB = 8 + D_BLKS
+        _init = []
+        for _ms in range_constexpr(M_SUBS):
+            _init += [_raw(fx.Float32(-BIG)) for _ in range_constexpr(4)]
+            _init += [_raw(fx.Float32(0.0)) for _ in range_constexpr(4)]
+            _init += [_raw(Vec.filled(4, 0.0, fx.Float32)) for _ in range_constexpr(D_BLKS)]
+
+        def emit_tile(kv_tile, carry, pool_ptr, idx_ptr, tkl_val, topk, bs, pbb):
+            kv_pos_base = kv_tile * fx.Index(block_n)
+
+            # === gather + dequant one BLOCK_N=64 tile -> LDS (bf16) =======
+            # thread (wave w, lin l): key row l, head-dim quarter w.
+            idx_i32 = load_i32(idx_ptr, pid_t * fx.Index(topk)
+                               + kv_pos_base + kv_row)
+            idx_c = _mlir_arith.MaxSIOp(idx_i32, _raw(fx.Int32(0))).result
+            blk = _mlir_arith.DivUIOp(idx_c, _raw(fx.Int32(bs))).result
+            off = _mlir_arith.RemUIOp(idx_c, _raw(fx.Int32(bs))).result
+            blk_i = fx.Index(blk)
+            off_i = fx.Index(off)
+            data_base = blk_i * fx.Index(pbb) + off_i * fx.Index(SLOT_DATA_BYTES)
+            scale_base = (blk_i * fx.Index(pbb)
+                          + fx.Index(bs * SLOT_DATA_BYTES)
+                          + off_i * fx.Index(SLOT_SCALE_BYTES))
+
+            # phase A: nope quarter (112 fp8) -> bf16, per-64 ue8m0 scale folded
+            for dc in range_constexpr(NOPE_CHUNKS):
+                abs_dim = g_part * fx.Index(NOPE_QUARTER) + fx.Index(dc * 8)
+                tile = abs_dim // fx.Index(QUANT_BLOCK)
+                scale_f = ue8m0_to_f32(load_u8_i32(pool_ptr, scale_base + tile))
+                raw_i64 = load_i64(pool_ptr, data_base + abs_dim)
+                bvals = []
+                for j in range_constexpr(8):
+                    fv = _fmul(fp8_to_f32(extract_byte_i32(raw_i64, j)), scale_f)
+                    bvals.append(to_bf16(fv))
+                Vec.from_elements(bvals, fx.BFloat16).store(
+                    lds_kv, [kv_row * fx.Index(head_dim) + abs_dim]
+                )
+
+            # phase B: rope quarter (32 raw bytes -> 16 bf16 LE) -> bf16
+            for dc in range_constexpr(ROPE_CHUNKS):
+                rope_idx = g_part * fx.Index(ROPE_QUARTER) + fx.Index(dc * 8)
+                bvals = []
+                for j in range_constexpr(8):
+                    boff = (data_base + fx.Index(D_NOPE)
+                            + (rope_idx + fx.Index(j)) * fx.Index(2))
+                    bvals.append(load_bf16_byte(pool_ptr, boff))
+                Vec.from_elements(bvals, fx.BFloat16).store(
+                    lds_kv, [kv_row * fx.Index(head_dim) + fx.Index(D_NOPE) + rope_idx]
+                )
+
+            gpu.barrier()
+
+            # === validity mask (head-independent; computed once / tile) ===
+            mask_f = []
+            for nb in range_constexpr(N_BLKS_S):
+                key_pos = kv_pos_base + fx.Index(nb * MFMA_N) + lane
+                ki = load_i32(idx_ptr, pid_t * fx.Index(topk) + key_pos)
+                ne = arith.cmpi(arith.CmpIPredicate.ne, ki, fx.Int32(-1))
+                kp_i32 = _mlir_arith.IndexCastOp(T.i32, _raw(key_pos)).result
+                lt = arith.cmpi(arith.CmpIPredicate.slt, kp_i32, tkl_val)
+                good = _mlir_arith.AndIOp(_raw(ne), _raw(lt)).result
+                mask_f.append(_mlir_arith.UIToFPOp(T.f32, good).result)
+
+            new_carry = []
+            for m_sub in range_constexpr(M_SUBS):
+                base = m_sub * PER_SUB
+                m_run = [carry[base + r] for r in range_constexpr(4)]
+                l_run = [carry[base + 4 + r] for r in range_constexpr(4)]
+                o_acc = [carry[base + 8 + d] for d in range_constexpr(D_BLKS)]
+                hb = wave_head_base + fx.Index(m_sub * MFMA_N)
+
+                # === QK GEMM : S[16, BLOCK_N] = Q @ K^T (bf16 MFMA) =======
+                s_acc = [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(N_BLKS_S)]
+                for ks in range_constexpr(K_STEPS_QK):
+                    q_a = q_packs[m_sub][ks]
+                    for nb in range_constexpr(N_BLKS_S):
+                        key = fx.Index(nb * MFMA_N) + lane
+                        koff = (key * fx.Index(head_dim)
+                                + fx.Index(ks * MFMA_K) + k_group * fx.Index(8))
+                        k_b = Vec.load(vec8bf16_ty, lds_kv, [koff])
+                        s_acc[nb] = mfma_bf16(s_acc[nb], q_a, k_b)
+
+                # === online softmax (log2 space) =========================
+                s_scaled = [
+                    [_fmul(Vec(s_acc[nb])[r], c_sm_log2e) for r in range_constexpr(4)]
+                    for nb in range_constexpr(N_BLKS_S)
+                ]
+                s_for_max = [
+                    [_fadd(s_scaled[nb][r], _fmul(_fsub(mask_f[nb], c_one), c_big))
+                     for r in range_constexpr(4)]
+                    for nb in range_constexpr(N_BLKS_S)
+                ]
+                row_max = [s_for_max[0][r] for r in range_constexpr(4)]
+                for nb in range_constexpr(N_BLKS_S):
+                    if const_expr(nb > 0):
+                        for r in range_constexpr(4):
+                            row_max[r] = _fmax(row_max[r], s_for_max[nb][r])
+                for xor_off in [8, 4, 2, 1]:
+                    so = fx.Int32(xor_off)
+                    for r in range_constexpr(4):
+                        row_max[r] = _fmax(
+                            row_max[r],
+                            fx.Float32(row_max[r]).shuffle_xor(so, fx.Int32(WARP_SIZE)),
+                        )
+
+                m_new = [_fmax(m_run[r], row_max[r]) for r in range_constexpr(4)]
+                corr  = [_exp2(_fsub(m_run[r], m_new[r])) for r in range_constexpr(4)]
+
+                p_vals   = [[None] * 4 for _ in range_constexpr(N_BLKS_S)]
+                tile_sum = [_raw(fx.Float32(0.0)) for _ in range_constexpr(4)]
+                for nb in range_constexpr(N_BLKS_S):
+                    for r in range_constexpr(4):
+                        p = _fmul(_exp2(_fsub(s_scaled[nb][r], m_new[r])), mask_f[nb])
+                        p_vals[nb][r] = p
+                        tile_sum[r] = _fadd(tile_sum[r], p)
+                for xor_off in [8, 4, 2, 1]:
+                    so = fx.Int32(xor_off)
+                    for r in range_constexpr(4):
+                        tile_sum[r] = _fadd(
+                            tile_sum[r],
+                            fx.Float32(tile_sum[r]).shuffle_xor(so, fx.Int32(WARP_SIZE)),
+                        )
+
+                l_new = [_fadd(_fmul(corr[r], l_run[r]), tile_sum[r]) for r in range_constexpr(4)]
+                new_o = []
+                for d in range_constexpr(D_BLKS):
+                    ov = Vec(o_acc[d])
+                    new_o.append(
+                        Vec.from_elements(
+                            [_fmul(ov[r], corr[r]) for r in range_constexpr(4)], fx.Float32
+                        )
+                    )
+
+                # === stage P (f32) -> LDS, transposed [head_row][key] =====
+                for nb in range_constexpr(N_BLKS_S):
+                    for r in range_constexpr(4):
+                        p_row = hb + k_group * fx.Index(4) + fx.Index(r)
+                        p_col = fx.Index(nb * MFMA_N) + lane
+                        _memref.store(_raw(p_vals[nb][r]), lds_p,
+                                      [_raw(p_row * fx.Index(block_n) + p_col)])
+                gpu.barrier()
+
+                # === PV GEMM : O += P @ V (bf16 MFMA), K=block_n=2x32 ======
+                for ks_pv in range_constexpr(K_STEPS_PV):
+                    p_base = ((hb + lane) * fx.Index(block_n)
+                              + fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8))
+                    p_a = Vec.from_elements(
+                        [to_bf16(_memref.load(lds_p, [_raw(p_base + fx.Index(j))]))
+                         for j in range_constexpr(8)],
+                        fx.BFloat16,
+                    )
+                    for d in range_constexpr(D_BLKS):
+                        vvals = []
+                        for j in range_constexpr(8):
+                            key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
+                            voff = key * fx.Index(head_dim) + fx.Index(d * MFMA_N) + lane
+                            vvals.append(_memref.load(lds_kv, [_raw(voff)]))
+                        v_b = Vec.from_elements(vvals, fx.BFloat16)
+                        new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
+                gpu.barrier()
+
+                new_carry += list(m_new) + list(l_new) + list(new_o)
+
+            return new_carry
+
+        # ==== dual-scope online softmax: SWA (main) then EXTRA ==========
+        loop_results = _init
+        for kv_tile, _carry in range(0, KV_TILES_MAIN, 1, init=_init):
+            new_carry = emit_tile(
+                kv_tile, _carry,
+                main_pool_ptr, main_idx_ptr, topklen_main_val,
+                topk_main, block_size_main, PBB_MAIN,
+            )
+            loop_results = yield new_carry
+
+        for kv_tile, _carry in range(0, KV_TILES_EXTRA, 1, init=loop_results):
+            new_carry = emit_tile(
+                kv_tile, _carry,
+                extra_pool_ptr, extra_idx_ptr, topklen_extra_val,
+                topk_extra, block_size_extra, PBB_EXTRA,
+            )
+            loop_results = yield new_carry
+
+        # ==== finalize : normalize, fold attn_sink, lonely -> zero ======
+        for m_sub in range_constexpr(M_SUBS):
+            base = m_sub * PER_SUB
+            m_run = [loop_results[base + r] for r in range_constexpr(4)]
+            l_run = [loop_results[base + 4 + r] for r in range_constexpr(4)]
+            o_acc = [loop_results[base + 8 + d] for d in range_constexpr(D_BLKS)]
+            hb = wave_head_base + fx.Index(m_sub * MFMA_N)
+            for r in range_constexpr(4):
+                head = hb + k_group * fx.Index(4) + fx.Index(r)
+                l_r = l_run[r]
+                m_r = m_run[r]
+                lonely_f = _fsub(c_one, _fmin(_fmul(l_r, c_big), c_one))
+                one_m = _fsub(c_one, lonely_f)
+                m_safe = _fmul(m_r, one_m)
+                if const_expr(has_attn_sink):
+                    sink = load_f32_elem(sink_ptr, head)
+                    sink_term = _exp2(_fsub(_fmul(sink, c_log2e), m_safe))
+                    denom = _fadd(l_r, sink_term)
+                else:
+                    denom = l_r
+                safe_denom = _fadd(_fmul(denom, one_m), lonely_f)
+                inv = arith.divf(_raw(c_one), _raw(safe_denom), fastmath=fm)
+                for d in range_constexpr(D_BLKS):
+                    o_norm = _fmul(Vec(o_acc[d])[r], inv)
+                    out_off = (pid_t * fx.Index(TOK_OUT_STRIDE)
+                               + head * fx.Index(HEAD_OUT_STRIDE)
+                               + fx.Index(d * MFMA_N) + lane)
+                    out_gep = buffer_ops.get_element_ptr(
+                        out_ptr, fx.Int64(out_off), elem_type=T.bf16
+                    )
+                    _llvm.StoreOp(to_bf16(o_norm).ir_value(), out_gep)
+        return
+
+    @flyc.jit
+    def launch_dual_scope_prefill_c128(
+        Q, KV_Main, Indices_Main, TopkLen_Main,
+        KV_Extra, Indices_Extra, TopkLen_Extra,
+        AttnSink, Out, total_tokens,
+        stream: "fx.Stream" = fx.Stream(None),
+    ):
+        alloc.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            alloc.finalize()
+
+        tokens_idx = fx.Index(total_tokens)
+        grid_h = fx.Index((h_q + BLOCK_H - 1) // BLOCK_H)
+        launcher = dual_scope_prefill_kernel_c128(
+            Q, KV_Main, Indices_Main, TopkLen_Main,
+            KV_Extra, Indices_Extra, TopkLen_Extra,
+            AttnSink, Out, total_tokens,
+        )
+
+        passthrough = []
+        for pair in [
+            ("denormal-fp-math-f32", "preserve-sign,preserve-sign"),
+            ("no-nans-fp-math", "true"),
+            ("unsafe-fp-math", "true"),
+        ]:
+            passthrough.append(
+                ir.ArrayAttr.get(
+                    [ir.StringAttr.get(pair[0]), ir.StringAttr.get(pair[1])]
+                )
+            )
+        for op in ctx.gpu_module_body.operations:
+            if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
+                op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough)
+                op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                    T.i32, int(waves_per_eu)
+                )
+
+        launcher.launch(
+            grid=(grid_h, tokens_idx, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    _hints = {
+        "fast_fp_math": True,
+        "unsafe_fp_math": True,
+        "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
+    }
+
+    def _launch(*args, **kwargs):
+        with CompilationContext.compile_hints(_hints):
+            return launch_dual_scope_prefill_c128(*args, **kwargs)
+
+    return _launch
+
+
 def _flydsl_dual_scope_kernel_impl(
     q: torch.Tensor,
     swa_k_cache: torch.Tensor,
@@ -1385,19 +1909,26 @@ def _flydsl_dual_scope_kernel_impl(
     device = q3.device
     T_tok, H, _ = q3.shape
 
-    # ---- C4 / high-topk dispatch ---------------------------------------
+    # ---- specialized-kernel dispatch -----------------------------------
     # compress_ratio is the discriminator (passed directly by the backend):
-    #   * compress_ratio == 4   -> the new BLOCK_H=128 / BLOCK_N=64, 4-wave C4
-    #                              kernel (1 CTA/token handles all 128 heads;
-    #                              gather+dequant done once for all heads).
-    #   * compress_ratio == 128 -> the original BLOCK_H=16 / BLOCK_N=32 kernel,
-    #                              UNCHANGED (so that path keeps working).
-    # The C4 kernel is fixed at BLOCK_N=64, so topk_main / topk_extra are padded
-    # up to a multiple of 64 with -1 sentinels (which mask out exactly like real
-    # padding); BLOCK_H=128 means h_q is padded to a multiple of 128.
-    use_c4 = int(compress_ratio) == 4
-    block_h = 128 if use_c4 else 16
-    block_n = 64 if use_c4 else 32
+    #   * compress_ratio == 4   -> the C4 / high-topk BLOCK_H=128 / BLOCK_N=64,
+    #                              4-wave kernel (1 CTA/token handles all 128
+    #                              heads; gather+dequant done once for all heads).
+    #   * compress_ratio == 128 -> the C128 / low-topk kernel, which REUSES the
+    #                              same LDS-sound BLOCK_H=128 / BLOCK_N=64 4-wave
+    #                              tiling (only the C128 dims / block_size_extra
+    #                              differ) -- a separate specialized builder.
+    #   * any other ratio       -> the original BLOCK_H=16 / BLOCK_N=32 base
+    #                              kernel as a safe fallback.
+    # Both specialized kernels are fixed at BLOCK_N=64, so topk_main / topk_extra
+    # are padded up to a multiple of 64 with -1 sentinels (which mask out exactly
+    # like real padding); BLOCK_H=128 means h_q is padded to a multiple of 128.
+    ratio = int(compress_ratio)
+    use_c4 = ratio == 4
+    use_c128 = ratio == 128
+    use_specialized = use_c4 or use_c128
+    block_h = 128 if use_specialized else 16
+    block_n = 64 if use_specialized else 32
     h_q_pad = ((H + block_h - 1) // block_h) * block_h
 
     def _pad_topk(idx: torch.Tensor) -> torch.Tensor:
@@ -1412,7 +1943,7 @@ def _flydsl_dual_scope_kernel_impl(
 
     # --- main (SWA) scope tensors ---------------------------------------
     swa_idx = _normalize_indices(swa_indices).to(torch.int32).contiguous()  # [T, topk_m]
-    if use_c4:
+    if use_specialized:
         swa_idx = _pad_topk(swa_idx)
     topk_main = swa_idx.shape[1]
     swa_u8, _nb_main, bs_main = _block_layout(swa_k_cache)                   # [Nb, pbb] u8
@@ -1421,7 +1952,7 @@ def _flydsl_dual_scope_kernel_impl(
     has_extra = extra_k_cache is not None and extra_indices is not None
     if has_extra:
         extra_idx = _normalize_indices(extra_indices).to(torch.int32).contiguous()
-        if use_c4:
+        if use_specialized:
             extra_idx = _pad_topk(extra_idx)
         topk_extra = extra_idx.shape[1]
         extra_u8, _nb_extra, bs_extra = _block_layout(extra_k_cache)
@@ -1462,10 +1993,16 @@ def _flydsl_dual_scope_kernel_impl(
     out = torch.zeros((T_tok, h_q_pad, head_dim_v), dtype=torch.bfloat16, device=device)
 
     # Dispatch on compress_ratio: compress_ratio==4 -> the specialized C4 /
-    # high-topk kernel (BLOCK_H=128/BLOCK_N=64, 4 waves); compress_ratio==128
-    # keeps using the original BLOCK_H=16/BLOCK_N=32 kernel unchanged. Both
+    # high-topk kernel; compress_ratio==128 -> the specialized C128 / low-topk
+    # kernel (both BLOCK_H=128/BLOCK_N=64, 4 waves); any other ratio -> the
+    # original BLOCK_H=16/BLOCK_N=32 base kernel as a safe fallback. All three
     # builders expose the same launcher call signature.
-    _build = _build_dual_scope_kernel_c4 if use_c4 else _build_dual_scope_kernel
+    if use_c4:
+        _build = _build_dual_scope_kernel_c4
+    elif use_c128:
+        _build = _build_dual_scope_kernel_c128
+    else:
+        _build = _build_dual_scope_kernel
     kernel = _build(
         h_q=h_q_pad,
         head_dim=D_QK,
