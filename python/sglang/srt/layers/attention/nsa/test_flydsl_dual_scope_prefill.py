@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.nsa.flydsl_dual_scope_prefill import (
     D_V,
     N_NOPE_TILES,
     QUANT_BLOCK,
+    _USE_FLYDSL_KERNEL,
     _flydsl_available,
     _flydsl_dual_scope_kernel_impl,
     _torch_reference_dual_scope,
@@ -306,26 +307,26 @@ def run_case(label: str, **kwargs) -> None:
     _check("cosine(ref, oracle) > 0.999", cos > 0.999)
     _check("max_abs < 5e-2", max_abs < 5e-2)
 
-    # public entry returns identical result to the reference (TEMP live path)
-    pub = flydsl_dual_scope_prefill(
-        q=s.q,
-        swa_k_cache=s.swa_k_cache,
-        swa_indices=s.swa_indices,
-        swa_topk_length=s.swa_topk_length,
-        extra_k_cache=s.extra_k_cache,
-        extra_indices=s.extra_indices,
-        extra_topk_length=s.extra_topk_length,
-        compress_ratio=s.compress_ratio,
-        softmax_scale=s.softmax_scale,
-        attn_sink=s.attn_sink,
-        head_dim_v=s.head_dim_v,
-    )
-    _check("public entry == reference", bool(torch.equal(pub, ref)))
-
-    # TODO(phase1): once the FlyDSL kernel lands, build the SAME synthetic inputs
-    #   and assert cosine-diff(kernel_out, ref) < 3e-2:
-    #       kernel_out = _flydsl_dual_scope_kernel_impl(...same args...)
-    #       assert (1.0 - _cosine(kernel_out, ref)) < 3e-2
+    # When the kernel is the live path (_USE_FLYDSL_KERNEL=True) the public entry
+    # routes through the GPU FlyDSL kernel, which requires CUDA and is not
+    # bit-identical to this CPU reference; that path is validated numerically by
+    # run_kernel_launch_case below.  Only assert exact public==reference equality
+    # when the reference is the live path (flag False).
+    if not _USE_FLYDSL_KERNEL:
+        pub = flydsl_dual_scope_prefill(
+            q=s.q,
+            swa_k_cache=s.swa_k_cache,
+            swa_indices=s.swa_indices,
+            swa_topk_length=s.swa_topk_length,
+            extra_k_cache=s.extra_k_cache,
+            extra_indices=s.extra_indices,
+            extra_topk_length=s.extra_topk_length,
+            compress_ratio=s.compress_ratio,
+            softmax_scale=s.softmax_scale,
+            attn_sink=s.attn_sink,
+            head_dim_v=s.head_dim_v,
+        )
+        _check("public entry == reference", bool(torch.equal(pub, ref)))
 
 
 def run_kernel_launch_case(label: str, ref_subset: Optional[int] = None, **kwargs) -> None:
