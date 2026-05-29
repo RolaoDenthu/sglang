@@ -201,9 +201,10 @@ def main() -> int:
             )
         o_kernel = o_kernel.reshape(T_full, H, head_dim_v)
         o_kernel_s = o_kernel[:n].contiguous()
+        nz_frac = (o_kernel.float().abs() > 0).float().mean().item()
         print(
-            f"       o_kernel shape={tuple(o_kernel.shape)} dtype={o_kernel.dtype} "
-            f"(nonzero frac={ (o_kernel.float().abs() > 0).float().mean().item():.4f })"
+            f"       o_kernel shape={tuple(o_kernel.shape)} "
+            f"dtype={o_kernel.dtype} (nonzero frac={nz_frac:.4f})"
         )
     except Exception as e:
         import traceback
