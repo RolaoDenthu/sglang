@@ -328,12 +328,19 @@ def run_case(label: str, **kwargs) -> None:
     #       assert (1.0 - _cosine(kernel_out, ref)) < 3e-2
 
 
-def run_kernel_launch_case(label: str, **kwargs) -> None:
+def run_kernel_launch_case(label: str, ref_subset: Optional[int] = None, **kwargs) -> None:
     """Phase-1 inner-math test: build synthetic inputs, launch the FlyDSL
     dual-scope kernel, and assert it numerically MATCHES the PyTorch reference
     (cosine > 0.97).  Reports cosine / max-abs / max-rel per case.  Skips
     cleanly when CUDA / FlyDSL (gfx950) is unavailable so the CPU reference
     harness still runs.
+
+    ``ref_subset``: when set, the kernel still runs on the FULL token set
+    (cheap: one CTA/token), but the dense PyTorch reference is only built for
+    the first ``ref_subset`` query tokens and the kernel output is sliced to the
+    same subset for comparison.  This keeps the reference's [T, topk, 512]
+    gather tractable for the large-T cases (T=512/1024) without diluting the
+    correctness signal.
     """
     print(f"\n=== [kernel-launch] {label} ===")
     if not torch.cuda.is_available():
@@ -358,21 +365,45 @@ def run_kernel_launch_case(label: str, **kwargs) -> None:
         head_dim_v=s.head_dim_v,
     )
 
+    T, _, H, _ = s.q.shape
+
+    # Optionally restrict the dense reference (and the kernel output it is
+    # compared against) to the first ``n`` query tokens.  Per-token inputs
+    # (q, indices, topk_length) are sliced consistently; the paged pools and
+    # attn_sink are shared and stay full.
+    if ref_subset is not None and ref_subset < T:
+        n = ref_subset
+        print(f"  [ref-subset] dense reference on first {n} of T={T} tokens "
+              f"(kernel ran full T)")
+        ref_q = s.q[:n].contiguous()
+        ref_swa_idx = s.swa_indices[:n].contiguous()
+        ref_swa_len = s.swa_topk_length[:n].contiguous() if s.swa_topk_length is not None else None
+        ref_extra_idx = s.extra_indices[:n].contiguous() if s.extra_indices is not None else None
+        ref_extra_len = s.extra_topk_length[:n].contiguous() if s.extra_topk_length is not None else None
+        out_cmp = out[:n].contiguous()
+    else:
+        n = T
+        ref_q = s.q
+        ref_swa_idx = s.swa_indices
+        ref_swa_len = s.swa_topk_length
+        ref_extra_idx = s.extra_indices
+        ref_extra_len = s.extra_topk_length
+        out_cmp = out
+
     ref = _torch_reference_dual_scope(
-        q=s.q,
+        q=ref_q,
         swa_k_cache=s.swa_k_cache,
-        swa_indices=s.swa_indices,
-        swa_topk_length=s.swa_topk_length,
+        swa_indices=ref_swa_idx,
+        swa_topk_length=ref_swa_len,
         extra_k_cache=s.extra_k_cache,
-        extra_indices=s.extra_indices,
-        extra_topk_length=s.extra_topk_length,
+        extra_indices=ref_extra_idx,
+        extra_topk_length=ref_extra_len,
         compress_ratio=s.compress_ratio,
         softmax_scale=s.softmax_scale,
         attn_sink=s.attn_sink,
         head_dim_v=s.head_dim_v,
     ).to(out.device)
 
-    T, _, H, _ = s.q.shape
     _check(
         f"kernel out shape == [T={T}, H={H}, {s.head_dim_v}]",
         tuple(out.shape) == (T, H, s.head_dim_v),
@@ -380,14 +411,14 @@ def run_kernel_launch_case(label: str, **kwargs) -> None:
     _check("kernel out dtype == bf16", out.dtype == torch.bfloat16)
     _check("kernel out all finite", bool(torch.isfinite(out.to(torch.float32)).all()))
 
-    of = out.to(torch.float32)
+    of = out_cmp.to(torch.float32)
     rf = ref.to(torch.float32)
     cos = _cosine(of, rf)
     max_abs = float((of - rf).abs().max())
     denom = rf.abs().clamp_min(1e-4)
     max_rel = float(((of - rf).abs() / denom).max())
     print(f"  cosine(kernel, ref) = {cos:.6f}   max_abs = {max_abs:.3e}   "
-          f"max_rel = {max_rel:.3e}")
+          f"max_rel = {max_rel:.3e}   (compared on {n} tokens)")
     _check("cosine(kernel, ref) > 0.97", cos > 0.97)
 
 
@@ -406,6 +437,52 @@ _LARGE_CASE = dict(
     compress_ratio=4,
 )
 
+# ---------------------------------------------------------------------------
+# C4 production-shape case (compress_ratio=4).  Exercises the C4 extra scope:
+# block_size_extra = page_size // 4 = 64, a LARGE extra topk (512 -> 16 runtime
+# EXTRA tiles) on top of the SWA main scope (topk 256 -> 8 main tiles), at the
+# real model dims H=128 (h_q_pad=128 -> grid_h=8), head_dim_v=512, and the real
+# main block_size 256.  Mixed valid / -1 / over-topk_length indices + attn_sink
+# are all populated by build_synthetic_dual_scope / _make_indices.
+_C4_CASE = dict(
+    H=128,
+    topk_main=256,
+    topk_extra=512,
+    block_size_main=256,
+    block_size_extra=64,
+    num_blocks_main=8,
+    num_blocks_extra=64,
+    compress_ratio=4,
+)
+
+# Large-T cases: full sequence length 512 / 1024 with the real H=128 head count
+# and dual scope populated, modest topk so the dense reference's [T, topk, 512]
+# gather stays tractable.  The kernel runs the full T cheaply (one CTA/token);
+# the dense reference is restricted to a token subset (ref_subset) for the
+# largest case.
+_LARGE_T_512 = dict(
+    T=512,
+    H=128,
+    topk_main=64,
+    topk_extra=64,
+    block_size_main=256,
+    block_size_extra=64,
+    num_blocks_main=8,
+    num_blocks_extra=64,
+    compress_ratio=4,
+)
+_LARGE_T_1024 = dict(
+    T=1024,
+    H=128,
+    topk_main=64,
+    topk_extra=64,
+    block_size_main=256,
+    block_size_extra=64,
+    num_blocks_main=8,
+    num_blocks_extra=64,
+    compress_ratio=4,
+)
+
 
 def main() -> None:
     torch.manual_seed(0)
@@ -415,6 +492,10 @@ def main() -> None:
     run_case("SWA only (no extra scope)", with_extra=False)
     run_case("C128 extra (compress_ratio=128)", compress_ratio=128)
     run_case("LARGE: H=20 (grid_h>1), bs=64, multi-tile (4 SWA + 8 EXTRA)", **_LARGE_CASE)
+    # C4 production-shape reference-vs-oracle check (small T=6 keeps the oracle
+    # cheap; the C4-distinguishing knobs are block_size_extra=64 + large extra
+    # topk + compress_ratio=4, all exercised here).
+    run_case("C4 prod-shape: H=128, bs_m=256, bs_e=64, topk 256+512", **_C4_CASE)
     print("\nAll dual-scope reference equivalence checks passed.")
 
     # Compile-first FlyDSL kernel launch tests (skip cleanly off-box).
@@ -423,6 +504,21 @@ def main() -> None:
     run_kernel_launch_case("no attn_sink / no topk_length", with_attn_sink=False, with_topk_length=False)
     run_kernel_launch_case(
         "LARGE: H=20 (grid_h>1), bs=64, multi-tile (4 SWA + 8 EXTRA)", **_LARGE_CASE
+    )
+    # NEW axes (not previously covered): C4 production shape + large T.
+    run_kernel_launch_case(
+        "C4 prod-shape: H=128 (grid_h=8), bs_m=256, bs_e=64, topk 256+512 "
+        "(8 SWA + 16 EXTRA tiles)",
+        **_C4_CASE,
+    )
+    run_kernel_launch_case(
+        "LARGE-T=512: H=128, dual scope (kernel full T, ref full T)",
+        **_LARGE_T_512,
+    )
+    run_kernel_launch_case(
+        "LARGE-T=1024: H=128, dual scope (kernel full T, ref subset=256)",
+        ref_subset=256,
+        **_LARGE_T_1024,
     )
 
 
