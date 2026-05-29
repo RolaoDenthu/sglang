@@ -1108,62 +1108,92 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 extra_topk_length=extra_topk_lengths,
             )
 
-            # ------- TEMP (#11): env-gated real-data capture (gfx950) -------
-            # When SGLANG_FLYDSL_CAPTURE=1 AND this is a prefill AND we have not
-            # captured yet, FORCE the production (FlashMLA/Triton) baseline path
-            # (bypassing the FlyDSL reference branch regardless of
-            # SGLANG_FLYDSL_PREFILL), dump the EXACT tensors that
-            # flydsl_dual_scope_prefill would receive plus the production output
-            # to /tmp/flydsl_capture.pt, then return the production output so the
-            # server keeps serving. No-op unless SGLANG_FLYDSL_CAPTURE=1.
+            # ------- TEMP (#11 / #12): env-gated real-data capture (gfx950) ----
+            # When SGLANG_FLYDSL_CAPTURE=1 AND this is a prefill, emit a one-line
+            # [FLYDSL-CAPTURE-SCAN] log per prefill forward (T + compress_ratio)
+            # so we can SEE which compress_ratio the model exercises at which T.
+            # The one-shot capture FORCES the production (FlashMLA/Triton)
+            # baseline path (bypassing the FlyDSL branch regardless of
+            # SGLANG_FLYDSL_PREFILL) and dumps the EXACT tensors that
+            # flydsl_dual_scope_prefill would receive plus the production output,
+            # then returns the production output so the server keeps serving.
+            #
+            # Targeting knobs (so we can capture a C4 / large-T prefill instead
+            # of the T=6 warmup; both optional):
+            #   SGLANG_FLYDSL_CAPTURE_MIN_T : capture only when T >= MIN_T   (def 0)
+            #   SGLANG_FLYDSL_CAPTURE_RATIO : capture only when compress_ratio
+            #                                 == RATIO (def: any ratio)
+            #   SGLANG_FLYDSL_CAPTURE_PATH  : output .pt path
+            #                                 (def /tmp/flydsl_capture_c4.pt)
+            # Strict no-op unless SGLANG_FLYDSL_CAPTURE=1.
             global _FLYDSL_CAPTURE_DONE
             if (
                 os.environ.get("SGLANG_FLYDSL_CAPTURE", "0") == "1"
-                and not _FLYDSL_CAPTURE_DONE
                 and forward_batch.forward_mode.is_prefill(
                     include_draft_extend_v2=True
                 )
             ):
-                backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
-                o_prod = flash_mla_with_kvcache_entrypoint(
-                    **input_dict, backend=backend
-                )[0]
-                o_prod = o_prod.squeeze(1)
-
-                def _cpu(t):
-                    if t is None or not isinstance(t, torch.Tensor):
-                        return t
-                    return t.detach().to("cpu").contiguous()
-
-                capture = {
-                    "q": _cpu(q),
-                    "swa_k_cache": _cpu(swa_k_cache),
-                    "swa_indices": _cpu(swa_page_indices),
-                    "swa_topk_length": _cpu(swa_topk_lengths),
-                    "extra_k_cache": _cpu(extra_k_cache),
-                    "extra_indices": _cpu(extra_indices),
-                    "extra_topk_length": _cpu(extra_topk_lengths),
-                    "compress_ratio": int(compress_ratio),
-                    "softmax_scale": float(self.softmax_scale),
-                    "attn_sink": _cpu(attn_sink),
-                    "head_dim_v": int(self.head_dim_v),
-                    "o_prod": _cpu(o_prod),
-                    "o_prod_dtype": str(o_prod.dtype),
-                    "o_prod_shape": tuple(o_prod.shape),
-                    "q_shape": tuple(q.shape),
-                }
-                torch.save(capture, "/tmp/flydsl_capture.pt")
-                _FLYDSL_CAPTURE_DONE = True
-                logger.warning(
-                    "[FLYDSL-CAPTURE] saved /tmp/flydsl_capture.pt "
-                    "(q_shape=%s, o_prod_shape=%s, o_prod_dtype=%s, "
-                    "compress_ratio=%s)",
-                    tuple(q.shape),
-                    tuple(o_prod.shape),
-                    o_prod.dtype,
-                    compress_ratio,
+                cap_T = int(q.shape[0])
+                min_t = int(os.environ.get("SGLANG_FLYDSL_CAPTURE_MIN_T", "0"))
+                _ratio_env = os.environ.get("SGLANG_FLYDSL_CAPTURE_RATIO", "").strip()
+                want_ratio = int(_ratio_env) if _ratio_env else None
+                should_capture = (
+                    (not _FLYDSL_CAPTURE_DONE)
+                    and cap_T >= min_t
+                    and (want_ratio is None or int(compress_ratio) == want_ratio)
                 )
-                return o_prod
+                logger.warning(
+                    "[FLYDSL-CAPTURE-SCAN] T=%d compress_ratio=%s captured=%s",
+                    cap_T,
+                    int(compress_ratio),
+                    bool(should_capture),
+                )
+                if should_capture:
+                    backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
+                    o_prod = flash_mla_with_kvcache_entrypoint(
+                        **input_dict, backend=backend
+                    )[0]
+                    o_prod = o_prod.squeeze(1)
+
+                    def _cpu(t):
+                        if t is None or not isinstance(t, torch.Tensor):
+                            return t
+                        return t.detach().to("cpu").contiguous()
+
+                    capture = {
+                        "q": _cpu(q),
+                        "swa_k_cache": _cpu(swa_k_cache),
+                        "swa_indices": _cpu(swa_page_indices),
+                        "swa_topk_length": _cpu(swa_topk_lengths),
+                        "extra_k_cache": _cpu(extra_k_cache),
+                        "extra_indices": _cpu(extra_indices),
+                        "extra_topk_length": _cpu(extra_topk_lengths),
+                        "compress_ratio": int(compress_ratio),
+                        "softmax_scale": float(self.softmax_scale),
+                        "attn_sink": _cpu(attn_sink),
+                        "head_dim_v": int(self.head_dim_v),
+                        "o_prod": _cpu(o_prod),
+                        "o_prod_dtype": str(o_prod.dtype),
+                        "o_prod_shape": tuple(o_prod.shape),
+                        "q_shape": tuple(q.shape),
+                    }
+                    out_path = os.environ.get(
+                        "SGLANG_FLYDSL_CAPTURE_PATH", "/tmp/flydsl_capture_c4.pt"
+                    )
+                    torch.save(capture, out_path)
+                    _FLYDSL_CAPTURE_DONE = True
+                    logger.warning(
+                        "[FLYDSL-CAPTURE] saved %s "
+                        "(T=%d, q_shape=%s, o_prod_shape=%s, o_prod_dtype=%s, "
+                        "compress_ratio=%s)",
+                        out_path,
+                        cap_T,
+                        tuple(q.shape),
+                        tuple(o_prod.shape),
+                        o_prod.dtype,
+                        compress_ratio,
+                    )
+                    return o_prod
 
             # ------- FlyDSL dual-scope prefill override (gfx950) -------
             # When SGLANG_FLYDSL_PREFILL=1, route prefill through a single fused
