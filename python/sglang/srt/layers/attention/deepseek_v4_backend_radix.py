@@ -90,6 +90,10 @@ logger = logging.getLogger(__name__)
 # env-gated SGLANG_FLYDSL_CAPTURE instrumentation in the prefill hook. When the
 # env var is unset/0 this is never touched and behavior is 100% unchanged.
 _FLYDSL_CAPTURE_DONE = False
+# TEMP (#12 clean capture): count matching (shape/ratio) prefills so we can skip
+# the first K (warmup / first-C4 autotune residue) before capturing a
+# steady-state prefill. Only incremented under SGLANG_FLYDSL_CAPTURE=1.
+_FLYDSL_CAPTURE_MATCH_COUNT = 0
 
 
 def _copy_metadata(
@@ -1126,7 +1130,17 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             #   SGLANG_FLYDSL_CAPTURE_PATH  : output .pt path
             #                                 (def /tmp/flydsl_capture_c4.pt)
             # Strict no-op unless SGLANG_FLYDSL_CAPTURE=1.
-            global _FLYDSL_CAPTURE_DONE
+            # ---- TEMP (#12 clean capture) safeguards on top of #11 -----------
+            #   SGLANG_FLYDSL_CAPTURE_SKIP : skip the first K matching prefills
+            #       (warmup / first-C4 autotune residue) before capturing a
+            #       steady-state one. (def 0 -> capture first match.)
+            # In addition, before SAVING we recompute the production output a
+            # SECOND time on identical inputs and only save if the two recomputes
+            # are self-consistent across ALL heads (per-head cosine all >0.999).
+            # If not, we log + SKIP this prefill and retry on the next matching
+            # one. This defeats the prior capture-time corruption that hit head-
+            # blocks [16:32]u[48:64] (autotune-warmup residue / buffer aliasing).
+            global _FLYDSL_CAPTURE_DONE, _FLYDSL_CAPTURE_MATCH_COUNT
             if (
                 os.environ.get("SGLANG_FLYDSL_CAPTURE", "0") == "1"
                 and forward_batch.forward_mode.is_prefill(
@@ -1137,29 +1151,83 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 min_t = int(os.environ.get("SGLANG_FLYDSL_CAPTURE_MIN_T", "0"))
                 _ratio_env = os.environ.get("SGLANG_FLYDSL_CAPTURE_RATIO", "").strip()
                 want_ratio = int(_ratio_env) if _ratio_env else None
+                skip_n = int(os.environ.get("SGLANG_FLYDSL_CAPTURE_SKIP", "0"))
+                verify_thr = float(
+                    os.environ.get("SGLANG_FLYDSL_CAPTURE_VERIFY_THR", "0.999")
+                )
+                matches_shape = cap_T >= min_t and (
+                    want_ratio is None or int(compress_ratio) == want_ratio
+                )
+                if matches_shape and not _FLYDSL_CAPTURE_DONE:
+                    _FLYDSL_CAPTURE_MATCH_COUNT += 1
+                matched_idx = _FLYDSL_CAPTURE_MATCH_COUNT  # 1-based for matches
                 should_capture = (
                     (not _FLYDSL_CAPTURE_DONE)
-                    and cap_T >= min_t
-                    and (want_ratio is None or int(compress_ratio) == want_ratio)
+                    and matches_shape
+                    and matched_idx > skip_n
                 )
                 logger.warning(
-                    "[FLYDSL-CAPTURE-SCAN] T=%d compress_ratio=%s captured=%s",
+                    "[FLYDSL-CAPTURE-SCAN] T=%d compress_ratio=%s match_idx=%s "
+                    "skip=%d captured=%s",
                     cap_T,
                     int(compress_ratio),
+                    matched_idx if matches_shape else -1,
+                    skip_n,
                     bool(should_capture),
                 )
                 if should_capture:
                     backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
-                    o_prod = flash_mla_with_kvcache_entrypoint(
-                        **input_dict, backend=backend
-                    )[0]
-                    o_prod = o_prod.squeeze(1)
 
                     def _cpu(t):
                         if t is None or not isinstance(t, torch.Tensor):
                             return t
                         return t.detach().to("cpu").contiguous()
 
+                    # Recompute production output TWICE on identical inputs.
+                    # Immediately detach().clone().contiguous() each to avoid any
+                    # output-buffer aliasing with internal autotune scratch.
+                    o_prod_1 = flash_mla_with_kvcache_entrypoint(
+                        **input_dict, backend=backend
+                    )[0].squeeze(1)
+                    o_prod_1 = o_prod_1.detach().clone().contiguous()
+                    o_prod_2 = flash_mla_with_kvcache_entrypoint(
+                        **input_dict, backend=backend
+                    )[0].squeeze(1)
+                    o_prod_2 = o_prod_2.detach().clone().contiguous()
+
+                    # per-head self-consistency check across ALL heads.
+                    a = o_prod_1.to(torch.float32)
+                    b = o_prod_2.to(torch.float32)
+                    n_heads = int(a.shape[1])
+                    af = a.permute(1, 0, 2).reshape(n_heads, -1)
+                    bf = b.permute(1, 0, 2).reshape(n_heads, -1)
+                    per_head_cos = torch.nn.functional.cosine_similarity(
+                        af, bf, dim=1
+                    )
+                    min_head_cos = float(per_head_cos.min())
+                    bad_mask = per_head_cos < verify_thr
+                    n_bad = int(bad_mask.sum())
+                    logger.warning(
+                        "[FLYDSL-CAPTURE-VERIFY] recompute self-consistency: "
+                        "min_head_cos=%.6f n_bad_heads(<%.3f)=%d/%d",
+                        min_head_cos,
+                        verify_thr,
+                        n_bad,
+                        n_heads,
+                    )
+                    if n_bad > 0:
+                        bad_heads = torch.nonzero(bad_mask).flatten().tolist()
+                        logger.warning(
+                            "[FLYDSL-CAPTURE-VERIFY] NOT self-consistent "
+                            "(bad heads=%s); SKIPPING save, retry next matching "
+                            "prefill",
+                            bad_heads,
+                        )
+                        # keep _FLYDSL_CAPTURE_DONE False so the next matching
+                        # prefill retries; return a valid output to keep serving.
+                        return o_prod_1
+
+                    o_prod = o_prod_1
                     capture = {
                         "q": _cpu(q),
                         "swa_k_cache": _cpu(swa_k_cache),
@@ -1176,6 +1244,10 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         "o_prod_dtype": str(o_prod.dtype),
                         "o_prod_shape": tuple(o_prod.shape),
                         "q_shape": tuple(q.shape),
+                        "capture_match_idx": int(matched_idx),
+                        "capture_skip": int(skip_n),
+                        "verify_min_head_cos": min_head_cos,
+                        "verify_n_heads": n_heads,
                     }
                     out_path = os.environ.get(
                         "SGLANG_FLYDSL_CAPTURE_PATH", "/tmp/flydsl_capture_c4.pt"
@@ -1185,13 +1257,17 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                     logger.warning(
                         "[FLYDSL-CAPTURE] saved %s "
                         "(T=%d, q_shape=%s, o_prod_shape=%s, o_prod_dtype=%s, "
-                        "compress_ratio=%s)",
+                        "compress_ratio=%s, match_idx=%d, "
+                        "verify_min_head_cos=%.6f over %d heads)",
                         out_path,
                         cap_T,
                         tuple(q.shape),
                         tuple(o_prod.shape),
                         o_prod.dtype,
                         compress_ratio,
+                        matched_idx,
+                        min_head_cos,
+                        n_heads,
                     )
                     return o_prod
 
