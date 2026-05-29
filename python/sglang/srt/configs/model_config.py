@@ -149,6 +149,35 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+def get_deepseek_v4_compress_ratios(hf_config):
+    """Per-layer DeepSeek-V4 attention compression ratios, as a list.
+
+    transformers>=5.8 ships a built-in ``DeepseekV4Config`` that supersedes the
+    checkpoint's remote-code config (even with ``trust_remote_code``).  It
+    replaced the old per-layer ``compress_ratios`` list with a ``compress_rates``
+    dict ({attention_type: ratio}) plus a per-layer ``layer_types`` list.
+
+    Normalize both schemas back to the original per-layer list (indexed by layer
+    id) so all downstream code that indexes/iterates it stays schema-agnostic.
+    Returns ``None`` if neither schema is present.
+    """
+    # Legacy schema (older transformers / checkpoint remote-code config).
+    compress_ratios = getattr(hf_config, "compress_ratios", None)
+    if compress_ratios is not None:
+        return list(compress_ratios)
+    compress_rates = getattr(hf_config, "compress_rates", None)
+    # transformers>=5.8 schema: {attention_type: ratio} dict + layer_types list.
+    if isinstance(compress_rates, dict):
+        layer_types = getattr(hf_config, "layer_types", None)
+        if layer_types is not None:
+            return [int(compress_rates.get(lt, 0)) for lt in layer_types]
+        return None
+    # Defensive: a future config could expose compress_rates already as a list.
+    if compress_rates is not None:
+        return list(compress_rates)
+    return None
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -568,15 +597,7 @@ class ModelConfig:
             if envs.SGLANG_DSV4_MODE.get() == "2604":
                 self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim
-            # transformers>=5.8 ships a built-in DeepseekV4Config that supersedes
-            # the checkpoint's remote-code config (even with trust_remote_code)
-            # and renames this field ``compress_ratios`` -> ``compress_rates``.
-            # Accept both so old and new transformers/checkpoints load.
-            self.compress_ratios = getattr(
-                self.hf_config,
-                "compress_rates",
-                getattr(self.hf_config, "compress_ratios", None),
-            )
+            self.compress_ratios = get_deepseek_v4_compress_ratios(self.hf_config)
             self.attention_arch = AttentionArch.MHA
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
             if self.hf_config.rope_scaling:

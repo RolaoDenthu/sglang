@@ -18,6 +18,7 @@ from sglang.srt.configs.deepseek_v4 import (
     DeepSeekV4Config,
     set_fp4_experts,
 )
+from sglang.srt.configs.model_config import get_deepseek_v4_compress_ratios
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
@@ -1563,13 +1564,9 @@ class MQALayer(nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.eps = config.rms_norm_eps
-        # transformers>=5.8 built-in DeepseekV4Config renamed this field
-        # ``compress_ratios`` -> ``compress_rates``; accept both names.
-        compress_ratios = getattr(
-            config,
-            "compress_rates",
-            getattr(config, "compress_ratios", None),
-        )
+        # Normalizes the old per-layer ``compress_ratios`` list and the
+        # transformers>=5.8 ``compress_rates`` dict + ``layer_types`` schema.
+        compress_ratios = get_deepseek_v4_compress_ratios(config)
         compress_ratio = compress_ratios[layer_id]
         assert compress_ratio in [0, 4, 128]
         self.compress_ratio: Literal[0, 4, 128] = compress_ratio  # type: ignore
@@ -2441,7 +2438,11 @@ class DeepseekV4Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        self.first_k_dense_replace = config.first_k_dense_replace
+        # transformers>=5.8 DeepseekV4Config dropped ``first_k_dense_replace``
+        # (dense/MoE placement now lives in per-layer ``mlp_layer_types``); the
+        # actual dense/sparse decision is made in DeepseekV4DecoderLayer
+        # ._is_layer_sparse. Default to 0 when the field is absent.
+        self.first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
