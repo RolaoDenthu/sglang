@@ -12,7 +12,6 @@
 
 #include <bit>
 #include <cstdint>
-#include <cuda_fp8.h>
 
 namespace {
 
