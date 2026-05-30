@@ -62,7 +62,7 @@ class SyntheticDualScope:
     dense_kv_extra: Optional[torch.Tensor]
 
 
-def _make_scope_pool(num_blocks: int, block_size: int, seed: int, device, dtype_scale_lo=124, dtype_scale_hi=131):
+def _make_scope_pool(num_blocks: int, block_size: int, seed: int, device, dtype_scale_lo=124, dtype_scale_hi=131, value_scale: float = 0.30):
     """Build a raw paged KV pool + the dense (pre-pack) dequantized float KV.
 
     Layout matches DeepSeekV4SingleKVPool / the Triton reference exactly:
@@ -73,7 +73,7 @@ def _make_scope_pool(num_blocks: int, block_size: int, seed: int, device, dtype_
     n_tok = num_blocks * block_size
 
     # nope: fp8 e4m3fn is the source of truth (no separate quantization step).
-    nope_fp8 = (torch.randn(n_tok, D_NOPE, generator=g) * 0.30).to(torch.float8_e4m3fn)
+    nope_fp8 = (torch.randn(n_tok, D_NOPE, generator=g) * value_scale).to(torch.float8_e4m3fn)
     nope_u8 = nope_fp8.view(torch.uint8)                       # [n_tok, 448]
 
     # ue8m0 scale bytes near 127 (exp2(byte-127) ~ O(1)).
@@ -82,7 +82,7 @@ def _make_scope_pool(num_blocks: int, block_size: int, seed: int, device, dtype_
     ).to(torch.uint8)                                          # [n_tok, 7]
 
     # rope: bf16 values stored as raw bytes.
-    rope_bf16 = (torch.randn(n_tok, D_ROPE, generator=g) * 0.30).to(torch.bfloat16)
+    rope_bf16 = (torch.randn(n_tok, D_ROPE, generator=g) * value_scale).to(torch.bfloat16)
     rope_u8 = rope_bf16.view(torch.uint8)                      # [n_tok, 128]
 
     # ----- dense (pre-pack) dequantized float KV, the independent oracle -----
@@ -156,15 +156,29 @@ def build_synthetic_dual_scope(
     with_topk_length: bool = True,
     seed: int = 0,
     device: str = "cpu",
+    value_scale: float = 0.30,
+    scale_lo: int = 124,
+    scale_hi: int = 131,
 ) -> SyntheticDualScope:
-    """Build tiny synthetic dual-scope inputs in the real pool layout/dtypes."""
+    """Build tiny synthetic dual-scope inputs in the real pool layout/dtypes.
+
+    ``value_scale`` scales q / nope / rope magnitudes (controls softmax sharpness:
+    larger -> peakier attention), and ``scale_lo/scale_hi`` set the ue8m0
+    per-tile exponent spread (wider -> larger per-tile dynamic range, which
+    stresses the fp8 dequant + online-softmax accumulation).  Sweeping these
+    makes the fidelity check representative of "all types of input" rather than a
+    single calm distribution.
+    """
     dev = torch.device(device)
     g = torch.Generator(device="cpu").manual_seed(seed + 100)
 
-    q = (torch.randn(T, 1, H, D_QK, generator=g) * 0.30).to(torch.bfloat16).to(dev)
+    q = (torch.randn(T, 1, H, D_QK, generator=g) * value_scale).to(torch.bfloat16).to(dev)
     softmax_scale = 1.0 / math.sqrt(D_QK)
 
-    swa_k_cache, dense_main = _make_scope_pool(num_blocks_main, block_size_main, seed + 1, dev)
+    swa_k_cache, dense_main = _make_scope_pool(
+        num_blocks_main, block_size_main, seed + 1, dev,
+        dtype_scale_lo=scale_lo, dtype_scale_hi=scale_hi, value_scale=value_scale,
+    )
     swa_idx, swa_len = _make_indices(
         T, topk_main, num_blocks_main * block_size_main, seed + 2, dev
     )
@@ -173,7 +187,8 @@ def build_synthetic_dual_scope(
 
     if with_extra:
         extra_k_cache, dense_extra = _make_scope_pool(
-            num_blocks_extra, block_size_extra, seed + 3, dev
+            num_blocks_extra, block_size_extra, seed + 3, dev,
+            dtype_scale_lo=scale_lo, dtype_scale_hi=scale_hi, value_scale=value_scale,
         )
         extra_idx, extra_len = _make_indices(
             T, topk_extra, num_blocks_extra * block_size_extra, seed + 4, dev
@@ -508,6 +523,87 @@ _LARGE_T_1024 = dict(
 )
 
 
+def run_fidelity_sweep() -> None:
+    """Representative kernel-vs-reference fidelity sweep over all input types.
+
+    For each production regime (C4 + C128/base) sweep value magnitude (softmax
+    sharpness) x ue8m0 per-tile scale spread (dynamic range) x seed, run the
+    FlyDSL kernel against the PyTorch reference, and print every case's
+    cosine / max_abs / max_rel sorted worst-first.  This pinpoints which input
+    regime (if any) is lossy enough to explain a GSM8K accuracy drop, rather
+    than relying on one calm synthetic distribution.
+    """
+    print("\n" + "=" * 78)
+    print("REPRESENTATIVE FIDELITY SWEEP (kernel vs reference, all input types)")
+    print("=" * 78)
+    if not torch.cuda.is_available() or not _flydsl_available():
+        print("  [SKIP] FlyDSL / gfx950 GPU not available")
+        return
+
+    regimes = {"C4": _C4_CASE, "C128": _C128_CASE}
+    # value_scale: 0.30 ~ near-uniform softmax, 1.0 moderate, 3.0 peaky attention.
+    value_scales = [0.30, 1.0, 3.0]
+    # ue8m0 exponent byte spread: narrow ~O(1) vs wide ~2^-9..2^10 dynamic range.
+    scale_spreads = [(124, 131), (118, 137)]
+    seeds = [0, 7]
+
+    rows = []
+    for rname, base in regimes.items():
+        for vs in value_scales:
+            for (lo, hi) in scale_spreads:
+                for sd in seeds:
+                    kw = dict(base)
+                    kw.update(value_scale=vs, scale_lo=lo, scale_hi=hi, seed=sd)
+                    s = build_synthetic_dual_scope(device="cuda", **kw)
+                    out = _flydsl_dual_scope_kernel_impl(
+                        q=s.q,
+                        swa_k_cache=s.swa_k_cache,
+                        swa_indices=s.swa_indices,
+                        swa_topk_length=s.swa_topk_length,
+                        extra_k_cache=s.extra_k_cache,
+                        extra_indices=s.extra_indices,
+                        extra_topk_length=s.extra_topk_length,
+                        compress_ratio=s.compress_ratio,
+                        softmax_scale=s.softmax_scale,
+                        attn_sink=s.attn_sink,
+                        head_dim_v=s.head_dim_v,
+                    )
+                    ref = _torch_reference_dual_scope(
+                        q=s.q,
+                        swa_k_cache=s.swa_k_cache,
+                        swa_indices=s.swa_indices,
+                        swa_topk_length=s.swa_topk_length,
+                        extra_k_cache=s.extra_k_cache,
+                        extra_indices=s.extra_indices,
+                        extra_topk_length=s.extra_topk_length,
+                        compress_ratio=s.compress_ratio,
+                        softmax_scale=s.softmax_scale,
+                        attn_sink=s.attn_sink,
+                        head_dim_v=s.head_dim_v,
+                    ).to(out.device)
+                    of = out.to(torch.float32)
+                    rf = ref.to(torch.float32)
+                    cos = _cosine(of, rf)
+                    max_abs = float((of - rf).abs().max())
+                    denom = rf.abs().clamp_min(1e-4)
+                    max_rel = float(((of - rf).abs() / denom).max())
+                    rows.append((cos, max_abs, max_rel, rname, vs, (lo, hi), sd))
+
+    rows.sort(key=lambda r: r[0])  # worst cosine first
+    print(f"\n{'regime':<6} {'vscale':>7} {'spread':>11} {'seed':>5} "
+          f"{'cosine':>10} {'max_abs':>11} {'max_rel':>11}")
+    print("-" * 72)
+    for cos, max_abs, max_rel, rname, vs, spread, sd in rows:
+        flag = "  <-- LOSSY" if cos < 0.999 else ""
+        print(f"{rname:<6} {vs:>7.2f} {str(spread):>11} {sd:>5} "
+              f"{cos:>10.6f} {max_abs:>11.3e} {max_rel:>11.3e}{flag}")
+    worst = rows[0]
+    print(f"\nWORST cosine = {worst[0]:.6f}  (regime={worst[3]}, value_scale={worst[4]}, "
+          f"scale_spread={worst[5]}, seed={worst[6]})")
+    print("If cosine ~1.0 across ALL rows the kernel is faithful on synthetic inputs, "
+          "and the GSM8K drop points to real-data distribution rather than kernel math.")
+
+
 def main() -> None:
     torch.manual_seed(0)
     run_case("dual scope (SWA + C4 extra), sink + topk_length", compress_ratio=4)
@@ -551,6 +647,9 @@ def main() -> None:
         ref_subset=256,
         **_LARGE_T_1024,
     )
+
+    # Representative fidelity sweep across input distributions for both regimes.
+    run_fidelity_sweep()
 
 
 if __name__ == "__main__":
