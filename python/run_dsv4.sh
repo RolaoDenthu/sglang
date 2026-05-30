@@ -33,6 +33,7 @@ sglang serve \
     --tp 8 \
     --disable-radix-cache \
     --attention-backend compressed \
+    --disable-cuda-graph \
     --max-running-request 256 \
     --page-size 256 \
     --mem-fraction-static 0.90 \
