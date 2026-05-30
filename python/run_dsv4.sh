@@ -32,7 +32,7 @@ sglang serve \
     --trust-remote-code \
     --tp 8 \
     --disable-radix-cache \
-    --attention-backend dsv4 \
+    --attention-backend triton \
     --max-running-request 256 \
     --page-size 256 \
     --mem-fraction-static 0.90 \
