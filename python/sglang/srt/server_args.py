@@ -145,6 +145,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "nsa",
     "compressed",
+    "dsv4",  # Accepted alias for "compressed" (canonical name on this branch)
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -1068,6 +1069,18 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+        # Attention-backend alias: accept "dsv4" (canonical upstream name) and
+        # map it to this branch's canonical "compressed" so all internal
+        # compressed-path logic keeps working.
+        for attr in (
+            "attention_backend",
+            "decode_attention_backend",
+            "prefill_attention_backend",
+            "speculative_draft_attention_backend",
+        ):
+            if getattr(self, attr, None) == "dsv4":
+                setattr(self, attr, "compressed")
 
         if self.enable_nan_detection:
             logger.warning(
