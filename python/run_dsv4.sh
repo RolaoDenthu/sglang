@@ -31,7 +31,7 @@ sglang serve \
     --tp 8 \
     --disable-radix-cache \
     --attention-backend dsv4 \
-    --cuda-graph-max-bs 128 \
+    --cuda-graph-max-bs 32 \
     --max-running-request 256 \
     --page-size 256 \
     --mem-fraction-static 0.85 \
