@@ -101,16 +101,24 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ]
 }
 
-# DeepSeek V3.2 reuses the V3 config schema. Subclass the upstream transformers
-# class with the V3.2 model_type so AutoConfig.register passes its consistency
-# check (which requires class.model_type == registered key).
+# DeepSeek V3.2 / V4 reuse the V3 config schema. Subclass the upstream
+# transformers class with each model_type so AutoConfig.register passes its
+# consistency check (which requires class.model_type == registered key).
+# This makes AutoConfig use the V3-schema config (flat rope_scaling +
+# compress_ratios list) instead of transformers>=5.8's built-in
+# DeepseekV4Config (nested rope_parameters + compress_rates dict), which the
+# rest of the DeepSeek-V4 code path does not understand.
 try:
     from transformers import DeepseekV3Config as _HFDeepseekV3Config
 
     class _DeepseekV32ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v32"
 
+    class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
+        model_type = "deepseek_v4"
+
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
+    _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
 except ImportError:
     pass
 
