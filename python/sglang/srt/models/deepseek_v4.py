@@ -61,6 +61,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.utils.hf_transformers import get_rope_config
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.compress_state import (
@@ -1578,7 +1579,9 @@ class MQALayer(nn.Module):
         assert config.num_key_value_heads == 1
 
         # need a indexer for compress ratio = 4
-        rope_scaling = config.rope_scaling
+        # transformers v5: config.rope_scaling can return a nested/unhashable
+        # structure; get_rope_config normalizes to the flat rope_parameters dict.
+        _, rope_scaling = get_rope_config(config)
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
@@ -1633,7 +1636,7 @@ class MQALayer(nn.Module):
         else:
             original_seq_len = rope_scaling["original_max_position_embeddings"]
 
-        rope_scaling = config.rope_scaling
+        _, rope_scaling = get_rope_config(config)
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
             seqlen=config.max_position_embeddings,
