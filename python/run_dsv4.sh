@@ -33,7 +33,7 @@ sglang serve \
     --attention-backend dsv4 \
     --max-running-request 256 \
     --page-size 256 \
-    --mem-fraction-static 0.90 \
+    --mem-fraction-static 0.85 \
     --swa-full-tokens-ratio 0.1 \
     --chunked-prefill-size 8192 \
     --port 8000 \
