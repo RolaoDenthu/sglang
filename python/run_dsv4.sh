@@ -16,6 +16,9 @@ export SGLANG_OPT_USE_TILELANG_MHC_PRE=false
 export SGLANG_OPT_USE_TILELANG_MHC_POST=false
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 export SGLANG_OPT_USE_FUSED_COMPRESS_TRITON=true
+# branch-local equivalent of SGLANG_OPT_USE_FUSED_COMPRESS_TRITON: makes the
+# radix backend build real FusedCompressMetadata to match the model's fused path
+export SGLANG_OPT_USE_FUSED_PAGED_COMPRESS=true
 export SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false
 export SGLANG_ROCM_USE_MULTI_STREAM=false
 export AITER_BF16_FP8_MOE_BOUND=0
