@@ -22,7 +22,7 @@ export SGLANG_ROCM_USE_MULTI_STREAM=false
 
 export AITER_BF16_FP8_MOE_BOUND=0
 
-export SGLANG_FLYDSL_PREFILL=0
+export SGLANG_FLYDSL_PREFILL=1
 
 # --dp 8 --enable-dp-attention --enable-prefill-delayer \
 # --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-num-draft-tokens 4 --speculative-eagle-topk 1
