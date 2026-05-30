@@ -1,7 +1,5 @@
 export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
 
-export SGLANG_DEFAULT_THINKING=1
-export SGLANG_DSV4_REASONING_EFFORT=max
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=false
 export SGLANG_USE_AITER=1
 export SGLANG_USE_ROCM700A=1
@@ -9,15 +7,11 @@ export SGLANG_OPT_USE_FUSED_COMPRESS=true
 export SGLANG_HACK_FLASHMLA_BACKEND=triton
 export SGLANG_OPT_FP8_WO_A_GEMM=false
 export SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
-export SGLANG_OPT_USE_TOPK_V2=false
-export SGLANG_OPT_USE_AITER_INDEXER=true
 export SGLANG_OPT_USE_TILELANG_INDEXER=false
 export SGLANG_OPT_USE_TILELANG_MHC_PRE=false
 export SGLANG_OPT_USE_TILELANG_MHC_POST=false
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
-export SGLANG_OPT_USE_FUSED_COMPRESS_TRITON=true
-# branch-local equivalent of SGLANG_OPT_USE_FUSED_COMPRESS_TRITON: makes the
-# radix backend build real FusedCompressMetadata to match the model's fused path
+# makes the radix backend build real FusedCompressMetadata to match the model's fused path
 export SGLANG_OPT_USE_FUSED_PAGED_COMPRESS=true
 export SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false
 export SGLANG_ROCM_USE_MULTI_STREAM=false
