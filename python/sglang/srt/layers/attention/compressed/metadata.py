@@ -167,6 +167,10 @@ class PagedIndexerMetadata(IndexerMetadata):
     def max_seq_len(self) -> int:
         return self.page_table.shape[1] * self.page_size
 
+    @property
+    def max_c4_seq_len(self) -> int:
+        return self.page_table.shape[1] * self.c4_page_size
+
     def copy_(self, other: "PagedIndexerMetadata"):
         if is_hip():
             copy_metadata(
