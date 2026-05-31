@@ -460,9 +460,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             seq_lens=seq_lens,
         )
 
-        if not envs.SGLANG_OPT_USE_FUSED_PAGED_COMPRESS.get():
-            create = _create_dummy_paged_compress_data
-
         return DSV4MetadataRadix(
             core_attn_metadata,
             indexer_metadata,
@@ -504,7 +501,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             if need_compress
             else None
         )
-        if not (envs.SGLANG_OPT_USE_FUSED_PAGED_COMPRESS.get() and need_compress):
+        if not need_compress:
             create = _create_dummy_paged_compress_data
         else:
             create = functools.partial(
