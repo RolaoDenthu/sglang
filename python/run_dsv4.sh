@@ -7,7 +7,11 @@ export SGLANG_OPT_USE_FUSED_COMPRESS=true
 export SGLANG_HACK_FLASHMLA_BACKEND=triton
 export SGLANG_OPT_FP8_WO_A_GEMM=false
 export SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
-export SGLANG_OPT_USE_TILELANG_INDEXER=false
+# Route c4 indexer logits through the tilelang paged kernel. The alternative on
+# ROCm is fp8_paged_mqa_logits_torch (SGLANG_FP8_PAGED_MQA_LOGITS_TORCH), which
+# materializes a dense (bs x full_capture_seq x heads) fp32 tensor and OOMs
+# (~16 GiB) when capturing large-bs CUDA graphs. tilelang is fused/paged -> low mem.
+export SGLANG_OPT_USE_TILELANG_INDEXER=true
 export SGLANG_OPT_USE_TILELANG_MHC_PRE=false
 export SGLANG_OPT_USE_TILELANG_MHC_POST=false
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
@@ -25,7 +29,7 @@ sglang serve \
     --tp 8 \
     --disable-radix-cache \
     --attention-backend dsv4 \
-    --cuda-graph-max-bs 32 \
+    --cuda-graph-max-bs 256 \
     --max-running-request 256 \
     --page-size 256 \
     --mem-fraction-static 0.85 \
