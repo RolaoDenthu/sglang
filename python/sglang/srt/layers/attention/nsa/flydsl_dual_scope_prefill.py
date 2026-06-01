@@ -46,9 +46,26 @@ Dequant (per gathered key token):
 
 import functools
 import math
+import os
+import time
 from typing import Optional, Tuple
 
 import torch
+
+# ----------------------------------------------------------------------------
+# Diagnostic timing.  Gated on SGLANG_FLYDSL_TIMING=1 -- when enabled, every
+# prefill call appends a per-call attribution line to
+# SGLANG_FLYDSL_TIMING_FILE (default /tmp/flydsl_timing.log):
+#   host-prep GPU time (allocs/pads/copies) | JIT build/recompile (host, MLIR)
+#   | pure kernel exec | post (out slice/contiguous).  This is the definitive
+# way to split a TTFT regression into "host overhead" vs "kernel recompiles"
+# vs "kernel is genuinely slow", given rocprofv3 corrupts CUDA-graph dispatch
+# and torch-profiler traces get truncated on server kill.
+# ----------------------------------------------------------------------------
+_FLYDSL_TIMING: bool = os.environ.get("SGLANG_FLYDSL_TIMING", "0") == "1"
+_FLYDSL_TIMING_FILE: str = os.environ.get(
+    "SGLANG_FLYDSL_TIMING_FILE", "/tmp/flydsl_timing.log"
+)
 
 # ----------------------------------------------------------------------------
 # FlyDSL is a remote-container (gfx950) dependency.  Import its API surface at
@@ -2001,6 +2018,15 @@ def _flydsl_dual_scope_kernel_impl(
     Q / attn_sink are padded to a multiple of BLOCK_H heads; the extra padding
     heads are sliced off (``[:, :H]``) before returning.
     """
+    if _FLYDSL_TIMING:
+        torch.cuda.synchronize()
+        _ev_start = torch.cuda.Event(enable_timing=True)
+        _ev_prep = torch.cuda.Event(enable_timing=True)
+        _ev_k0 = torch.cuda.Event(enable_timing=True)
+        _ev_k1 = torch.cuda.Event(enable_timing=True)
+        _ev_end = torch.cuda.Event(enable_timing=True)
+        _ev_start.record()
+
     q3 = _normalize_q(q)                         # [T, H, D_QK]
     device = q3.device
     T_tok, H, _ = q3.shape
@@ -2111,6 +2137,16 @@ def _flydsl_dual_scope_kernel_impl(
         has_topk_length_main=swa_topk_length is not None,
         has_topk_length_extra=(has_extra and extra_topk_length is not None),
     )
+    if _FLYDSL_TIMING:
+        _ev_prep.record()
+        _builder = (
+            _build_dual_scope_kernel_c4 if use_c4
+            else _build_dual_scope_kernel_c128 if use_c128
+            else _build_dual_scope_kernel
+        )
+        _misses_before = _builder.cache_info().misses
+        _t_build0 = time.perf_counter()
+
     if use_c4:
         kernel = _build_dual_scope_kernel_c4(**_build_kw)
     elif use_c128:
@@ -2121,14 +2157,40 @@ def _flydsl_dual_scope_kernel_impl(
     else:
         kernel = _build_dual_scope_kernel(**_build_kw)
 
+    if _FLYDSL_TIMING:
+        _build_ms = (time.perf_counter() - _t_build0) * 1e3
+        _was_miss = _builder.cache_info().misses > _misses_before
+
     stream = torch.cuda.current_stream()
+    if _FLYDSL_TIMING:
+        _ev_k0.record()
     kernel(
         q_pad, swa_u8, swa_idx, topklen_main,
         extra_u8, extra_idx, topklen_extra,
         sink, out, total_tokens=int(T_tok),
         stream=fx.Stream(stream.cuda_stream),
     )
-    return out[:, :H].contiguous()
+    if _FLYDSL_TIMING:
+        _ev_k1.record()
+    result = out[:, :H].contiguous()
+    if _FLYDSL_TIMING:
+        _ev_end.record()
+        torch.cuda.synchronize()
+        _prep_ms = _ev_start.elapsed_time(_ev_prep)
+        _kern_ms = _ev_k0.elapsed_time(_ev_k1)
+        _post_ms = _ev_k1.elapsed_time(_ev_end)
+        try:
+            with open(_FLYDSL_TIMING_FILE, "a") as _f:
+                _f.write(
+                    f"[FLYDSL] ratio={ratio} T={T_tok} H={H} h_pad={h_q_pad} "
+                    f"bh={block_h} bn={block_n} tk_main={topk_main} "
+                    f"tk_extra={topk_extra} build_miss={int(_was_miss)} "
+                    f"prep_ms={_prep_ms:.3f} build_ms={_build_ms:.3f} "
+                    f"kernel_ms={_kern_ms:.3f} post_ms={_post_ms:.3f}\n"
+                )
+        except Exception:
+            pass
+    return result
 
 
 # ============================================================================
