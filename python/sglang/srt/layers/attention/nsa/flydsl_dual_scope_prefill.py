@@ -122,6 +122,7 @@ BYTES_PER_TOKEN_SCALE: int = 8                       # 7 ue8m0 + 1 pad
 
 _LOG2E: float = 1.4426950408889634
 
+
 # Internal flag: when True (the production default) the public entry routes
 # prefill through the live FlyDSL dual-scope kernel
 # (_flydsl_dual_scope_kernel_impl). When False the public entry uses the
@@ -185,14 +186,20 @@ _C128_PLAN = _c128_plan()
 # (MI350X) group-segment budget, so only 1 CTA co-resides per CU: the
 # rocdl.waves_per_eu desired==2 hint resolves to final==1 (occupancy 1).
 #
-# Halving BLOCK_N (64 -> 32) halves the LDS to 48KB (KV 32KB + P 16KB), which
-# lets 2-3 CTAs co-reside per CU (occupancy 2-3), and also halves N_BLKS_S
-# (4 -> 2) / K_STEPS_PV (2 -> 1) so it relieves VGPR pressure too.  It keeps
-# 1 CTA/token, so the gather+dequant-once-for-all-128-heads savings that
-# motivate the C4 variant are preserved (just ~2x more 32-key KV tiles).
-# We realize this through the byte-identical PARAMETERIZED builder
-# (_build_dual_scope_kernel_c128), which reproduces the fixed C4 tiling exactly
-# at (block_h=128, block_n=64, n_waves=4) and supports block_n==32.
+# Halving BLOCK_N (64 -> 32) halves the LDS to 48KB and lifts per-CU occupancy
+# from 1 to 2-3 -- but it ran SLOWER end-to-end: rocprof showed the kernel is
+# stall/VGPR-spill bound (PV f32 O-accumulator -> VGPR256 + spill, ~74% cycles
+# stalled, MfmaUtil ~5%), NOT LDS-occupancy bound, so more co-resident CTAs did
+# not help and the extra KV tiles/barriers cost more.  The bn32 route is
+# therefore REVERTED (default _c4_plan() -> None -> legacy fixed BLOCK_N=64).
+# Profiling the BLOCK_N=64 baseline (rocprofv3 counters) shows it is NOT
+# MFMA-bound (MfmaUtil ~6%) and NOT VMEM-bound (MemUnitStalled ~0%): a native
+# fp8 QK/PV MFMA path was prototyped and then removed because halving matmul
+# cost can recover at most a few % of wall time.  The dominant costs are LDS
+# bank conflicts (~39%) and barrier/latency stalls at occupancy 1, so the real
+# levers are LDS layout (bank-conflict removal) and occupancy.  The
+# parameterized builder (_build_dual_scope_kernel_c128) and the _C4_* knobs
+# below remain available for A/B via SGLANG_C4_TILING but are no longer default.
 _C4_BLOCK_H: int = 128
 _C4_BLOCK_N: int = 32
 _C4_N_WAVES: int = 4
@@ -204,12 +211,16 @@ def _c4_plan():
     waves_per_eu)`` to route through the parameterized C128-style builder, or
     ``None`` to use the LEGACY fixed ``_build_dual_scope_kernel_c4`` (BLOCK_N=64).
 
-    The tuned DEFAULT is ``(128, 32, 4, 2)`` -- the LDS-halved, occupancy-2 path.
-    Overridable for A/B and autotuning via env ``SGLANG_C4_TILING``:
-        * "legacy"          -> the fixed BLOCK_N=64 C4 kernel (occupancy 1)
+    The DEFAULT is ``None`` -- the LEGACY fixed BLOCK_N=64 C4 kernel.  The
+    BLOCK_N=32 occupancy-2 experiment was reverted: halving BLOCK_N doubled
+    per-CU occupancy but ran SLOWER end-to-end (the kernel is stall/VGPR-spill
+    bound, not LDS-occupancy bound), so BLOCK_N=64 is the baseline the fp8-MFMA
+    work builds on.  Still overridable for A/B and autotuning via env
+    ``SGLANG_C4_TILING``:
+        * "legacy"          -> the fixed BLOCK_N=64 C4 kernel (default)
         * "BH,BN,NW"        -> parameterized C4 with that tiling (waves_per_eu=2)
         * "BH,BN,NW,WPE"    -> parameterized C4 with explicit waves_per_eu
-        * unset/invalid     -> the tuned default (128, 32, 4, 2)
+        * unset/invalid     -> the legacy fixed BLOCK_N=64 C4 kernel
     Parsed once at import (a server restart re-reads it).
     """
     import os as _os
@@ -226,7 +237,7 @@ def _c4_plan():
                 return (bh, bn, nw, wpe)
             except ValueError:
                 pass
-    return (_C4_BLOCK_H, _C4_BLOCK_N, _C4_N_WAVES, _C4_WAVES_PER_EU)
+    return None
 
 
 _C4_PLAN = _c4_plan()
@@ -1059,11 +1070,21 @@ def _build_dual_scope_kernel_c4(
     BIG = 1.0e30
 
     # ---- LDS layout -------------------------------------------------------
-    LDS_KV_BF16 = block_n * head_dim                 # 32768 bf16 (64KB)
-    LDS_KV_BYTES = LDS_KV_BF16 * 2                    # 65536
-    LDS_P_F32 = BLOCK_H * block_n                     # 8192 f32 (32KB)
-    LDS_P_BYTES = LDS_P_F32 * 4                        # 32768
-    LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES            # 98304 (< 160KB)
+    # Per-row padding breaks the multiple-of-32-banks stride that otherwise
+    # collapses every key (resp. head-row) onto the same LDS banks.  lds_kv is
+    # accessed as [key][dim] with 16-byte (8 bf16) vectors; head_dim=512 is 256
+    # words == 0 (mod 32 banks), so all 16 MFMA keys land on the same banks (a
+    # 16-32-way conflict on the QK read, PV read and gather store).  +8 bf16
+    # (520/key, 260 words, 4 mod 32) aligns the 16-byte vectors to bank groups
+    # -> ~2-way, the 16-lane x 4-bank floor.  Likewise lds_p [head_row][key]
+    # stride block_n=64 == 0 (mod 32) makes the PV P-read 16-way; +8 f32 -> 72.
+    KV_LDS_STRIDE = head_dim + 8                      # 520 bf16 per key
+    P_LDS_STRIDE = block_n + 8                         # 72 f32 per head-row
+    LDS_KV_BF16 = block_n * KV_LDS_STRIDE             # 33280 bf16
+    LDS_KV_BYTES = LDS_KV_BF16 * 2                    # 66560
+    LDS_P_F32 = BLOCK_H * P_LDS_STRIDE                # 9216 f32
+    LDS_P_BYTES = LDS_P_F32 * 4                        # 36864
+    LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES            # 103424 (< 160KB)
 
     alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name="dual_scope_c4_smem")
     base_off = alloc._align(alloc.ptr, 16)
@@ -1239,7 +1260,7 @@ def _build_dual_scope_kernel_c4(
                     fv = _fmul(fp8_to_f32(extract_byte_i32(raw_i64, j)), scale_f)
                     bvals.append(to_bf16(fv))
                 Vec.from_elements(bvals, fx.BFloat16).store(
-                    lds_kv, [kv_row * fx.Index(head_dim) + abs_dim]
+                    lds_kv, [kv_row * fx.Index(KV_LDS_STRIDE) + abs_dim]
                 )
 
             # phase B: rope quarter (32 raw bytes -> 16 bf16 LE) -> bf16
@@ -1251,7 +1272,7 @@ def _build_dual_scope_kernel_c4(
                             + (rope_idx + fx.Index(j)) * fx.Index(2))
                     bvals.append(load_bf16_byte(pool_ptr, boff))
                 Vec.from_elements(bvals, fx.BFloat16).store(
-                    lds_kv, [kv_row * fx.Index(head_dim) + fx.Index(D_NOPE) + rope_idx]
+                    lds_kv, [kv_row * fx.Index(KV_LDS_STRIDE) + fx.Index(D_NOPE) + rope_idx]
                 )
 
             gpu.barrier()
@@ -1281,7 +1302,7 @@ def _build_dual_scope_kernel_c4(
                     q_a = q_packs[m_sub][ks]
                     for nb in range_constexpr(N_BLKS_S):
                         key = fx.Index(nb * MFMA_N) + lane
-                        koff = (key * fx.Index(head_dim)
+                        koff = (key * fx.Index(KV_LDS_STRIDE)
                                 + fx.Index(ks * MFMA_K) + k_group * fx.Index(8))
                         k_b = Vec.load(vec8bf16_ty, lds_kv, [koff])
                         s_acc[nb] = mfma_bf16(s_acc[nb], q_a, k_b)
@@ -1343,12 +1364,12 @@ def _build_dual_scope_kernel_c4(
                         p_row = hb + k_group * fx.Index(4) + fx.Index(r)
                         p_col = fx.Index(nb * MFMA_N) + lane
                         _memref.store(_raw(p_vals[nb][r]), lds_p,
-                                      [_raw(p_row * fx.Index(block_n) + p_col)])
+                                      [_raw(p_row * fx.Index(P_LDS_STRIDE) + p_col)])
                 gpu.barrier()
 
                 # === PV GEMM : O += P @ V (bf16 MFMA), K=block_n=2x32 ======
                 for ks_pv in range_constexpr(K_STEPS_PV):
-                    p_base = ((hb + lane) * fx.Index(block_n)
+                    p_base = ((hb + lane) * fx.Index(P_LDS_STRIDE)
                               + fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8))
                     p_a = Vec.from_elements(
                         [to_bf16(_memref.load(lds_p, [_raw(p_base + fx.Index(j))]))
@@ -1359,7 +1380,7 @@ def _build_dual_scope_kernel_c4(
                         vvals = []
                         for j in range_constexpr(8):
                             key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
-                            voff = key * fx.Index(head_dim) + fx.Index(d * MFMA_N) + lane
+                            voff = key * fx.Index(KV_LDS_STRIDE) + fx.Index(d * MFMA_N) + lane
                             vvals.append(_memref.load(lds_kv, [_raw(voff)]))
                         v_b = Vec.from_elements(vvals, fx.BFloat16)
                         new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
@@ -1620,9 +1641,14 @@ def _build_dual_scope_kernel_c128(
     BIG = 1.0e30
 
     # ---- LDS layout (KV block_n*512 bf16 + P block_h*block_n f32; < 160KB) -
-    LDS_KV_BF16 = block_n * head_dim
+    # +8-element per-row padding breaks the multiple-of-32-banks stride (see the
+    # C4 kernel) so the 16-byte lds_kv vectors and the lds_p P-read spread across
+    # LDS bank groups instead of colliding on a single bank.
+    KV_LDS_STRIDE = head_dim + 8
+    P_LDS_STRIDE = block_n + 8
+    LDS_KV_BF16 = block_n * KV_LDS_STRIDE
     LDS_KV_BYTES = LDS_KV_BF16 * 2
-    LDS_P_F32 = BLOCK_H * block_n
+    LDS_P_F32 = BLOCK_H * P_LDS_STRIDE
     LDS_P_BYTES = LDS_P_F32 * 4
     LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES
     assert LDS_TOTAL <= 160 * 1024, f"LDS {LDS_TOTAL} exceeds 160KB budget"
@@ -1811,7 +1837,7 @@ def _build_dual_scope_kernel_c128(
                     fv = _fmul(fp8_to_f32(extract_byte_i32(raw_i64, j)), scale_f)
                     bvals.append(to_bf16(fv))
                 Vec.from_elements(bvals, fx.BFloat16).store(
-                    lds_kv, [kv_row * fx.Index(head_dim) + abs_dim]
+                    lds_kv, [kv_row * fx.Index(KV_LDS_STRIDE) + abs_dim]
                 )
 
             # phase B: rope partition (ROPE_PART*2 raw bytes -> ROPE_PART bf16 LE)
@@ -1823,7 +1849,7 @@ def _build_dual_scope_kernel_c128(
                             + (rope_idx + fx.Index(j)) * fx.Index(2))
                     bvals.append(load_bf16_byte(pool_ptr, boff))
                 Vec.from_elements(bvals, fx.BFloat16).store(
-                    lds_kv, [kv_row * fx.Index(head_dim) + fx.Index(D_NOPE) + rope_idx]
+                    lds_kv, [kv_row * fx.Index(KV_LDS_STRIDE) + fx.Index(D_NOPE) + rope_idx]
                 )
 
             gpu.barrier()
@@ -1853,7 +1879,7 @@ def _build_dual_scope_kernel_c128(
                     q_a = q_packs[m_sub][ks]
                     for nb in range_constexpr(N_BLKS_S):
                         key = fx.Index(nb * MFMA_N) + lane
-                        koff = (key * fx.Index(head_dim)
+                        koff = (key * fx.Index(KV_LDS_STRIDE)
                                 + fx.Index(ks * MFMA_K) + k_group * fx.Index(8))
                         k_b = Vec.load(vec8bf16_ty, lds_kv, [koff])
                         s_acc[nb] = mfma_bf16(s_acc[nb], q_a, k_b)
@@ -1915,12 +1941,12 @@ def _build_dual_scope_kernel_c128(
                         p_row = hb + k_group * fx.Index(4) + fx.Index(r)
                         p_col = fx.Index(nb * MFMA_N) + lane
                         _memref.store(_raw(p_vals[nb][r]), lds_p,
-                                      [_raw(p_row * fx.Index(block_n) + p_col)])
+                                      [_raw(p_row * fx.Index(P_LDS_STRIDE) + p_col)])
                 gpu.barrier()
 
                 # === PV GEMM : O += P @ V (bf16 MFMA), K=block_n=2x32 ======
                 for ks_pv in range_constexpr(K_STEPS_PV):
-                    p_base = ((hb + lane) * fx.Index(block_n)
+                    p_base = ((hb + lane) * fx.Index(P_LDS_STRIDE)
                               + fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8))
                     p_a = Vec.from_elements(
                         [to_bf16(_memref.load(lds_p, [_raw(p_base + fx.Index(j))]))
@@ -1931,7 +1957,7 @@ def _build_dual_scope_kernel_c128(
                         vvals = []
                         for j in range_constexpr(8):
                             key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
-                            voff = key * fx.Index(head_dim) + fx.Index(d * MFMA_N) + lane
+                            voff = key * fx.Index(KV_LDS_STRIDE) + fx.Index(d * MFMA_N) + lane
                             vvals.append(_memref.load(lds_kv, [_raw(voff)]))
                         v_b = Vec.from_elements(vvals, fx.BFloat16)
                         new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
