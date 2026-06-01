@@ -177,6 +177,60 @@ def _c128_plan():
 
 _C128_PLAN = _c128_plan()
 
+# C4 / high-topk routing: the C4 regime (compress_ratio==4, the dominant
+# high-topk prefill: topk_main=128 + topk_extra=512, bs_main=256, bs_extra=64,
+# H=128, head_dim=512) used to launch the FIXED _build_dual_scope_kernel_c4 at
+# BLOCK_N=64 / BLOCK_H=128 / 4 waves -- 1 CTA/token staging a 96KB LDS tile
+# (KV 64KB bf16 + P 32KB f32).  Two 96KB CTAs (192KB) exceed the 160KB gfx950
+# (MI350X) group-segment budget, so only 1 CTA co-resides per CU: the
+# rocdl.waves_per_eu desired==2 hint resolves to final==1 (occupancy 1).
+#
+# Halving BLOCK_N (64 -> 32) halves the LDS to 48KB (KV 32KB + P 16KB), which
+# lets 2-3 CTAs co-reside per CU (occupancy 2-3), and also halves N_BLKS_S
+# (4 -> 2) / K_STEPS_PV (2 -> 1) so it relieves VGPR pressure too.  It keeps
+# 1 CTA/token, so the gather+dequant-once-for-all-128-heads savings that
+# motivate the C4 variant are preserved (just ~2x more 32-key KV tiles).
+# We realize this through the byte-identical PARAMETERIZED builder
+# (_build_dual_scope_kernel_c128), which reproduces the fixed C4 tiling exactly
+# at (block_h=128, block_n=64, n_waves=4) and supports block_n==32.
+_C4_BLOCK_H: int = 128
+_C4_BLOCK_N: int = 32
+_C4_N_WAVES: int = 4
+_C4_WAVES_PER_EU: int = 2
+
+
+def _c4_plan():
+    """C4 tiling plan for compress_ratio==4: ``(block_h, block_n, n_waves,
+    waves_per_eu)`` to route through the parameterized C128-style builder, or
+    ``None`` to use the LEGACY fixed ``_build_dual_scope_kernel_c4`` (BLOCK_N=64).
+
+    The tuned DEFAULT is ``(128, 32, 4, 2)`` -- the LDS-halved, occupancy-2 path.
+    Overridable for A/B and autotuning via env ``SGLANG_C4_TILING``:
+        * "legacy"          -> the fixed BLOCK_N=64 C4 kernel (occupancy 1)
+        * "BH,BN,NW"        -> parameterized C4 with that tiling (waves_per_eu=2)
+        * "BH,BN,NW,WPE"    -> parameterized C4 with explicit waves_per_eu
+        * unset/invalid     -> the tuned default (128, 32, 4, 2)
+    Parsed once at import (a server restart re-reads it).
+    """
+    import os as _os
+
+    raw = _os.environ.get("SGLANG_C4_TILING", "").strip().lower()
+    if raw == "legacy":
+        return None
+    if raw:
+        parts = raw.split(",")
+        if len(parts) in (3, 4):
+            try:
+                bh, bn, nw = int(parts[0]), int(parts[1]), int(parts[2])
+                wpe = int(parts[3]) if len(parts) == 4 else _C4_WAVES_PER_EU
+                return (bh, bn, nw, wpe)
+            except ValueError:
+                pass
+    return (_C4_BLOCK_H, _C4_BLOCK_N, _C4_N_WAVES, _C4_WAVES_PER_EU)
+
+
+_C4_PLAN = _c4_plan()
+
 
 # ============================================================================
 # Shape / dtype normalization helpers
@@ -2046,10 +2100,17 @@ def _flydsl_dual_scope_kernel_impl(
     # exactly like real padding); h_q is padded to a multiple of block_h.
     ratio = int(compress_ratio)
     use_c4 = ratio == 4
+    # C4 routing: _C4_PLAN is (block_h, block_n, n_waves, waves_per_eu) for the
+    # parameterized BLOCK_N=32 occupancy-2 path, or None (legacy fixed BLOCK_N=64
+    # _build_dual_scope_kernel_c4).
+    c4_plan = _C4_PLAN if use_c4 else None
+    use_c4_param = use_c4 and c4_plan is not None  # None -> legacy fixed C4
     c128_plan = _C128_PLAN if ratio == 128 else None
     use_c128 = ratio == 128 and c128_plan is not None  # None -> route to base
     use_specialized = use_c4 or use_c128
-    if use_c4:
+    if use_c4_param:
+        block_h, block_n = c4_plan[0], c4_plan[1]
+    elif use_c4:
         block_h, block_n = 128, 64
     elif use_c128:
         block_h, block_n = c128_plan[0], c128_plan[1]
@@ -2140,14 +2201,23 @@ def _flydsl_dual_scope_kernel_impl(
     if _FLYDSL_TIMING:
         _ev_prep.record()
         _builder = (
-            _build_dual_scope_kernel_c4 if use_c4
+            _build_dual_scope_kernel_c128 if use_c4_param
+            else _build_dual_scope_kernel_c4 if use_c4
             else _build_dual_scope_kernel_c128 if use_c128
             else _build_dual_scope_kernel
         )
         _misses_before = _builder.cache_info().misses
         _t_build0 = time.perf_counter()
 
-    if use_c4:
+    if use_c4_param:
+        # Parameterized BLOCK_N=32 occupancy-2 C4 path (byte-identical math to
+        # the fixed C4 kernel at the default tiling; halved LDS lifts the
+        # per-CU occupancy from 1 to 2-3).
+        kernel = _build_dual_scope_kernel_c128(
+            block_h=c4_plan[0], block_n=c4_plan[1],
+            n_waves=c4_plan[2], waves_per_eu=c4_plan[3], **_build_kw,
+        )
+    elif use_c4:
         kernel = _build_dual_scope_kernel_c4(**_build_kw)
     elif use_c128:
         kernel = _build_dual_scope_kernel_c128(
