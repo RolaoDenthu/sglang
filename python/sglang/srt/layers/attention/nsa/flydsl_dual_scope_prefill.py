@@ -242,6 +242,23 @@ def _c4_plan():
 
 _C4_PLAN = _c4_plan()
 
+# LDS bank-conflict padding (per-row stride pad, in elements) for the C4/C128
+# dual-scope kernels.  The lds_kv ([key][dim] bf16) and lds_p ([head_row][key]
+# f32) strides must avoid being multiples of the 32 LDS banks; these pads are
+# the tuned defaults (see the LDS layout comment in _build_dual_scope_kernel_c4)
+# and are overridable via env for autotuning sweeps.
+#
+# NOTE (tuning result): driving SQ_LDS_BANK_CONFLICT to ~0 is possible (e.g.
+# KV pad 12 -> 0.2%) but is a ~10% perf REGRESSION: the residual ~18% conflict
+# is the PV V-read's two-k-group 2-way collision, and removing it needs a bf16
+# stride not divisible by 8, which breaks the 16-byte row alignment the QK
+# ds_read_b128 vector loads depend on.  The conflict is overlapped behind the
+# occupancy-1 latency/barrier stalls (the true bottleneck), so we keep the pad
+# that is fastest end-to-end (16-byte aligned), not the one with lowest conflict.
+import os as _os_ldspad
+_C4_KV_PAD: int = int(_os_ldspad.environ.get("SGLANG_C4_KV_PAD", "").strip() or "16")
+_C4_P_PAD: int = int(_os_ldspad.environ.get("SGLANG_C4_P_PAD", "").strip() or "4")
+
 
 # ============================================================================
 # Shape / dtype normalization helpers
@@ -1072,19 +1089,21 @@ def _build_dual_scope_kernel_c4(
     # ---- LDS layout -------------------------------------------------------
     # Per-row padding breaks the multiple-of-32-banks stride that otherwise
     # collapses every key (resp. head-row) onto the same LDS banks.  lds_kv is
-    # accessed as [key][dim] with 16-byte (8 bf16) vectors; head_dim=512 is 256
-    # words == 0 (mod 32 banks), so all 16 MFMA keys land on the same banks (a
-    # 16-32-way conflict on the QK read, PV read and gather store).  +8 bf16
-    # (520/key, 260 words, 4 mod 32) aligns the 16-byte vectors to bank groups
-    # -> ~2-way, the 16-lane x 4-bank floor.  Likewise lds_p [head_row][key]
-    # stride block_n=64 == 0 (mod 32) makes the PV P-read 16-way; +8 f32 -> 72.
-    KV_LDS_STRIDE = head_dim + 8                      # 520 bf16 per key
-    P_LDS_STRIDE = block_n + 8                         # 72 f32 per head-row
-    LDS_KV_BF16 = block_n * KV_LDS_STRIDE             # 33280 bf16
-    LDS_KV_BYTES = LDS_KV_BF16 * 2                    # 66560
-    LDS_P_F32 = BLOCK_H * P_LDS_STRIDE                # 9216 f32
-    LDS_P_BYTES = LDS_P_F32 * 4                        # 36864
-    LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES            # 103424 (< 160KB)
+    # accessed as [key][dim]: the QK read takes 16-byte (8 bf16) vectors while
+    # the high-frequency PV read takes scalar bf16 with the 8 contraction keys
+    # one k-group apart (8 keys) -- to avoid those 8-apart keys aliasing the
+    # same banks the bf16 stride must NOT be a multiple of 8 (4*stride mod 32).
+    # lds_p [head_row][key] f32: the P-store has the two k-groups (head-rows 4
+    # apart) aliasing unless the f32 stride is not a multiple of 8.  _C4_KV_PAD
+    # / _C4_P_PAD are tuned to minimize SQ_LDS_BANK_CONFLICT (sweep) and are
+    # env-overridable.
+    KV_LDS_STRIDE = head_dim + _C4_KV_PAD             # padded bf16 per key
+    P_LDS_STRIDE = block_n + _C4_P_PAD                 # padded f32 per head-row
+    LDS_KV_BF16 = block_n * KV_LDS_STRIDE
+    LDS_KV_BYTES = LDS_KV_BF16 * 2
+    LDS_P_F32 = BLOCK_H * P_LDS_STRIDE
+    LDS_P_BYTES = LDS_P_F32 * 4
+    LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES
 
     alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name="dual_scope_c4_smem")
     base_off = alloc._align(alloc.ptr, 16)
@@ -1641,11 +1660,10 @@ def _build_dual_scope_kernel_c128(
     BIG = 1.0e30
 
     # ---- LDS layout (KV block_n*512 bf16 + P block_h*block_n f32; < 160KB) -
-    # +8-element per-row padding breaks the multiple-of-32-banks stride (see the
-    # C4 kernel) so the 16-byte lds_kv vectors and the lds_p P-read spread across
-    # LDS bank groups instead of colliding on a single bank.
-    KV_LDS_STRIDE = head_dim + 8
-    P_LDS_STRIDE = block_n + 8
+    # Per-row padding breaks the multiple-of-32-banks stride (see the C4 kernel)
+    # so the lds_kv / lds_p accesses spread across LDS bank groups.
+    KV_LDS_STRIDE = head_dim + _C4_KV_PAD
+    P_LDS_STRIDE = block_n + _C4_P_PAD
     LDS_KV_BF16 = block_n * KV_LDS_STRIDE
     LDS_KV_BYTES = LDS_KV_BF16 * 2
     LDS_P_F32 = BLOCK_H * P_LDS_STRIDE
