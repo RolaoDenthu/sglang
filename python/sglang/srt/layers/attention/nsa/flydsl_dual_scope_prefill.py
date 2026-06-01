@@ -1403,10 +1403,17 @@ def _build_dual_scope_kernel_c4(
                             vvals.append(_memref.load(lds_kv, [_raw(voff)]))
                         v_b = Vec.from_elements(vvals, fx.BFloat16)
                         new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
-                gpu.barrier()
 
                 new_carry += list(m_new) + list(l_new) + list(new_o)
 
+            # One end-of-tile barrier instead of one per m_sub: each m_sub writes
+            # a DISJOINT lds_p region (p_row = wave_head_base + m_sub*16 + ...) and
+            # only READS the shared read-only lds_kv, so there is no inter-m_sub
+            # LDS hazard.  The single barrier here gates the next tile's gather
+            # (which overwrites lds_kv) against this tile's PV V-reads.  At
+            # occupancy-1 every barrier is a fully-exposed stall, so dropping
+            # M_SUBS-1 of them per tile directly attacks the ~70% stall bottleneck.
+            gpu.barrier()
             return new_carry
 
         # ==== dual-scope online softmax: SWA (main) then EXTRA ==========
@@ -1979,10 +1986,17 @@ def _build_dual_scope_kernel_c128(
                             vvals.append(_memref.load(lds_kv, [_raw(voff)]))
                         v_b = Vec.from_elements(vvals, fx.BFloat16)
                         new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
-                gpu.barrier()
 
                 new_carry += list(m_new) + list(l_new) + list(new_o)
 
+            # One end-of-tile barrier instead of one per m_sub: each m_sub writes
+            # a DISJOINT lds_p region (p_row = wave_head_base + m_sub*16 + ...) and
+            # only READS the shared read-only lds_kv, so there is no inter-m_sub
+            # LDS hazard.  The single barrier here gates the next tile's gather
+            # (which overwrites lds_kv) against this tile's PV V-reads.  At
+            # occupancy-1 every barrier is a fully-exposed stall, so dropping
+            # M_SUBS-1 of them per tile directly attacks the ~70% stall bottleneck.
+            gpu.barrier()
             return new_carry
 
         # ==== dual-scope online softmax: SWA (main) then EXTRA ==========
