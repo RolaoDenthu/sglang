@@ -1093,16 +1093,18 @@ def _build_dual_scope_kernel_c4(
     # the high-frequency PV read takes scalar bf16 with the 8 contraction keys
     # one k-group apart (8 keys) -- to avoid those 8-apart keys aliasing the
     # same banks the bf16 stride must NOT be a multiple of 8 (4*stride mod 32).
-    # lds_p [head_row][key] f32: the P-store has the two k-groups (head-rows 4
-    # apart) aliasing unless the f32 stride is not a multiple of 8.  _C4_KV_PAD
+    # lds_p [head_row][key] bf16: the P-store has the two k-groups (head-rows 4
+    # apart) aliasing unless the stride is not a multiple of 8.  _C4_KV_PAD
     # / _C4_P_PAD are tuned to minimize SQ_LDS_BANK_CONFLICT (sweep) and are
     # env-overridable.
     KV_LDS_STRIDE = head_dim + _C4_KV_PAD             # padded bf16 per key
-    P_LDS_STRIDE = block_n + _C4_P_PAD                 # padded f32 per head-row
+    P_LDS_STRIDE = block_n + _C4_P_PAD                 # padded bf16 per head-row
     LDS_KV_BF16 = block_n * KV_LDS_STRIDE
     LDS_KV_BYTES = LDS_KV_BF16 * 2
-    LDS_P_F32 = BLOCK_H * P_LDS_STRIDE
-    LDS_P_BYTES = LDS_P_F32 * 4
+    # P is cast to bf16 for the PV MFMA anyway -> stage it in LDS as bf16, not
+    # f32: halves the lds_p footprint AND the P-transpose LDS read/write traffic.
+    LDS_P_BF16 = BLOCK_H * P_LDS_STRIDE
+    LDS_P_BYTES = LDS_P_BF16 * 2
     LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES
 
     alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name="dual_scope_c4_smem")
@@ -1221,7 +1223,7 @@ def _build_dual_scope_kernel_c4(
         # ---- LDS ------------------------------------------------------
         lds_base = alloc.get_base()
         lds_kv = SmemPtr(lds_base, kv_lds_off, T.bf16, shape=(LDS_KV_BF16,)).get()
-        lds_p  = SmemPtr(lds_base, p_lds_off,  T.f32,  shape=(LDS_P_F32,)).get()
+        lds_p  = SmemPtr(lds_base, p_lds_off,  T.bf16, shape=(LDS_P_BF16,)).get()
 
         topklen_main_val  = load_i32(main_tkl_ptr,  pid_t)
         topklen_extra_val = load_i32(extra_tkl_ptr, pid_t)
@@ -1377,12 +1379,12 @@ def _build_dual_scope_kernel_c4(
                         )
                     )
 
-                # === stage P (f32) -> LDS, transposed [head_row][key] =====
+                # === stage P (bf16) -> LDS, transposed [head_row][key] ====
                 for nb in range_constexpr(N_BLKS_S):
                     for r in range_constexpr(4):
                         p_row = hb + k_group * fx.Index(4) + fx.Index(r)
                         p_col = fx.Index(nb * MFMA_N) + lane
-                        _memref.store(_raw(p_vals[nb][r]), lds_p,
+                        _memref.store(_raw(to_bf16(p_vals[nb][r])), lds_p,
                                       [_raw(p_row * fx.Index(P_LDS_STRIDE) + p_col)])
                 gpu.barrier()
 
@@ -1391,7 +1393,7 @@ def _build_dual_scope_kernel_c4(
                     p_base = ((hb + lane) * fx.Index(P_LDS_STRIDE)
                               + fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8))
                     p_a = Vec.from_elements(
-                        [to_bf16(_memref.load(lds_p, [_raw(p_base + fx.Index(j))]))
+                        [_memref.load(lds_p, [_raw(p_base + fx.Index(j))])
                          for j in range_constexpr(8)],
                         fx.BFloat16,
                     )
@@ -1666,15 +1668,17 @@ def _build_dual_scope_kernel_c128(
     SM_LOG2E = float(sm_scale) * _LOG2E
     BIG = 1.0e30
 
-    # ---- LDS layout (KV block_n*512 bf16 + P block_h*block_n f32; < 160KB) -
+    # ---- LDS layout (KV block_n*512 bf16 + P block_h*block_n bf16; < 160KB) -
     # Per-row padding breaks the multiple-of-32-banks stride (see the C4 kernel)
     # so the lds_kv / lds_p accesses spread across LDS bank groups.
     KV_LDS_STRIDE = head_dim + _C4_KV_PAD
     P_LDS_STRIDE = block_n + _C4_P_PAD
     LDS_KV_BF16 = block_n * KV_LDS_STRIDE
     LDS_KV_BYTES = LDS_KV_BF16 * 2
-    LDS_P_F32 = BLOCK_H * P_LDS_STRIDE
-    LDS_P_BYTES = LDS_P_F32 * 4
+    # P staged in LDS as bf16 (consumed by the PV MFMA as bf16): half the f32
+    # footprint and half the P-transpose LDS traffic.
+    LDS_P_BF16 = BLOCK_H * P_LDS_STRIDE
+    LDS_P_BYTES = LDS_P_BF16 * 2
     LDS_TOTAL = LDS_KV_BYTES + LDS_P_BYTES
     assert LDS_TOTAL <= 160 * 1024, f"LDS {LDS_TOTAL} exceeds 160KB budget"
 
@@ -1804,7 +1808,7 @@ def _build_dual_scope_kernel_c128(
         # ---- LDS ------------------------------------------------------
         lds_base = alloc.get_base()
         lds_kv = SmemPtr(lds_base, kv_lds_off, T.bf16, shape=(LDS_KV_BF16,)).get()
-        lds_p  = SmemPtr(lds_base, p_lds_off,  T.f32,  shape=(LDS_P_F32,)).get()
+        lds_p  = SmemPtr(lds_base, p_lds_off,  T.bf16, shape=(LDS_P_BF16,)).get()
 
         topklen_main_val  = load_i32(main_tkl_ptr,  pid_t)
         topklen_extra_val = load_i32(extra_tkl_ptr, pid_t)
@@ -1960,12 +1964,12 @@ def _build_dual_scope_kernel_c128(
                         )
                     )
 
-                # === stage P (f32) -> LDS, transposed [head_row][key] =====
+                # === stage P (bf16) -> LDS, transposed [head_row][key] ====
                 for nb in range_constexpr(N_BLKS_S):
                     for r in range_constexpr(4):
                         p_row = hb + k_group * fx.Index(4) + fx.Index(r)
                         p_col = fx.Index(nb * MFMA_N) + lane
-                        _memref.store(_raw(p_vals[nb][r]), lds_p,
+                        _memref.store(_raw(to_bf16(p_vals[nb][r])), lds_p,
                                       [_raw(p_row * fx.Index(P_LDS_STRIDE) + p_col)])
                 gpu.barrier()
 
@@ -1974,7 +1978,7 @@ def _build_dual_scope_kernel_c128(
                     p_base = ((hb + lane) * fx.Index(P_LDS_STRIDE)
                               + fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8))
                     p_a = Vec.from_elements(
-                        [to_bf16(_memref.load(lds_p, [_raw(p_base + fx.Index(j))]))
+                        [_memref.load(lds_p, [_raw(p_base + fx.Index(j))])
                          for j in range_constexpr(8)],
                         fx.BFloat16,
                     )
