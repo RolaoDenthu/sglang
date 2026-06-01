@@ -460,6 +460,9 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             seq_lens=seq_lens,
         )
 
+        if not envs.SGLANG_OPT_USE_FUSED_PAGED_COMPRESS.get():
+            create = _create_dummy_paged_compress_data
+
         return DSV4MetadataRadix(
             core_attn_metadata,
             indexer_metadata,
@@ -501,7 +504,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             if need_compress
             else None
         )
-        if not need_compress:
+        if not (envs.SGLANG_OPT_USE_FUSED_PAGED_COMPRESS.get() and need_compress):
             create = _create_dummy_paged_compress_data
         else:
             create = functools.partial(
@@ -1142,7 +1145,31 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                     raise
 
             backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
+            _bl_timing = (
+                os.environ.get("SGLANG_FLYDSL_TIMING", "0") == "1"
+                and forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True)
+            )
+            if _bl_timing:
+                torch.cuda.synchronize()
+                _ev0 = torch.cuda.Event(enable_timing=True)
+                _ev1 = torch.cuda.Event(enable_timing=True)
+                _ev0.record()
             o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
+            if _bl_timing:
+                _ev1.record()
+                torch.cuda.synchronize()
+                _bl_ms = _ev0.elapsed_time(_ev1)
+                try:
+                    _f = os.environ.get(
+                        "SGLANG_FLYDSL_TIMING_FILE", "/tmp/flydsl_timing.log"
+                    )
+                    with open(_f, "a") as _fh:
+                        _fh.write(
+                            f"[BASELINE] backend={backend} ratio={compress_ratio} "
+                            f"T={q.shape[0]} H={q.shape[-2]} kernel_ms={_bl_ms:.3f}\n"
+                        )
+                except Exception:
+                    pass
 
             o = o.squeeze(1)
             return o
