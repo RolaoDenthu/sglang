@@ -259,6 +259,17 @@ import os as _os_ldspad
 _C4_KV_PAD: int = int(_os_ldspad.environ.get("SGLANG_C4_KV_PAD", "").strip() or "16")
 _C4_P_PAD: int = int(_os_ldspad.environ.get("SGLANG_C4_P_PAD", "").strip() or "4")
 
+# SPIKE (gfx950 only): route the high-frequency PV V-operand read through the
+# CDNA4 LDS transpose-read intrinsic (ds_read_b64_tr_b16) instead of 8 strided
+# scalar bf16 loads per (ks_pv, d) tile.  Each 16x16 transpose read returns the
+# 4 contraction keys at the lane's head already laid out as the MFMA-B operand,
+# so 2 reads replace 8 scalar loads.  Verified bit-exact vs the scalar path for
+# all (ks_pv, d, stride/pad) in standalone spikes.  OFF by default; A/B via env.
+_C4_DS_TR: bool = (
+    _os_ldspad.environ.get("SGLANG_C4_DS_TR", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
 
 # ============================================================================
 # Shape / dtype normalization helpers
@@ -1387,6 +1398,24 @@ def _build_dual_scope_kernel_c4(
                 gpu.barrier()
 
                 # === PV GEMM : O += P @ V (bf16 MFMA), K=block_n=2x32 ======
+                # LDS transpose-read helper (gfx950 ds_read_b64_tr_b16): returns a
+                # vector<4xbf16> = the 4 contraction keys at the calling lane's head,
+                # transposed from lds_kv at bf16 element offset `elem_off`.
+                def _ds_tr_read(elem_off):
+                    base_mr = lds_base
+                    if hasattr(base_mr, "ir_value") and not isinstance(base_mr, ir.Value):
+                        base_mr = base_mr.ir_value()
+                    base_idx = _memref.extract_aligned_pointer_as_index(base_mr)
+                    base_i64 = _mlir_arith.IndexCastOp(T.i64, _raw(base_idx)).result
+                    eoff_i64 = _mlir_arith.IndexCastOp(T.i64, _raw(elem_off)).result
+                    byte_addr = _mlir_arith.AddIOp(
+                        _mlir_arith.AddIOp(base_i64, _raw(fx.Int64(kv_lds_off))).result,
+                        _mlir_arith.MulIOp(eoff_i64, _raw(fx.Int64(2))).result,
+                    ).result
+                    p3 = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), byte_addr)
+                    vi16 = rocdl.ds_read_tr16_b64(ir.VectorType.get([4], T.i16), p3)
+                    return arith.BitcastOp(ir.VectorType.get([4], T.bf16), vi16).result
+
                 for ks_pv in range_constexpr(K_STEPS_PV):
                     p_base = ((hb + lane) * fx.Index(P_LDS_STRIDE)
                               + fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8))
@@ -1396,12 +1425,29 @@ def _build_dual_scope_kernel_c4(
                         fx.BFloat16,
                     )
                     for d in range_constexpr(D_BLKS):
-                        vvals = []
-                        for j in range_constexpr(8):
-                            key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
-                            voff = key * fx.Index(KV_LDS_STRIDE) + fx.Index(d * MFMA_N) + lane
-                            vvals.append(_memref.load(lds_kv, [_raw(voff)]))
-                        v_b = Vec.from_elements(vvals, fx.BFloat16)
+                        if const_expr(_C4_DS_TR):
+                            # 2 transpose reads replace 8 strided scalar loads.
+                            #   n=lane (head 0-15), kg=k_group (0-3)
+                            #   base = (kg*8 + n//4 + ks_pv*MFMA_K)*KV_LDS_STRIDE
+                            #          + (n%4)*4 + d*MFMA_N ; read2 = base + 4*stride
+                            tr_base = ((k_group * fx.Index(8) + lane // fx.Index(4)
+                                        + fx.Index(ks_pv * MFMA_K)) * fx.Index(KV_LDS_STRIDE)
+                                       + (lane % fx.Index(4)) * fx.Index(4)
+                                       + fx.Index(d * MFMA_N))
+                            r1 = _ds_tr_read(tr_base)
+                            r2 = _ds_tr_read(tr_base + fx.Index(4 * KV_LDS_STRIDE))
+                            v_b = Vec.from_elements(
+                                [Vec(r1)[0], Vec(r1)[1], Vec(r1)[2], Vec(r1)[3],
+                                 Vec(r2)[0], Vec(r2)[1], Vec(r2)[2], Vec(r2)[3]],
+                                fx.BFloat16,
+                            )
+                        else:
+                            vvals = []
+                            for j in range_constexpr(8):
+                                key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
+                                voff = key * fx.Index(KV_LDS_STRIDE) + fx.Index(d * MFMA_N) + lane
+                                vvals.append(_memref.load(lds_kv, [_raw(voff)]))
+                            v_b = Vec.from_elements(vvals, fx.BFloat16)
                         new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
 
                 new_carry += list(m_new) + list(l_new) + list(new_o)
@@ -1970,6 +2016,24 @@ def _build_dual_scope_kernel_c128(
                 gpu.barrier()
 
                 # === PV GEMM : O += P @ V (bf16 MFMA), K=block_n=2x32 ======
+                # LDS transpose-read helper (gfx950 ds_read_b64_tr_b16): returns a
+                # vector<4xbf16> = the 4 contraction keys at the calling lane's head,
+                # transposed from lds_kv at bf16 element offset `elem_off`.
+                def _ds_tr_read(elem_off):
+                    base_mr = lds_base
+                    if hasattr(base_mr, "ir_value") and not isinstance(base_mr, ir.Value):
+                        base_mr = base_mr.ir_value()
+                    base_idx = _memref.extract_aligned_pointer_as_index(base_mr)
+                    base_i64 = _mlir_arith.IndexCastOp(T.i64, _raw(base_idx)).result
+                    eoff_i64 = _mlir_arith.IndexCastOp(T.i64, _raw(elem_off)).result
+                    byte_addr = _mlir_arith.AddIOp(
+                        _mlir_arith.AddIOp(base_i64, _raw(fx.Int64(kv_lds_off))).result,
+                        _mlir_arith.MulIOp(eoff_i64, _raw(fx.Int64(2))).result,
+                    ).result
+                    p3 = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), byte_addr)
+                    vi16 = rocdl.ds_read_tr16_b64(ir.VectorType.get([4], T.i16), p3)
+                    return arith.BitcastOp(ir.VectorType.get([4], T.bf16), vi16).result
+
                 for ks_pv in range_constexpr(K_STEPS_PV):
                     p_base = ((hb + lane) * fx.Index(P_LDS_STRIDE)
                               + fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8))
@@ -1979,12 +2043,29 @@ def _build_dual_scope_kernel_c128(
                         fx.BFloat16,
                     )
                     for d in range_constexpr(D_BLKS):
-                        vvals = []
-                        for j in range_constexpr(8):
-                            key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
-                            voff = key * fx.Index(KV_LDS_STRIDE) + fx.Index(d * MFMA_N) + lane
-                            vvals.append(_memref.load(lds_kv, [_raw(voff)]))
-                        v_b = Vec.from_elements(vvals, fx.BFloat16)
+                        if const_expr(_C4_DS_TR):
+                            # 2 transpose reads replace 8 strided scalar loads.
+                            #   n=lane (head 0-15), kg=k_group (0-3)
+                            #   base = (kg*8 + n//4 + ks_pv*MFMA_K)*KV_LDS_STRIDE
+                            #          + (n%4)*4 + d*MFMA_N ; read2 = base + 4*stride
+                            tr_base = ((k_group * fx.Index(8) + lane // fx.Index(4)
+                                        + fx.Index(ks_pv * MFMA_K)) * fx.Index(KV_LDS_STRIDE)
+                                       + (lane % fx.Index(4)) * fx.Index(4)
+                                       + fx.Index(d * MFMA_N))
+                            r1 = _ds_tr_read(tr_base)
+                            r2 = _ds_tr_read(tr_base + fx.Index(4 * KV_LDS_STRIDE))
+                            v_b = Vec.from_elements(
+                                [Vec(r1)[0], Vec(r1)[1], Vec(r1)[2], Vec(r1)[3],
+                                 Vec(r2)[0], Vec(r2)[1], Vec(r2)[2], Vec(r2)[3]],
+                                fx.BFloat16,
+                            )
+                        else:
+                            vvals = []
+                            for j in range_constexpr(8):
+                                key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
+                                voff = key * fx.Index(KV_LDS_STRIDE) + fx.Index(d * MFMA_N) + lane
+                                vvals.append(_memref.load(lds_kv, [_raw(voff)]))
+                            v_b = Vec.from_elements(vvals, fx.BFloat16)
                         new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
 
                 new_carry += list(m_new) + list(l_new) + list(new_o)
