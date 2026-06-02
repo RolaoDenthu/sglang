@@ -270,6 +270,31 @@ _C4_DS_TR: bool = (
     in ("1", "true", "yes", "on")
 )
 
+# Intra-wave software pipelining of the PV-GEMM V-operand LDS reads.  At
+# occupancy-1 the CTA's 4 waves land 1-per-SIMD, so a stalled LDS read idles the
+# whole SIMD (no second wave to switch to).  The only latency-hiding lever left
+# is per-wave ILP: emit a BATCH of _C4_PV_PIPE independent V-reads (into distinct
+# registers) before their consuming MFMAs, so several reads are in flight during
+# the ~20-40cy LDS round-trips instead of one-at-a-time read->dependent-MFMA.
+# This is a pure emission-order reorder (per-accumulator MFMA order is unchanged)
+# so it is bit-exact vs the unpipelined path (verified: max_abs_diff==0).
+#
+# NOTE (tuning result -- kept OFF): this does NOT help and is a documented
+# dead-end.  The C4 kernel is REGISTER-bound, not schedule-bound: VGPR is pinned
+# at the 256 arch cap (the f32 O-accumulator alone is D_BLKS*4 = 128 VGPR and is
+# live across the whole tile), so there is no headroom to hold loads in flight --
+# every prefetched fragment spills to scratch (488B -> 512-624B) and the spill
+# costs more than the LDS latency it hides.  Measured (T=2048, gfx950, DS_TR on):
+# PV_PIPE off 1.905ms ; W=2 2.111ms (+11%) ; W=4 1.899ms (~neutral) ; W=8 2.078ms
+# (+9%).  Hiding LDS latency here is gated on first shrinking the O-accumulator's
+# register footprint (split-D multi-pass / LDS-resident acc), not on pipelining.
+# OFF by default; A/B via env.  SGLANG_C4_PV_PIPE = PV d-loop batch width (def 4).
+_C4_PIPE: bool = (
+    _os_ldspad.environ.get("SGLANG_C4_PIPE", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+_C4_PV_PIPE: int = int(_os_ldspad.environ.get("SGLANG_C4_PV_PIPE", "").strip() or "4")
+
 
 # ============================================================================
 # Shape / dtype normalization helpers
@@ -1416,6 +1441,32 @@ def _build_dual_scope_kernel_c4(
                     vi16 = rocdl.ds_read_tr16_b64(ir.VectorType.get([4], T.i16), p3)
                     return arith.BitcastOp(ir.VectorType.get([4], T.bf16), vi16).result
 
+                # PV V-operand read for contraction step ks_pv, output d-block d.
+                # Returns the MFMA-B fragment (vector<8xbf16>) for new_o[d].
+                def _read_v(ks_pv, d):
+                    if const_expr(_C4_DS_TR):
+                        # 2 transpose reads replace 8 strided scalar loads.
+                        #   n=lane (head 0-15), kg=k_group (0-3)
+                        #   base = (kg*8 + n//4 + ks_pv*MFMA_K)*KV_LDS_STRIDE
+                        #          + (n%4)*4 + d*MFMA_N ; read2 = base + 4*stride
+                        tr_base = ((k_group * fx.Index(8) + lane // fx.Index(4)
+                                    + fx.Index(ks_pv * MFMA_K)) * fx.Index(KV_LDS_STRIDE)
+                                   + (lane % fx.Index(4)) * fx.Index(4)
+                                   + fx.Index(d * MFMA_N))
+                        r1 = _ds_tr_read(tr_base)
+                        r2 = _ds_tr_read(tr_base + fx.Index(4 * KV_LDS_STRIDE))
+                        return Vec.from_elements(
+                            [Vec(r1)[0], Vec(r1)[1], Vec(r1)[2], Vec(r1)[3],
+                             Vec(r2)[0], Vec(r2)[1], Vec(r2)[2], Vec(r2)[3]],
+                            fx.BFloat16,
+                        )
+                    vvals = []
+                    for j in range_constexpr(8):
+                        key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
+                        voff = key * fx.Index(KV_LDS_STRIDE) + fx.Index(d * MFMA_N) + lane
+                        vvals.append(_memref.load(lds_kv, [_raw(voff)]))
+                    return Vec.from_elements(vvals, fx.BFloat16)
+
                 for ks_pv in range_constexpr(K_STEPS_PV):
                     p_base = ((hb + lane) * fx.Index(P_LDS_STRIDE)
                               + fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8))
@@ -1424,31 +1475,20 @@ def _build_dual_scope_kernel_c4(
                          for j in range_constexpr(8)],
                         fx.BFloat16,
                     )
-                    for d in range_constexpr(D_BLKS):
-                        if const_expr(_C4_DS_TR):
-                            # 2 transpose reads replace 8 strided scalar loads.
-                            #   n=lane (head 0-15), kg=k_group (0-3)
-                            #   base = (kg*8 + n//4 + ks_pv*MFMA_K)*KV_LDS_STRIDE
-                            #          + (n%4)*4 + d*MFMA_N ; read2 = base + 4*stride
-                            tr_base = ((k_group * fx.Index(8) + lane // fx.Index(4)
-                                        + fx.Index(ks_pv * MFMA_K)) * fx.Index(KV_LDS_STRIDE)
-                                       + (lane % fx.Index(4)) * fx.Index(4)
-                                       + fx.Index(d * MFMA_N))
-                            r1 = _ds_tr_read(tr_base)
-                            r2 = _ds_tr_read(tr_base + fx.Index(4 * KV_LDS_STRIDE))
-                            v_b = Vec.from_elements(
-                                [Vec(r1)[0], Vec(r1)[1], Vec(r1)[2], Vec(r1)[3],
-                                 Vec(r2)[0], Vec(r2)[1], Vec(r2)[2], Vec(r2)[3]],
-                                fx.BFloat16,
-                            )
-                        else:
-                            vvals = []
-                            for j in range_constexpr(8):
-                                key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
-                                voff = key * fx.Index(KV_LDS_STRIDE) + fx.Index(d * MFMA_N) + lane
-                                vvals.append(_memref.load(lds_kv, [_raw(voff)]))
-                            v_b = Vec.from_elements(vvals, fx.BFloat16)
-                        new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
+                    if const_expr(_C4_PIPE):
+                        # Issue _C4_PV_PIPE independent V-reads (distinct regs) then
+                        # their MFMAs, so multiple LDS reads are in flight per SIMD.
+                        PV_W = _C4_PV_PIPE
+                        n_chunks = (D_BLKS + PV_W - 1) // PV_W
+                        for c in range_constexpr(n_chunks):
+                            d0 = c * PV_W
+                            w = min(PV_W, D_BLKS - d0)
+                            vb = [_read_v(ks_pv, d0 + i) for i in range_constexpr(w)]
+                            for i in range_constexpr(w):
+                                new_o[d0 + i] = mfma_bf16(new_o[d0 + i], p_a, vb[i])
+                    else:
+                        for d in range_constexpr(D_BLKS):
+                            new_o[d] = mfma_bf16(new_o[d], p_a, _read_v(ks_pv, d))
 
                 new_carry += list(m_new) + list(l_new) + list(new_o)
 
@@ -2034,6 +2074,32 @@ def _build_dual_scope_kernel_c128(
                     vi16 = rocdl.ds_read_tr16_b64(ir.VectorType.get([4], T.i16), p3)
                     return arith.BitcastOp(ir.VectorType.get([4], T.bf16), vi16).result
 
+                # PV V-operand read for contraction step ks_pv, output d-block d.
+                # Returns the MFMA-B fragment (vector<8xbf16>) for new_o[d].
+                def _read_v(ks_pv, d):
+                    if const_expr(_C4_DS_TR):
+                        # 2 transpose reads replace 8 strided scalar loads.
+                        #   n=lane (head 0-15), kg=k_group (0-3)
+                        #   base = (kg*8 + n//4 + ks_pv*MFMA_K)*KV_LDS_STRIDE
+                        #          + (n%4)*4 + d*MFMA_N ; read2 = base + 4*stride
+                        tr_base = ((k_group * fx.Index(8) + lane // fx.Index(4)
+                                    + fx.Index(ks_pv * MFMA_K)) * fx.Index(KV_LDS_STRIDE)
+                                   + (lane % fx.Index(4)) * fx.Index(4)
+                                   + fx.Index(d * MFMA_N))
+                        r1 = _ds_tr_read(tr_base)
+                        r2 = _ds_tr_read(tr_base + fx.Index(4 * KV_LDS_STRIDE))
+                        return Vec.from_elements(
+                            [Vec(r1)[0], Vec(r1)[1], Vec(r1)[2], Vec(r1)[3],
+                             Vec(r2)[0], Vec(r2)[1], Vec(r2)[2], Vec(r2)[3]],
+                            fx.BFloat16,
+                        )
+                    vvals = []
+                    for j in range_constexpr(8):
+                        key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
+                        voff = key * fx.Index(KV_LDS_STRIDE) + fx.Index(d * MFMA_N) + lane
+                        vvals.append(_memref.load(lds_kv, [_raw(voff)]))
+                    return Vec.from_elements(vvals, fx.BFloat16)
+
                 for ks_pv in range_constexpr(K_STEPS_PV):
                     p_base = ((hb + lane) * fx.Index(P_LDS_STRIDE)
                               + fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8))
@@ -2042,31 +2108,20 @@ def _build_dual_scope_kernel_c128(
                          for j in range_constexpr(8)],
                         fx.BFloat16,
                     )
-                    for d in range_constexpr(D_BLKS):
-                        if const_expr(_C4_DS_TR):
-                            # 2 transpose reads replace 8 strided scalar loads.
-                            #   n=lane (head 0-15), kg=k_group (0-3)
-                            #   base = (kg*8 + n//4 + ks_pv*MFMA_K)*KV_LDS_STRIDE
-                            #          + (n%4)*4 + d*MFMA_N ; read2 = base + 4*stride
-                            tr_base = ((k_group * fx.Index(8) + lane // fx.Index(4)
-                                        + fx.Index(ks_pv * MFMA_K)) * fx.Index(KV_LDS_STRIDE)
-                                       + (lane % fx.Index(4)) * fx.Index(4)
-                                       + fx.Index(d * MFMA_N))
-                            r1 = _ds_tr_read(tr_base)
-                            r2 = _ds_tr_read(tr_base + fx.Index(4 * KV_LDS_STRIDE))
-                            v_b = Vec.from_elements(
-                                [Vec(r1)[0], Vec(r1)[1], Vec(r1)[2], Vec(r1)[3],
-                                 Vec(r2)[0], Vec(r2)[1], Vec(r2)[2], Vec(r2)[3]],
-                                fx.BFloat16,
-                            )
-                        else:
-                            vvals = []
-                            for j in range_constexpr(8):
-                                key = fx.Index(ks_pv * MFMA_K) + k_group * fx.Index(8) + fx.Index(j)
-                                voff = key * fx.Index(KV_LDS_STRIDE) + fx.Index(d * MFMA_N) + lane
-                                vvals.append(_memref.load(lds_kv, [_raw(voff)]))
-                            v_b = Vec.from_elements(vvals, fx.BFloat16)
-                        new_o[d] = mfma_bf16(new_o[d], p_a, v_b)
+                    if const_expr(_C4_PIPE):
+                        # Issue _C4_PV_PIPE independent V-reads (distinct regs) then
+                        # their MFMAs, so multiple LDS reads are in flight per SIMD.
+                        PV_W = _C4_PV_PIPE
+                        n_chunks = (D_BLKS + PV_W - 1) // PV_W
+                        for c in range_constexpr(n_chunks):
+                            d0 = c * PV_W
+                            w = min(PV_W, D_BLKS - d0)
+                            vb = [_read_v(ks_pv, d0 + i) for i in range_constexpr(w)]
+                            for i in range_constexpr(w):
+                                new_o[d0 + i] = mfma_bf16(new_o[d0 + i], p_a, vb[i])
+                    else:
+                        for d in range_constexpr(D_BLKS):
+                            new_o[d] = mfma_bf16(new_o[d], p_a, _read_v(ks_pv, d))
 
                 new_carry += list(m_new) + list(l_new) + list(new_o)
 
