@@ -11,11 +11,27 @@ Supports:
 - All configs: with/without topk_length, with/without attn_sink
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+# D4 (deferred / lazy online-softmax O-rescale) for the Triton SIMT kernels.
+# The online-softmax loop rescales every fp32 O-accumulator tile by
+# alpha = exp2(m_old - m_new) on each KV block.  alpha is a per-head-row VECTOR
+# (BLOCK_H rows); on a KV block where NO owned row's running max advances,
+# m_new == m_old so alpha == 1.0 exactly for every row and `acc * alpha` is an
+# identity multiply.  When a block-uniform predicate (min over rows of alpha ==
+# 1.0) holds we branch over the acc rescale via scf.if.  Bit-exact: the skip is
+# taken only when alpha == 1.0 for all rows, so acc * alpha == acc exactly; the
+# eager branch is the original code verbatim.  OFF by default; A/B via env
+# SGLANG_TRITON_LAZY_RESCALE in {1,true,yes,on}.
+_TRITON_LAZY_RESCALE: bool = (
+    os.environ.get("SGLANG_TRITON_LAZY_RESCALE", "0").strip().lower()
+    in ("1", "true", "yes", "on")
+)
 
 
 def _bucket_total_tokens(total_tokens: int) -> int:
@@ -263,14 +279,39 @@ def _process_kv_block_aggressive(
     l_new = alpha * l_i + tl.sum(p, axis=1)
     p_bf16 = p.to(tl.bfloat16)
 
-    acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
-    acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
-    acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
-    acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
-    acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
-    acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
-    acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
-    acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
+    if _TRITON_LAZY_RESCALE:
+        # D4: skip the acc rescale on blocks where NO owned row's max advanced.
+        # alpha <= 1.0 always, so min(alpha) == 1.0 <=> alpha == 1.0 for every
+        # row (m_new == m_old).  Then acc * alpha == acc exactly -> bit-exact.
+        # Block-uniform scalar predicate -> genuine scf.if branch, not exec mask.
+        no_advance = tl.min(alpha) == 1.0
+        if no_advance:
+            acc_0 = acc_0 + tl.dot(p_bf16, kv_0).to(tl.float32)
+            acc_1 = acc_1 + tl.dot(p_bf16, kv_1).to(tl.float32)
+            acc_2 = acc_2 + tl.dot(p_bf16, kv_2).to(tl.float32)
+            acc_3 = acc_3 + tl.dot(p_bf16, kv_3).to(tl.float32)
+            acc_4 = acc_4 + tl.dot(p_bf16, kv_4).to(tl.float32)
+            acc_5 = acc_5 + tl.dot(p_bf16, kv_5).to(tl.float32)
+            acc_6 = acc_6 + tl.dot(p_bf16, kv_6).to(tl.float32)
+            acc_7 = acc_7 + tl.dot(p_bf16, kv_7).to(tl.float32)
+        else:
+            acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
+            acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
+            acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
+            acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
+            acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
+            acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
+            acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
+            acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
+    else:
+        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
+        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
+        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
+        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
+        acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
+        acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
+        acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
+        acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
 
     return acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_new, l_new
 

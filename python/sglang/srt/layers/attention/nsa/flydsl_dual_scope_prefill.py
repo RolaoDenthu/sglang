@@ -316,10 +316,11 @@ _C4_PV_PIPE: int = int(_os_ldspad.environ.get("SGLANG_C4_PV_PIPE", "").strip() o
 # wave-wide max delta is <= 0, i.e. corr == 1.0 for every row, so o*corr == o.
 # When the predicate is true the original (corr possibly < 1) rescale runs
 # verbatim.  m_new / l_new / p are computed identically in both cases.
-# OFF by default; A/B via env SGLANG_C4_LAZY_RESCALE.
+# ON by default (bit-exact, latency-neutral-to-faster); disable via env
+# SGLANG_C4_LAZY_RESCALE in {0,false,no,off}.
 _C4_LAZY_RESCALE: bool = (
-    _os_ldspad.environ.get("SGLANG_C4_LAZY_RESCALE", "").strip().lower()
-    in ("1", "true", "yes", "on")
+    _os_ldspad.environ.get("SGLANG_C4_LAZY_RESCALE", "1").strip().lower()
+    not in ("0", "false", "no", "off")
 )
 
 
