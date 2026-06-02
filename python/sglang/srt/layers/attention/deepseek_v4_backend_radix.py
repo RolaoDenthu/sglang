@@ -1104,16 +1104,17 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             )
 
             # ------- FlyDSL dual-scope prefill override (gfx950) -------
-            # When SGLANG_FLYDSL_PREFILL=1, route prefill through a single fused
-            # FlyDSL dual-scope kernel that mirrors the Triton
-            # `_fused_gather_attn_dsv4_dual_scope_kernel` reference: SWA + C4/C128
-            # gathered and attended in one online-softmax pass (no Python-side
-            # LSE merge). This is the intended live path, so there is NO silent
+            # Route prefill through a single fused FlyDSL dual-scope kernel that
+            # mirrors the Triton `_fused_gather_attn_dsv4_dual_scope_kernel`
+            # reference: SWA + C4/C128 gathered and attended in one online-softmax
+            # pass (no Python-side LSE merge). This is the intended live path of
+            # this branch, so it is ON by default (set SGLANG_FLYDSL_PREFILL=0 to
+            # fall back to the FlashMLA/Triton baseline). There is NO silent
             # fallback: any failure (import or runtime) is logged with full
             # traceback and re-raised so the server crashes immediately (strict
-            # mode) rather than silently degrading to the FlashMLA/Triton baseline.
+            # mode) rather than silently degrading to the baseline.
             if (
-                os.environ.get("SGLANG_FLYDSL_PREFILL", "0") == "1"
+                os.environ.get("SGLANG_FLYDSL_PREFILL", "1") != "0"
                 and forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True)
             ):
                 try:
