@@ -132,19 +132,23 @@ _USE_FLYDSL_KERNEL: bool = True
 
 # C128 / low-topk routing: the C128 regime is a TINY 192-key problem
 # (topk_main=128 + topk_extra=64, bs_main=256, bs_extra=2, H=128, head_dim=512).
-# A full manual tile/wave autotune of a fully-parameterized specialized C128
-# kernel over (BLOCK_H, BLOCK_N, N_WAVES) -- gated by cosine>0.9999 vs the
-# PyTorch reference, then live gsm8k (8-shot/200q) -- showed that NO specialized
-# C128 config beats simply routing ratio==128 to the BASE kernel:
-#   * base (ratio128 -> base, BLOCK_H=16, 8 CTAs/token):  188.4 s, acc 0.915
-#   * best specialized (BLOCK_H=128/BLOCK_N=64/N_WAVES=8): 203.3 s, acc 0.910
-#   * max-parallelism specialized (BLOCK_H=16/BN=32/w1):   GPU HSA exception
-# The base kernel's small BLOCK_H=16 already launches 8 CTAs/token (the parallelism
-# the tiny problem wants) without the redundant per-CTA fp8 dequant that a
-# specialized small-BLOCK_H kernel incurs, so it is both faster AND simpler.
-# => default plan is None (route ratio==128 to the base kernel).  The specialized
-# parameterized C128 builder is retained and remains reachable via the env
-# override below purely for future autotuning experiments.
+# An earlier gsm8k-only autotune (8-shot/200q) had picked the BASE kernel for
+# ratio==128, but that comparison predated the PV transpose-read (ds_read_b64_tr_b16)
+# and conflated the tiny C128 slice with the decode-bound gsm8k total.  A fresh,
+# direct C128-regime microbenchmark + gsm8k re-measurement (8-shot/400q,
+# DeepSeek-V4-Pro FP8, tp8) overturned it: the specialized (128,64,8) C128 kernel
+# with the transpose-read is faster than base across the ENTIRE T range with NO
+# accuracy cost:
+#   per-call kernel (HIP events): spec+DS_TR vs base ->
+#     T=6  1.23x | T=190 2.01x | T=680 2.47x | T=2048 2.47x | T=8192 2.57x
+#   gsm8k end-to-end: base acc 0.940 / 24.24 s ; spec+DS_TR acc 0.943 / 23.45 s
+#     (cosine vs torch ref = 0.99999750 at every T)
+# The 1-CTA/token BLOCK_H=128 tile dequants the fp8 KV ONCE per token (vs the base
+# kernel's BLOCK_H=16 = 8 CTAs/token, each redundantly dequanting the same KV), and
+# the transpose-read collapses the PV V-operand LDS traffic ~2.5x.
+# => default plan is the specialized (128,64,8); route ratio==128 there.  The base
+# kernel remains the fallback for all other ratios and is still reachable for
+# ratio==128 via the "base" env override below (autotuning / regression bisects).
 _C128_BLOCK_H: int = 128
 _C128_BLOCK_N: int = 64
 _C128_N_WAVES: int = 8
@@ -154,11 +158,12 @@ def _c128_plan():
     """C128 tiling plan: ``(block_h, block_n, n_waves)`` for the specialized
     kernel, or ``None`` to route compress_ratio==128 to the BASE kernel.
 
-    The tuned DEFAULT is ``None`` (base kernel won the autotune -- see the comment
-    above).  Overridable for autotuning experiments via env ``SGLANG_C128_TILING``:
-        * "base"            -> route ratio==128 to the base kernel (the default)
+    The tuned DEFAULT is the specialized ``(128, 64, 8)`` (it beats base across the
+    whole T range with the transpose-read on -- see the comment above).  Overridable
+    via env ``SGLANG_C128_TILING``:
+        * "base"            -> route ratio==128 to the base kernel
         * "BH,BN,NW"        -> specialized C128 with that tiling
-        * unset/invalid     -> the tuned default (base routing)
+        * unset/invalid     -> the tuned default (specialized 128,64,8)
     Parsed once at import (a server restart re-reads it).
     """
     import os as _os
@@ -173,7 +178,7 @@ def _c128_plan():
                 return (int(parts[0]), int(parts[1]), int(parts[2]))
             except ValueError:
                 pass
-    return None
+    return (_C128_BLOCK_H, _C128_BLOCK_N, _C128_N_WAVES)
 
 
 _C128_PLAN = _c128_plan()
@@ -259,15 +264,17 @@ import os as _os_ldspad
 _C4_KV_PAD: int = int(_os_ldspad.environ.get("SGLANG_C4_KV_PAD", "").strip() or "16")
 _C4_P_PAD: int = int(_os_ldspad.environ.get("SGLANG_C4_P_PAD", "").strip() or "4")
 
-# SPIKE (gfx950 only): route the high-frequency PV V-operand read through the
-# CDNA4 LDS transpose-read intrinsic (ds_read_b64_tr_b16) instead of 8 strided
-# scalar bf16 loads per (ks_pv, d) tile.  Each 16x16 transpose read returns the
-# 4 contraction keys at the lane's head already laid out as the MFMA-B operand,
-# so 2 reads replace 8 scalar loads.  Verified bit-exact vs the scalar path for
-# all (ks_pv, d, stride/pad) in standalone spikes.  OFF by default; A/B via env.
+# gfx950 only: route the high-frequency PV V-operand read through the CDNA4 LDS
+# transpose-read intrinsic (ds_read_b64_tr_b16) instead of 8 strided scalar bf16
+# loads per (ks_pv, d) tile.  Each 16x16 transpose read returns the 4 contraction
+# keys at the lane's head already laid out as the MFMA-B operand, so 2 reads
+# replace 8 scalar loads (~2.5x less PV LDS traffic).  Verified bit-exact vs the
+# scalar path for all (ks_pv, d, stride/pad) in standalone spikes, and a measured
+# end-to-end win on BOTH the C4 and C128 regimes (gsm8k acc unchanged, faster).
+# => ON by default; disable for A/B or regression bisects with SGLANG_C4_DS_TR=0.
 _C4_DS_TR: bool = (
     _os_ldspad.environ.get("SGLANG_C4_DS_TR", "").strip().lower()
-    in ("1", "true", "yes", "on")
+    not in ("0", "false", "no", "off")
 )
 
 # Intra-wave software pipelining of the PV-GEMM V-operand LDS reads.  At

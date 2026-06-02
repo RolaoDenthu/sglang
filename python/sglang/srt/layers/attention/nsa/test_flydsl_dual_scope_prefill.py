@@ -477,12 +477,12 @@ _C4_CASE = dict(
     compress_ratio=4,
 )
 
-# C128 production-shape case (compress_ratio=128 -> routes to the BASE kernel via
-# the tuned _C128_PLAN=None).  The C128 regime is the tiny extra scope: SWA
-# topk_main=128 + topk_extra=64, block_size_extra = page_size // 128 = 2, at the
-# real model dims H=128, head_dim_v=512, real main block_size 256.  This
-# ratio-128 -> base-kernel path carries the bulk of GSM8K's layers yet had NO
-# kernel-vs-reference numerics coverage before (only the C4 path was launch-tested).
+# C128 production-shape case (compress_ratio=128 -> routes to the specialized C128
+# kernel via the tuned _C128_PLAN=(128,64,8)).  The C128 regime is the tiny extra
+# scope: SWA topk_main=128 + topk_extra=64, block_size_extra = page_size // 128 = 2,
+# at the real model dims H=128, head_dim_v=512, real main block_size 256.  This
+# ratio-128 path carries the bulk of GSM8K's layers yet had NO kernel-vs-reference
+# numerics coverage before (only the C4 path was launch-tested).
 _C128_CASE = dict(
     H=128,
     topk_main=128,
