@@ -102,6 +102,7 @@ try:  # pragma: no cover - exercised only on the gfx950 box
         fly as _fly,
         llvm as _llvm,
         memref as _memref,
+        scf as _scf,
     )
 
     _HAS_FLYDSL = True
@@ -301,6 +302,25 @@ _C4_PIPE: bool = (
     in ("1", "true", "yes", "on")
 )
 _C4_PV_PIPE: int = int(_os_ldspad.environ.get("SGLANG_C4_PV_PIPE", "").strip() or "4")
+
+# D4 (deferred / lazy softmax O-rescale).  The online-softmax loop rescales the
+# 512-wide fp32 O-accumulator by corr = exp2(m_old - m_new) on every KV tile
+# (D_BLKS x vector<4xf32> = 128 VGPR worth of fmuls, on the PV-MFMA dependency
+# chain).  On tiles where no output row's running max advances this tile,
+# m_new == m_old so corr == 1.0 and the rescale is an identity multiply.  D4
+# skips it: a wave-uniform predicate (any owned row's max strictly increased) is
+# reduced across the 64-lane wave and the rescale is emitted under scf.if, so the
+# fmuls are genuinely branched-over (not exec-masked) when no max advances.
+#
+# Bit-exact vs the unconditional path: the skip branch is taken only when the
+# wave-wide max delta is <= 0, i.e. corr == 1.0 for every row, so o*corr == o.
+# When the predicate is true the original (corr possibly < 1) rescale runs
+# verbatim.  m_new / l_new / p are computed identically in both cases.
+# OFF by default; A/B via env SGLANG_C4_LAZY_RESCALE.
+_C4_LAZY_RESCALE: bool = (
+    _os_ldspad.environ.get("SGLANG_C4_LAZY_RESCALE", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
 
 
 # ============================================================================
@@ -1411,14 +1431,56 @@ def _build_dual_scope_kernel_c4(
                         )
 
                 l_new = [_fadd(_fmul(corr[r], l_run[r]), tile_sum[r]) for r in range_constexpr(4)]
-                new_o = []
-                for d in range_constexpr(D_BLKS):
-                    ov = Vec(o_acc[d])
-                    new_o.append(
-                        Vec.from_elements(
-                            [_fmul(ov[r], corr[r]) for r in range_constexpr(4)], fx.Float32
+                if const_expr(_C4_LAZY_RESCALE):
+                    # D4: skip the O rescale on tiles where no owned row's running
+                    # max advances (corr == 1, identity multiply).  Predicate is
+                    # reduced across the full 64-lane wave so scf.if is uniform.
+                    rm_delta = _fsub(row_max[0], m_run[0])
+                    for r in range_constexpr(4):
+                        if const_expr(r > 0):
+                            rm_delta = _fmax(rm_delta, _fsub(row_max[r], m_run[r]))
+                    for xor_off in [32, 16, 8, 4, 2, 1]:
+                        rm_delta = _fmax(
+                            rm_delta,
+                            fx.Float32(rm_delta).shuffle_xor(
+                                fx.Int32(xor_off), fx.Int32(WARP_SIZE)
+                            ),
                         )
+                    should_scale = arith.cmpf(
+                        arith.CmpFPredicate.OGT, _raw(rm_delta), _raw(fx.Float32(0.0))
                     )
+                    o_raw = [_raw(o_acc[d]) for d in range_constexpr(D_BLKS)]
+                    if_op = _scf.IfOp(
+                        _raw(should_scale),
+                        [v.type for v in o_raw],
+                        has_else=True,
+                        loc=ir.Location.unknown(),
+                    )
+                    with ir.InsertionPoint(if_op.regions[0].blocks[0]):
+                        scaled_raw = []
+                        for d in range_constexpr(D_BLKS):
+                            ov = Vec(o_acc[d])
+                            scaled_raw.append(
+                                _raw(Vec.from_elements(
+                                    [_fmul(ov[r], corr[r]) for r in range_constexpr(4)],
+                                    fx.Float32,
+                                ))
+                            )
+                        _scf.YieldOp(scaled_raw)
+                    if len(if_op.regions[1].blocks) == 0:
+                        if_op.regions[1].blocks.append(*[])
+                    with ir.InsertionPoint(if_op.regions[1].blocks[0]):
+                        _scf.YieldOp(o_raw)
+                    new_o = [Vec(r) for r in if_op.results]
+                else:
+                    new_o = []
+                    for d in range_constexpr(D_BLKS):
+                        ov = Vec(o_acc[d])
+                        new_o.append(
+                            Vec.from_elements(
+                                [_fmul(ov[r], corr[r]) for r in range_constexpr(4)], fx.Float32
+                            )
+                        )
 
                 # === stage P (f32) -> LDS, transposed [head_row][key] =====
                 for nb in range_constexpr(N_BLKS_S):
@@ -2044,14 +2106,56 @@ def _build_dual_scope_kernel_c128(
                         )
 
                 l_new = [_fadd(_fmul(corr[r], l_run[r]), tile_sum[r]) for r in range_constexpr(4)]
-                new_o = []
-                for d in range_constexpr(D_BLKS):
-                    ov = Vec(o_acc[d])
-                    new_o.append(
-                        Vec.from_elements(
-                            [_fmul(ov[r], corr[r]) for r in range_constexpr(4)], fx.Float32
+                if const_expr(_C4_LAZY_RESCALE):
+                    # D4: skip the O rescale on tiles where no owned row's running
+                    # max advances (corr == 1, identity multiply).  Predicate is
+                    # reduced across the full 64-lane wave so scf.if is uniform.
+                    rm_delta = _fsub(row_max[0], m_run[0])
+                    for r in range_constexpr(4):
+                        if const_expr(r > 0):
+                            rm_delta = _fmax(rm_delta, _fsub(row_max[r], m_run[r]))
+                    for xor_off in [32, 16, 8, 4, 2, 1]:
+                        rm_delta = _fmax(
+                            rm_delta,
+                            fx.Float32(rm_delta).shuffle_xor(
+                                fx.Int32(xor_off), fx.Int32(WARP_SIZE)
+                            ),
                         )
+                    should_scale = arith.cmpf(
+                        arith.CmpFPredicate.OGT, _raw(rm_delta), _raw(fx.Float32(0.0))
                     )
+                    o_raw = [_raw(o_acc[d]) for d in range_constexpr(D_BLKS)]
+                    if_op = _scf.IfOp(
+                        _raw(should_scale),
+                        [v.type for v in o_raw],
+                        has_else=True,
+                        loc=ir.Location.unknown(),
+                    )
+                    with ir.InsertionPoint(if_op.regions[0].blocks[0]):
+                        scaled_raw = []
+                        for d in range_constexpr(D_BLKS):
+                            ov = Vec(o_acc[d])
+                            scaled_raw.append(
+                                _raw(Vec.from_elements(
+                                    [_fmul(ov[r], corr[r]) for r in range_constexpr(4)],
+                                    fx.Float32,
+                                ))
+                            )
+                        _scf.YieldOp(scaled_raw)
+                    if len(if_op.regions[1].blocks) == 0:
+                        if_op.regions[1].blocks.append(*[])
+                    with ir.InsertionPoint(if_op.regions[1].blocks[0]):
+                        _scf.YieldOp(o_raw)
+                    new_o = [Vec(r) for r in if_op.results]
+                else:
+                    new_o = []
+                    for d in range_constexpr(D_BLKS):
+                        ov = Vec(o_acc[d])
+                        new_o.append(
+                            Vec.from_elements(
+                                [_fmul(ov[r], corr[r]) for r in range_constexpr(4)], fx.Float32
+                            )
+                        )
 
                 # === stage P (f32) -> LDS, transposed [head_row][key] =====
                 for nb in range_constexpr(N_BLKS_S):
