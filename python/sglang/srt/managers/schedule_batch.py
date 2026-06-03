@@ -2809,3 +2809,8 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # System concurrency at dispatch time (== scheduler #running-req). Stamped by
+    # the scheduler in run_batch; used for concurrency-aware kernel dispatch
+    # (e.g. DeepSeek-V4 FlyDSL prefill routing). None when not stamped.
+    num_running_reqs: Optional[int] = None

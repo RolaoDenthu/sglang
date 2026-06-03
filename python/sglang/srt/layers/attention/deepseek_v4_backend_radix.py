@@ -87,6 +87,23 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 logger = logging.getLogger(__name__)
 
 
+# Concurrency-aware FlyDSL prefill dispatch threshold (== scheduler #running-req).
+#
+# The FlyDSL fused dual-scope prefill kernel wins big at low concurrency
+# (warm TTFT vs the FlashMLA/Triton baseline: c=4/8/16 -> -70.7%/-84.9%/-80.1%),
+# but loses once the GPU is saturated: at c=32 it is ~+3.1% slower because it is
+# at its latency floor (occupancy-1, 1 CTA/CU, ~100KB LDS, ~930 ktok/s) and
+# FlashMLA's batched-GEMM path overtakes it. The empirical crossover sits between
+# c=16 (FlyDSL wins) and c=32 (FlyDSL loses), so the default 20 lands in that
+# window. Route FlyDSL only when #running-req is at/below this value; above it,
+# bypass to the baseline FlashMLA/Triton path (identical to SGLANG_FLYDSL_PREFILL=0,
+# per-batch). Override via env only for benchmark threshold sweeps; default to the
+# constant otherwise.
+FLYDSL_PREFILL_MAX_RUNNING_REQS: int = int(
+    os.environ.get("SGLANG_FLYDSL_PREFILL_MAX_RUNNING_REQS", "20")
+)
+
+
 def _copy_metadata(
     src,
     dst,
@@ -1113,9 +1130,25 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             # fallback: any failure (import or runtime) is logged with full
             # traceback and re-raised so the server crashes immediately (strict
             # mode) rather than silently degrading to the baseline.
+            #
+            # Concurrency-aware dispatch: FlyDSL only wins at low concurrency, so
+            # route to it only when the system's running-request count is at/below
+            # FLYDSL_PREFILL_MAX_RUNNING_REQS; above that, bypass this block and let
+            # control fall through to the baseline FlashMLA/Triton path below. This
+            # bypass is an INTENTIONAL dispatch decision (best-of-both), NOT an error
+            # fallback — genuine FlyDSL failures still re-raise in strict mode. When
+            # the running-req signal is unavailable (None: warmup / non-stamped
+            # paths), default to FlyDSL to preserve the SGLANG_FLYDSL_PREFILL=1
+            # behavior.
+            _num_running_reqs = forward_batch.num_running_reqs
+            _flydsl_low_concurrency = (
+                _num_running_reqs is None
+                or _num_running_reqs <= FLYDSL_PREFILL_MAX_RUNNING_REQS
+            )
             if (
                 os.environ.get("SGLANG_FLYDSL_PREFILL", "1") != "0"
                 and forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True)
+                and _flydsl_low_concurrency
             ):
                 try:
                     from sglang.srt.layers.attention.nsa.flydsl_dual_scope_prefill import (

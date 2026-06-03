@@ -440,6 +440,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # System concurrency at dispatch time (== scheduler #running-req), stamped by
+    # the scheduler. Used for concurrency-aware kernel dispatch (e.g. DeepSeek-V4
+    # FlyDSL prefill routing). None when unavailable (e.g. warmup / spec paths).
+    num_running_reqs: Optional[int] = None
+
     @classmethod
     def init_new(
         cls,
@@ -490,6 +495,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             rids=[req.rid for req in batch.reqs],
+            num_running_reqs=batch.num_running_reqs,
         )
         device = model_runner.device
 

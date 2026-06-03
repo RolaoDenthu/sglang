@@ -2966,6 +2966,11 @@ class Scheduler(
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
+                # Stamp current system concurrency (== #running-req) for
+                # concurrency-aware kernel dispatch (e.g. DeepSeek-V4 FlyDSL
+                # prefill routing). Cheap, low-blast-radius: only consumers that
+                # read num_running_reqs are affected.
+                worker_batch_or_batch.num_running_reqs = len(self.running_batch.reqs)
             else:
                 # In speculative decoding v1 (non-overlap) case, we use the batch directly.
                 # TODO(lsyin): delete this branch after unifying the abstraction.
