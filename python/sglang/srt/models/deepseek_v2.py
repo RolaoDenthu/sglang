@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -291,7 +292,7 @@ class DeepseekV2MLP(nn.Module):
         cached = getattr(self, "_fuse_act_quant_cache", None)
         if cached is None:
             cached = bool(
-                envs.SGLANG_OPT_FUSE_MLP_ACT_QUANT.get()
+                os.environ.get("SGLANG_FLYDSL_PREFILL", "1") != "0"
                 and can_fuse_act_quant_into_block_fp8_linear(self.down_proj)
             )
             self._fuse_act_quant_cache = cached
