@@ -97,6 +97,56 @@ if _use_aiter:
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
+    try:
+        from aiter import silu_and_mul_quant as _aiter_silu_and_mul_quant
+    except ImportError:
+        _aiter_silu_and_mul_quant = None
+else:
+    _aiter_silu_and_mul_quant = None
+
+
+def aiter_fused_silu_mul_per1x128_quant(
+    gate_up: torch.Tensor,
+    group_size: int = 128,
+    limit: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused SiLU-and-mul + per-1x128 fp8 activation quant.
+
+    Emits the fp8 q_input and row-major per-1x128 x_scale directly, matching the
+    layout produced by ``aiter_per1x128_quant(..., transpose_scale=False)`` so the
+    result can be handed to ``aiter_w8a8_block_fp8_linear`` as a prequantized
+    (input, input_scale) pair, skipping the standalone activation quant + the HBM
+    round-trip of the [tokens, intermediate] bf16 activation.
+    """
+    input_2d = gate_up.view(-1, gate_up.shape[-1])
+    m = input_2d.shape[0]
+    inter = input_2d.shape[-1] // 2
+    q_input = torch.empty((m, inter), dtype=aiter.dtypes.fp8, device=gate_up.device)
+    x_scale = torch.empty(
+        (m, inter // group_size), dtype=torch.float32, device=gate_up.device
+    )
+    # shuffle_scale=False -> row-major scale; the linear applies the bpreshuffle
+    # transpose itself when needed (see aiter_w8a8_block_fp8_linear).
+    _aiter_silu_and_mul_quant(q_input, input_2d, x_scale, group_size, limit, False)
+    return q_input, x_scale
+
+
+def can_fuse_act_quant_into_block_fp8_linear(linear) -> bool:
+    """True iff ``linear`` runs activations through aiter block-fp8 per-1x128 quant,
+    so a prequantized (q_input, x_scale) input takes its fast path."""
+    if not _use_aiter or _aiter_silu_and_mul_quant is None:
+        return False
+    qm = getattr(linear, "quant_method", None)
+    if qm is None:
+        return False
+    if not getattr(qm, "block_quant", False) or getattr(qm, "use_mxfp8", False):
+        return False
+    block_size = getattr(qm, "quant_config", None)
+    block_size = getattr(block_size, "weight_block_size", None)
+    if not block_size or block_size[1] != 128:
+        return False
+    return getattr(qm, "w8a8_block_fp8_linear", None) is aiter_w8a8_block_fp8_linear
+
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm

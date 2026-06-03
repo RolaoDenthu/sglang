@@ -169,8 +169,10 @@ if _use_aiter_gfx95:
         get_dsv3_gemm_output_zero_allocator_size,
     )
 
-if _use_aiter:
-    pass
+from sglang.srt.layers.quantization.fp8_utils import (
+    aiter_fused_silu_mul_per1x128_quant,
+    can_fuse_act_quant_into_block_fp8_linear,
+)
 
 if _is_cuda:
     from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
@@ -265,15 +267,35 @@ class DeepseekV2MLP(nn.Module):
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
-        if self.swiglu_limit:
-            x = self.act_fn(gate_up, limit=self.swiglu_limit)
+        if self._can_fuse_act_quant() and gate_up.shape[0] > 0:
+            # Fused SiLU-and-mul + per-1x128 fp8 quant: emit the prequantized
+            # activation directly so down_proj skips the standalone quant and the
+            # HBM round-trip of the [tokens, intermediate] bf16 activation.
+            q_input, x_scale = aiter_fused_silu_mul_per1x128_quant(
+                gate_up,
+                group_size=128,
+                limit=self.swiglu_limit if self.swiglu_limit else 0.0,
+            )
+            down_in = (q_input, x_scale)
+        elif self.swiglu_limit:
+            down_in = self.act_fn(gate_up, limit=self.swiglu_limit)
         else:
-            x = self.act_fn(gate_up)
+            down_in = self.act_fn(gate_up)
         x, _ = self.down_proj(
-            x,
+            down_in,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
         return x
+
+    def _can_fuse_act_quant(self) -> bool:
+        cached = getattr(self, "_fuse_act_quant_cache", None)
+        if cached is None:
+            cached = bool(
+                envs.SGLANG_OPT_FUSE_MLP_ACT_QUANT.get()
+                and can_fuse_act_quant_into_block_fp8_linear(self.down_proj)
+            )
+            self._fuse_act_quant_cache = cached
+        return cached
 
 
 class MoEGate(nn.Module):
