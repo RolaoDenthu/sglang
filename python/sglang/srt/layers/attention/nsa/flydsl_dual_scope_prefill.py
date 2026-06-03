@@ -131,6 +131,36 @@ _LOG2E: float = 1.4426950408889634
 # the tests/oracle path only, not as a runtime fallback.
 _USE_FLYDSL_KERNEL: bool = True
 
+# ----------------------------------------------------------------------------
+# Host-prep buffer cache.  The launcher feeds the kernel several CONSTANT dummy
+# tensors when an optional input is absent (all-(-1) extra indices, full-length
+# topk_length, zero attn_sink).  These are read-only kernel inputs whose content
+# depends only on (shape, fill-value, dtype, device), so we cache and reuse them
+# across calls instead of rebuilding with ``torch.full`` / ``torch.zeros`` every
+# prefill call.  Reuse is launch-order-safe: all launches share one CUDA stream,
+# so a reused buffer's reads are serialized after the prior launch that read it.
+# ----------------------------------------------------------------------------
+_DUMMY_CACHE: dict = {}
+
+
+def _cached_full(shape, fill_value, dtype, device) -> torch.Tensor:
+    key = (shape, int(fill_value), dtype, str(device))
+    t = _DUMMY_CACHE.get(key)
+    if t is None:
+        t = torch.full(shape, fill_value, dtype=dtype, device=device)
+        _DUMMY_CACHE[key] = t
+    return t
+
+
+def _cached_zeros(shape, dtype, device) -> torch.Tensor:
+    key = ("zeros", shape, dtype, str(device))
+    t = _DUMMY_CACHE.get(key)
+    if t is None:
+        t = torch.zeros(shape, dtype=dtype, device=device)
+        _DUMMY_CACHE[key] = t
+    return t
+
+
 # C128 / low-topk routing: the C128 regime is a TINY 192-key problem
 # (topk_main=128 + topk_extra=64, bs_main=256, bs_extra=2, H=128, head_dim=512).
 # An earlier gsm8k-only autotune (8-shot/200q) had picked the BASE kernel for
@@ -2454,19 +2484,28 @@ def _flydsl_dual_scope_kernel_impl(
         # tiles mask out to zero contribution (matches the reference, which
         # skips the extra scope entirely).
         topk_extra = topk_main
-        extra_idx = torch.full((T_tok, topk_extra), -1, dtype=torch.int32, device=device)
+        # Constant all-(-1) dummy; cached/reused across calls (read-only input).
+        extra_idx = _cached_full((T_tok, topk_extra), -1, torch.int32, device)
         extra_u8 = swa_u8
         bs_extra = bs_main
 
     # --- per-token topk_length (dummy full-length when absent) ----------
     if swa_topk_length is not None:
-        topklen_main = swa_topk_length.to(torch.int32).contiguous()
+        topklen_main = (
+            swa_topk_length
+            if swa_topk_length.dtype == torch.int32 and swa_topk_length.is_contiguous()
+            else swa_topk_length.to(torch.int32).contiguous()
+        )
     else:
-        topklen_main = torch.full((T_tok,), topk_main, dtype=torch.int32, device=device)
+        topklen_main = _cached_full((T_tok,), topk_main, torch.int32, device)
     if has_extra and extra_topk_length is not None:
-        topklen_extra = extra_topk_length.to(torch.int32).contiguous()
+        topklen_extra = (
+            extra_topk_length
+            if extra_topk_length.dtype == torch.int32 and extra_topk_length.is_contiguous()
+            else extra_topk_length.to(torch.int32).contiguous()
+        )
     else:
-        topklen_extra = torch.full((T_tok,), topk_extra, dtype=torch.int32, device=device)
+        topklen_extra = _cached_full((T_tok,), topk_extra, torch.int32, device)
 
     # --- attn_sink (padded/dummy to h_q_pad) ----------------------------
     if attn_sink is not None:
@@ -2476,14 +2515,26 @@ def _flydsl_dual_scope_kernel_impl(
                 [sink, torch.zeros(h_q_pad - sink.shape[0], dtype=torch.float32, device=device)]
             )
     else:
-        sink = torch.zeros(h_q_pad, dtype=torch.float32, device=device)
+        # Constant zero sink; cached/reused across calls (read-only input).
+        sink = _cached_zeros((h_q_pad,), torch.float32, device)
 
-    # Q padded to h_q_pad heads (kernel computes a full BLOCK_H tile; extra
-    # heads are discarded by the [:, :H] slice on return).
-    q_pad = torch.zeros((T_tok, h_q_pad, D_QK), dtype=torch.bfloat16, device=device)
-    q_pad[:, :H] = q3.to(torch.bfloat16)
+    # Q heads.  FAST PATH (h_q_pad == H, the production C4/C128 case at H=128):
+    # no head padding is required, so feed q3 straight through (bf16 +
+    # contiguous, already ensured by _normalize_q) and skip the ~1GB
+    # zeros-alloc + masked copy entirely.  When padding IS needed, allocate
+    # UNINITIALIZED (torch.empty) and copy only the real heads: attention is
+    # per-head independent and the padding heads are sliced off the output, so
+    # their garbage Q never reaches a returned value.
+    if h_q_pad == H:
+        q_pad = q3 if q3.dtype == torch.bfloat16 else q3.to(torch.bfloat16)
+    else:
+        q_pad = torch.empty((T_tok, h_q_pad, D_QK), dtype=torch.bfloat16, device=device)
+        q_pad[:, :H] = q3.to(torch.bfloat16)
 
-    out = torch.zeros((T_tok, h_q_pad, head_dim_v), dtype=torch.bfloat16, device=device)
+    # Output tile: the kernel writes the full [T, h_q_pad, head_dim_v] tile
+    # (including explicit zero rows for lonely queries), so zeroing the buffer
+    # first is wasteful -- allocate uninitialized.
+    out = torch.empty((T_tok, h_q_pad, head_dim_v), dtype=torch.bfloat16, device=device)
 
     # Dispatch on compress_ratio: compress_ratio==4 -> the specialized C4 /
     # high-topk kernel (BLOCK_H=128/BLOCK_N=64, 4 waves); compress_ratio==128 ->
@@ -2548,7 +2599,9 @@ def _flydsl_dual_scope_kernel_impl(
     )
     if _FLYDSL_TIMING:
         _ev_k1.record()
-    result = out[:, :H].contiguous()
+    # When no head padding was applied, ``out`` is already [T, H, head_dim_v]
+    # and contiguous -- return it directly and skip the ~1GB slice + copy.
+    result = out if h_q_pad == H else out[:, :H].contiguous()
     if _FLYDSL_TIMING:
         _ev_end.record()
         torch.cuda.synchronize()
