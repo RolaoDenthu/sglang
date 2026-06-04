@@ -278,6 +278,17 @@ def _c4_plan():
 
 _C4_PLAN = _c4_plan()
 
+# High-concurrency routing for C4 kernel: when T_tok >= this threshold, use
+# BLOCK_H=64 (2 CTAs/token, occupancy=2, LDS=80KB) instead of BLOCK_H=128
+# (1 CTA/token, occupancy=1, LDS=96KB).  At high T, SM is already full from
+# the token dimension, so trading 1 CTA/token for occupancy=2 hides barrier
+# stalls behind a second resident CTA.  Tune via SGLANG_C4_HIGH_CONC_THRESH.
+_C4_HIGH_CONC_THRESH: int = int(
+    _os_ldspad.environ.get("SGLANG_C4_HIGH_CONC_THRESH", "").strip() or "256"
+)
+# BLOCK_H=64 tiling for high-concurrency C4: (block_h, block_n, n_waves, waves_per_eu)
+_C4_HIGH_CONC_PLAN: tuple = (64, 64, 4, 2)
+
 # LDS bank-conflict padding (per-row stride pad, in elements) for the C4/C128
 # dual-scope kernels.  The lds_kv ([key][dim] bf16) and lds_p ([head_row][key]
 # f32) strides must avoid being multiples of the 32 LDS banks; these pads are
@@ -2436,10 +2447,15 @@ def _flydsl_dual_scope_kernel_impl(
     # exactly like real padding); h_q is padded to a multiple of block_h.
     ratio = int(compress_ratio)
     use_c4 = ratio == 4
-    # C4 routing: _C4_PLAN is (block_h, block_n, n_waves, waves_per_eu) for the
-    # parameterized BLOCK_N=32 occupancy-2 path, or None (legacy fixed BLOCK_N=64
-    # _build_dual_scope_kernel_c4).
-    c4_plan = _C4_PLAN if use_c4 else None
+    # C4 routing: at high T_tok (high concurrency), use BLOCK_H=64 (occupancy=2)
+    # instead of BLOCK_H=128 (occupancy=1) to hide barrier stalls behind a second
+    # resident CTA.  _C4_PLAN overrides this when set (autotuning / A/B).
+    use_c4_high_conc = use_c4 and T_tok >= _C4_HIGH_CONC_THRESH and _C4_PLAN is None
+    c4_plan = (
+        _C4_HIGH_CONC_PLAN if use_c4_high_conc
+        else _C4_PLAN if use_c4
+        else None
+    )
     use_c4_param = use_c4 and c4_plan is not None  # None -> legacy fixed C4
     c128_plan = _C128_PLAN if ratio == 128 else None
     use_c128 = ratio == 128 and c128_plan is not None  # None -> route to base
