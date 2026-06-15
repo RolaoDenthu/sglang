@@ -936,6 +936,15 @@ class MQALayer(nn.Module):
             is_unified_kv_triton,
         )
 
+        # Inverse-RoPE on the attention output is fused into the unified_kv
+        # decode reduce kernel on HIP (replacing the standalone
+        # apply_rotary_emb_triton below). Only decode goes through runtime.decode;
+        # extend/prefill still need the standalone call.
+        rope_fused = (
+            _is_hip
+            and is_unified_kv_triton()
+            and forward_batch.forward_mode.is_decode_or_idle()
+        )
         if is_unified_kv_triton():
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
@@ -946,6 +955,7 @@ class MQALayer(nn.Module):
                 compress_ratio=self.compress_ratio,
                 attn_sink=self.attn_sink,
                 save_kv_cache=kv is not None,
+                rope_freqs_cis=self.freqs_cis if rope_fused else None,
             )
         else:
             attn_q = q_padded if q_padded is not None else q
@@ -975,13 +985,14 @@ class MQALayer(nn.Module):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
-        fused_rope_inplace(
-            o[..., -self.qk_rope_head_dim :],
-            None,
-            self.freqs_cis,
-            positions=positions,
-            inverse=True,
-        )
+        if not rope_fused:
+            fused_rope_inplace(
+                o[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+                inverse=True,
+            )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
 

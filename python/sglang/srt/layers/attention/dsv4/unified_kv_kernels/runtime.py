@@ -126,9 +126,18 @@ def decode(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
+    rope_freqs_cis: Optional[torch.Tensor] = None,
+    rope_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_decode(
-        q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
+        q,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        softmax_scale,
+        rope_freqs_cis=rope_freqs_cis,
+        rope_positions=rope_positions,
     )
 
 

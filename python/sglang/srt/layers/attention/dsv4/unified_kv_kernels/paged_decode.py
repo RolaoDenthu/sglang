@@ -481,6 +481,8 @@ def _paged_decode_reduce_kernel(
     attn_sink_ptr,  # [H]
     kv_indptr_ptr,  # [N+1] int32
     out_ptr,  # [N, H, D]
+    freqs_ptr,  # [max_pos, ROPE_DIM] fp32 interleaved (real,imag,...) or dummy
+    positions_ptr,  # [N] int — absolute position per token, or dummy
     mp_stride_t,
     mp_stride_k,
     mp_stride_h,
@@ -494,6 +496,7 @@ def _paged_decode_reduce_kernel(
     out_stride_t,
     out_stride_h,
     out_stride_d,
+    freq_stride_pos,
     log2e,  # = LOG2E, used to convert natural-log sink → log2 domain
     H: tl.constexpr,
     D: tl.constexpr,
@@ -501,6 +504,8 @@ def _paged_decode_reduce_kernel(
     BLOCK_D: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,  # fuse inverse-RoPE on the last ROPE_DIM of D
+    ROPE_DIM: tl.constexpr,  # rope segment length (interleaved complex pairs)
 ):
     """2D-tile reduce: combine KV_SPLITS partials, fold attn_sink, write
     final output. Grid: ``(T, H, ceil(D / D_CHUNK))`` — one CTA owns one
@@ -607,6 +612,32 @@ def _paged_decode_reduce_kernel(
     acc_final = acc_combined * alpha_kv
     out = tl.where(l_final > 0.0, acc_final / denom, 0.0)
 
+    # Fused inverse-RoPE epilogue. Equivalent to the standalone
+    # `apply_rotary_emb_triton(o[..., -ROPE_DIM:], inverse=True)` that ran as a
+    # separate kernel between attention and O-projection. Applied here while the
+    # final `out` is still in registers — saves one launch + one global rt of o.
+    # Reshape the whole D_CHUNK tile into interleaved (real, imag) pairs; pairs
+    # outside the rope segment load identity freqs (1, 0) so rotation is a no-op.
+    if APPLY_ROPE:
+        pos = tl.load(positions_ptr + t)
+        p = tl.arange(0, D_CHUNK // 2)
+        # rope-local index of each pair's real element (even); pair is in the
+        # rope segment iff this index lands in [0, ROPE_DIM).
+        rl = (dc * D_CHUNK + 2 * p) - (D - ROPE_DIM)
+        in_rope = (rl >= 0) & (rl < ROPE_DIM)
+        rl_safe = tl.where(in_rope, rl, 0)
+        x_real, x_imag = tl.split(tl.reshape(out, (D_CHUNK // 2, 2)))
+        fr = tl.load(
+            freqs_ptr + pos * freq_stride_pos + rl_safe, mask=in_rope, other=1.0
+        )
+        fi = tl.load(
+            freqs_ptr + pos * freq_stride_pos + rl_safe + 1, mask=in_rope, other=0.0
+        )
+        # inverse rotation: conjugate of the forward complex multiply
+        o_real = x_real * fr + x_imag * fi
+        o_imag = x_imag * fr - x_real * fi
+        out = tl.reshape(tl.join(o_real, o_imag), (D_CHUNK,))
+
     tl.store(
         out_ptr + t * out_stride_t + h * out_stride_h + d_offs * out_stride_d,
         out.to(out_ptr.dtype.element_ty),
@@ -630,6 +661,8 @@ def _sparse_attn_v4_paged_decode_triton(
     block_h: int | None = None,
     kv_splits: int | None = None,
     block_k: int | None = None,
+    rope_freqs_cis: torch.Tensor | None = None,
+    rope_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
@@ -639,6 +672,15 @@ def _sparse_attn_v4_paged_decode_triton(
     ``kv_scales`` must be ``[total_pages, D // GROUP_SIZE]`` fp32 — 1xGROUP_SIZE
     block-scale quantization. Dequant happens in-kernel; the dot still runs
     in q.dtype.
+
+    When ``rope_freqs_cis`` (complex64 table) and ``rope_positions`` are both
+    supplied, an inverse-RoPE is applied to the last ``2 * rope_freqs_cis``
+    ``.shape[-1]`` dims of each head, replacing the caller's standalone
+    ``apply_rotary_emb_triton(..., inverse=True)`` kernel. On the split-K
+    (reduce) path it is fused into the reduce epilogue; on the kv_splits==1
+    fused path it falls back to the standalone kernel internally. Either way
+    the returned tensor already has RoPE applied — the caller must NOT apply it
+    again.
     """
     if not q.is_cuda:
         raise RuntimeError(
@@ -679,6 +721,24 @@ def _sparse_attn_v4_paged_decode_triton(
 
     T, H, D = q.shape
     out = torch.empty_like(q)
+
+    apply_rope = rope_freqs_cis is not None and rope_positions is not None
+    if apply_rope:
+        # complex64 [max_pos, rope_dim//2] -> fp32 [max_pos, rope_dim]
+        # interleaved (real, imag, real, imag, ...), matching the kernel's
+        # paired layout and apply_rotary_emb_triton's own view_as_real.
+        rope_freqs_real = torch.view_as_real(rope_freqs_cis).flatten(-2)
+        rope_dim = rope_freqs_real.shape[-1]
+        assert rope_dim % 2 == 0 and rope_dim <= D
+        assert rope_freqs_real.stride(-1) == 1
+        freq_stride_pos = rope_freqs_real.stride(0)
+        freqs_arg = rope_freqs_real
+        positions_arg = rope_positions
+    else:
+        rope_dim = 0
+        freq_stride_pos = 0
+        freqs_arg = q.new_empty(1, dtype=torch.float32)
+        positions_arg = q.new_empty(1, dtype=torch.int32)
 
     if block_h is None:
         block_h = triton.next_power_of_2(min(H, 64))
@@ -751,6 +811,17 @@ def _sparse_attn_v4_paged_decode_triton(
             num_warps=num_warps,
             num_stages=num_stages,
         )
+        if apply_rope:
+            # Fused kernel has no reduce epilogue to hook; apply the standalone
+            # inverse-RoPE so the contract (output already roped) still holds.
+            from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+            apply_rotary_emb_triton(
+                out[..., -rope_dim:],
+                rope_freqs_cis,
+                positions=rope_positions,
+                inverse=True,
+            )
         return out
 
     # Split-K path: split kernel writes (m, l, acc) partials in log2 domain;
@@ -831,6 +902,8 @@ def _sparse_attn_v4_paged_decode_triton(
         attn_sink,
         kv_indptr,
         out,
+        freqs_arg,
+        positions_arg,
         m_partial.stride(0),
         m_partial.stride(1),
         m_partial.stride(2),
@@ -844,6 +917,7 @@ def _sparse_attn_v4_paged_decode_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        freq_stride_pos,
         LOG2E,
         H,
         D,
@@ -851,6 +925,8 @@ def _sparse_attn_v4_paged_decode_triton(
         BLOCK_D=block_d,
         D_CHUNK=d_chunk,
         BLOCK_K=block_k,
+        APPLY_ROPE=apply_rope,
+        ROPE_DIM=rope_dim,
         num_warps=4,
     )
     return out
@@ -864,11 +940,17 @@ def sparse_attn_v4_paged_decode(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
+    rope_freqs_cis: torch.Tensor | None = None,
+    rope_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
+
+    When ``rope_freqs_cis`` and ``rope_positions`` are supplied, the returned
+    output already has inverse-RoPE applied to its last ``rope_dim`` dims (fused
+    into the reduce epilogue on the split-K path).
     """
     return _sparse_attn_v4_paged_decode_triton(
         q,
@@ -878,4 +960,6 @@ def sparse_attn_v4_paged_decode(
         attn_sink,
         softmax_scale,
         kv_scales=kv_scales,
+        rope_freqs_cis=rope_freqs_cis,
+        rope_positions=rope_positions,
     )
