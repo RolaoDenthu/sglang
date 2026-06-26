@@ -1,4 +1,18 @@
 # Usage (to build SGLang ROCm docker image):
+#
+#   gfx1250 (MI450 A0) — nightlies, device-all, ROCm 7.14.0a20260623:
+#   cd /home/kithumma/warroom-test-gfx1250/sglang
+#   docker build \
+#     --build-arg GPU_ARCH=gfx1250-rocm7_14 \
+#     --build-arg GPU_ARCH_LIST_ARG=gfx1250 \
+#     --build-arg ROCM_VERSION=7.14.0a20260623 \
+#     --build-arg INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/ \
+#     --build-arg TORCH_VERSION=2.11.0 \
+#     --build-arg TORCHVISION_VERSION=0.26.0 \
+#     --build-arg TRITON_VERSION=3.7.0+gitb4e20bbe \
+#     -t rocm/ufb-private:sglang-latest-gfx1250-rocm7.14.0a20260623-full \
+#     -f docker/rocm.Dockerfile .
+#
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm7_14 -t v0.5.10.post1-rocm714-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx1250-rocm7_14 -t v0.5.10.post1-rocm714-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
