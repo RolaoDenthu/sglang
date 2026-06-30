@@ -548,8 +548,6 @@ class C4IndexerBackendMixin:
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
-        # The pure-torch fp8_paged_mqa_logits_torch fn expects 1D seq_lens
-        # (shape == (batch_size,)); only the deep_gemm fn needs the 2D form.
         _use_torch_fn = (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer
         )

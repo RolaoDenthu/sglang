@@ -78,7 +78,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
-    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_sm90_supported,
@@ -91,23 +90,14 @@ _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
-_is_gfx1250_supported = is_gfx1250_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 if _use_aiter:
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
+    from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
+    from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
 
-    if _is_gfx1250_supported:
-        from aiter.ops.triton.normalization.rmsnorm import (
-            rmsnorm2d_fwd_with_add_dynamicquant as _aiter_add_rmsnorm_quant_triton,
-        )
-        from aiter.ops.triton.normalization.rmsnorm import (
-            rmsnorm2d_fwd_with_dynamicquant as _aiter_rmsnorm_quant_triton,
-        )
-    else:
-        from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
-        from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
+    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
 
     if _is_gfx95_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -142,46 +132,26 @@ def _fused_rmsnorm_fp8_per_token_quant(
     scale = torch.empty(M, dtype=torch.float32, device=hidden_states.device)
     if residual is not None:
         residual_out = torch.empty_like(hidden_states)
-        if _is_gfx1250_supported:
-            _aiter_add_rmsnorm_quant_triton(
-                out_fp8,
-                hidden_states,
-                residual,
-                residual_out,
-                scale,
-                weight,
-                epsilon,
-            )
-        else:
-            _aiter_add_rmsnorm_quant(
-                out_fp8,
-                hidden_states,
-                residual,
-                residual_out,
-                scale,
-                weight,
-                epsilon,
-                0,  # group_size=0 → per-token
-            )
+        _aiter_add_rmsnorm_quant(
+            out_fp8,
+            hidden_states,
+            residual,
+            residual_out,
+            scale,
+            weight,
+            epsilon,
+            0,  # group_size=0 → per-token
+        )
         return (out_fp8, scale.unsqueeze(1)), residual_out
     else:
-        if _is_gfx1250_supported:
-            _aiter_rmsnorm_quant_triton(
-                out_fp8,
-                hidden_states,
-                scale,
-                weight,
-                epsilon,
-            )
-        else:
-            _aiter_rmsnorm_quant(
-                out_fp8,
-                hidden_states,
-                scale,
-                weight,
-                epsilon,
-                0,  # group_size=0 → per-token
-            )
+        _aiter_rmsnorm_quant(
+            out_fp8,
+            hidden_states,
+            scale,
+            weight,
+            epsilon,
+            0,  # group_size=0 → per-token
+        )
         return (out_fp8, scale.unsqueeze(1))
 
 

@@ -10,17 +10,10 @@
 #include <cfloat>
 #include <cstdint>
 
-#if defined(__HIP_PLATFORM_AMD__)
-#include <hip/hip_version.h>
-#endif
-
-// ROCm 7.x headers require the __shfl_*_sync mask to be a 64-bit integer
-// (static_assert sizeof(MaskT) == 8); a 32-bit literal fails to compile. The
-// header internally adjusts the mask for wave32, so a 64-bit mask is correct
-// on all wave sizes. Gate on HIP_VERSION (defined in both the host and device
-// compile passes) rather than an arch macro like __gfx1250__, which is only
-// defined in the device pass and would still fail the host-pass instantiation.
-#if defined(__HIP_PLATFORM_AMD__) && defined(HIP_VERSION) && HIP_VERSION >= 70000000
+// gfx1250 needs a 64-bit __shfl_*_sync mask (static_assert sizeof == 8); it's
+// masked to wave32 internally, so 64-bit is fine everywhere. __gfx1250__ is
+// device-pass only, so widen in the host pass too or the launch stub won't build.
+#if defined(__gfx1250__) || (defined(__HIP_PLATFORM_AMD__) && !defined(__HIP_DEVICE_COMPILE__))
 #define SGL_WARP_SYNC_MASK 0xFFFFFFFFFFFFFFFFULL
 #else
 #define SGL_WARP_SYNC_MASK 0xFFFFFFFF
