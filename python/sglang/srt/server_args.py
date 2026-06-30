@@ -3378,6 +3378,11 @@ class ServerArgs:
                 )
             )
 
+        # Track whether the user explicitly provided mem_fraction_static. When
+        # set explicitly, later backend-specific heuristics (e.g. the aiter
+        # reduction) must not silently override the user's value.
+        self._mem_fraction_static_set_by_user = self.mem_fraction_static is not None
+
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
             reserved_mem = 512
@@ -4784,7 +4789,24 @@ class ServerArgs:
         # AMD platforms backends
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.85
+                # The aiter backend reserves extra non-static workspace for long
+                # contexts. This 0.85 factor is only a heuristic for the
+                # auto-derived default; if the user explicitly set
+                # mem_fraction_static, honor it instead of silently shrinking it
+                # (which can push the static budget below the model-weight
+                # footprint on near-full GPUs and break KV-cache allocation).
+                if getattr(self, "_mem_fraction_static_set_by_user", False):
+                    logger.warning(
+                        "attention_backend=aiter with context_len=%d (>8192) "
+                        "normally scales mem_fraction_static by 0.85, but "
+                        "mem_fraction_static=%.3f was set explicitly and will be "
+                        "used as-is. Ensure enough non-static memory is left for "
+                        "attention workspace and CUDA graphs.",
+                        model_config.context_len,
+                        self.mem_fraction_static,
+                    )
+                else:
+                    self.mem_fraction_static *= 0.85
 
         # Other platforms backends
         if (
