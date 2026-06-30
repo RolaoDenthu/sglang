@@ -10,6 +10,15 @@
 #include <cfloat>
 #include <cstdint>
 
+// gfx1250 (RDNA4) is wave32, but its ROCm header requires the __shfl_*_sync
+// mask to be a 64-bit integer; a 32-bit literal trips a static_assert. Other
+// architectures keep the existing 32-bit mask unchanged.
+#if defined(__gfx1250__)
+#define SGL_WARP_SYNC_MASK 0xFFFFFFFFFFFFFFFFULL
+#else
+#define SGL_WARP_SYNC_MASK 0xFFFFFFFF
+#endif
+
 namespace {
 
 constexpr uint32_t kWarpSize = 32;
@@ -100,8 +109,8 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
 
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
-      float other_val = __shfl_down_sync(0xFFFFFFFF, warp_max_val, offset);
-      int other_expert = __shfl_down_sync(0xFFFFFFFF, warp_max_expert, offset);
+      float other_val = __shfl_down_sync(SGL_WARP_SYNC_MASK, warp_max_val, offset);
+      int other_expert = __shfl_down_sync(SGL_WARP_SYNC_MASK, warp_max_expert, offset);
       if (other_val > warp_max_val) {
         warp_max_val = other_val;
         warp_max_expert = other_expert;
@@ -121,8 +130,8 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
 
 #pragma unroll
       for (int offset = 16; offset > 0; offset /= 2) {
-        float other_val = __shfl_down_sync(0xFFFFFFFF, final_max, offset);
-        int other_expert = __shfl_down_sync(0xFFFFFFFF, final_expert, offset);
+        float other_val = __shfl_down_sync(SGL_WARP_SYNC_MASK, final_max, offset);
+        int other_expert = __shfl_down_sync(SGL_WARP_SYNC_MASK, final_expert, offset);
         if (other_val > final_max) {
           final_max = other_val;
           final_expert = other_expert;
@@ -215,8 +224,8 @@ __global__ void moe_fused_gate_kernel(const MoEFusedGateParams __grid_constant__
     }
 
     for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-      float other_val = __shfl_down_sync(0xFFFFFFFF, max_val, offset);
-      int other_expert = __shfl_down_sync(0xFFFFFFFF, max_expert, offset);
+      float other_val = __shfl_down_sync(SGL_WARP_SYNC_MASK, max_val, offset);
+      int other_expert = __shfl_down_sync(SGL_WARP_SYNC_MASK, max_expert, offset);
 
       if (other_val > max_val || (other_val == max_val && other_expert < max_expert)) {
         max_val = other_val;

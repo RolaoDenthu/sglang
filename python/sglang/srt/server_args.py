@@ -76,6 +76,7 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1250_supported,
     is_hip,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
@@ -3919,6 +3920,11 @@ class ServerArgs:
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+                if is_gfx1250_supported():
+                    envs.SGLANG_OPT_USE_AITER_MHC_PRE.set(False)
+                    envs.SGLANG_OPT_USE_AITER_MHC_POST.set(False)
+                    envs.SGLANG_OPT_USE_AITER_INDEXER.set(False)
+                    envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
