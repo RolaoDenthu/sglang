@@ -5,8 +5,11 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
+
+_is_gfx1250 = is_gfx1250_supported()
 
 _FUSED_HC_POST_PRE_M_THRESHOLD = 64
 _FUSED_HC_POST_PRE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
@@ -102,12 +105,15 @@ def try_fused_hc_post_pre(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
     global _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
 
+    over_m_threshold = (
+        not _is_gfx1250 and x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD
+    )
     if (
         _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
         or not envs.SGLANG_OPT_USE_TRITON_FUSED_MHC.get()
         or not is_gfx95_supported
         or x.shape[0] == 0
-        or x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD
+        or over_m_threshold
         or x.dim() != 2
         or residual.dim() != 3
     ):

@@ -9,6 +9,10 @@ export SGLANG_USE_ROCM700A=0
 export SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
 export AITER_BF16_FP8_MOE_BOUND=0
 
+# gfx1250 mHC runs the aiter triton fused mhc_post_pre (TileLang/CK do not
+# compile on RDNA4). Requires the fuse switch on; off => pure-torch fallback.
+export SGLANG_OPT_FUSE_MHC_POST_PRE=1
+
 set -x
 exec sglang serve \
     --model-path "${MODEL}" \
