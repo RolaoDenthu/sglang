@@ -105,9 +105,7 @@ def try_fused_hc_post_pre(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
     global _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
 
-    over_m_threshold = (
-        not _is_gfx1250 and x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD
-    )
+    over_m_threshold = not _is_gfx1250 and x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD
     if (
         _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
         or not envs.SGLANG_OPT_USE_TRITON_FUSED_MHC.get()
