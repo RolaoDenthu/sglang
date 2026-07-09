@@ -3925,7 +3925,7 @@ class ServerArgs:
                     envs.SGLANG_OPT_USE_AITER_MHC_PRE.set(False)
                     envs.SGLANG_OPT_USE_AITER_MHC_POST.set(False)
                     envs.SGLANG_OPT_USE_AITER_INDEXER.set(False)
-                    envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+                    envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(False)
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the

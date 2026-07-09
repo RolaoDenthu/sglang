@@ -32,7 +32,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_gfx1250_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -55,6 +55,7 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
 _arange_cache = {}
+_is_gfx1250 = is_gfx1250_supported()
 
 
 def fp8_paged_mqa_logits_torch(
@@ -228,6 +229,175 @@ def fp8_paged_mqa_logits_torch_sm120(
     invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
     logits.masked_fill_(invalid_mask, float("-inf"))
 
+    return logits
+
+
+@triton.jit
+def _fp8_paged_mqa_logits_kernel(
+    q_ptr,  # fp8  (batch, num_heads, head_dim)
+    kv_val_ptr,  # fp8  (num_pages, total_dim) value region
+    kv_scale_ptr,  # fp32 (num_pages, total_dim//4) scale region
+    weight_ptr,  # fp32 (batch, num_heads)
+    seq_lens_ptr,  # int32 (batch,)
+    page_table_ptr,  # int32 (batch, max_num_pages)
+    logits_ptr,  # fp32 (batch, max_seq_len)
+    stride_q_b,
+    stride_q_h,
+    stride_q_d,
+    stride_kv_page,
+    stride_ks_page,
+    stride_w_b,
+    stride_w_h,
+    stride_pt_b,
+    stride_pt_p,
+    stride_lg_b,
+    stride_lg_p,
+    max_seq_len,
+    num_heads,
+    SCALE_F32_OFFSET: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """One program == one (batch, page). BLOCK_P == block_size, so every program
+    covers exactly one page's worth of contiguous KV positions that share the
+    same page id, and the whole batch's query tile is loaded once and reused."""
+    b = tl.program_id(0)
+    page_pos = tl.program_id(1)
+
+    # gather the physical page id for this (batch, logical-page) slot; invalid
+    # (negative) entries are clamped to 0, matching the torch reference.
+    page_id = tl.load(page_table_ptr + b * stride_pt_b + page_pos * stride_pt_p)
+    page_id = tl.maximum(page_id, 0).to(tl.int64)
+
+    offs_t = tl.arange(0, BLOCK_P)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_h = tl.arange(0, BLOCK_H)
+    h_mask = offs_h < num_heads
+
+    # KV value tile (BLOCK_P tokens, HEAD_DIM): token-major within a page.
+    kv_ptrs = (
+        kv_val_ptr
+        + page_id * stride_kv_page
+        + offs_t[:, None] * HEAD_DIM
+        + offs_d[None, :]
+    )
+    kv = tl.load(kv_ptrs).to(tl.bfloat16)
+
+    # Query tile (HEAD_DIM, BLOCK_H): loaded once, transposed layout for dot.
+    q_ptrs = (
+        q_ptr
+        + b * stride_q_b
+        + offs_d[:, None] * stride_q_d
+        + offs_h[None, :] * stride_q_h
+    )
+    q = tl.load(q_ptrs, mask=h_mask[None, :], other=0.0).to(tl.bfloat16)
+
+    # bf16 upcast dot with fp32 accumulate (NOT fp8 dot: gfx1250 constraint).
+    score = tl.dot(kv, q)  # (BLOCK_P, BLOCK_H) fp32
+
+    # relu -> * weight[b, h] -> sum over heads (order matches torch reference).
+    score = tl.maximum(score, 0.0)
+    w = tl.load(
+        weight_ptr + b * stride_w_b + offs_h * stride_w_h, mask=h_mask, other=0.0
+    )
+    score = score * w[None, :]
+    logit = tl.sum(score, axis=1)  # (BLOCK_P,)
+
+    # per-position fp32 scale applied last.
+    scale = tl.load(kv_scale_ptr + page_id * stride_ks_page + SCALE_F32_OFFSET + offs_t)
+    logit = logit * scale
+
+    # mask positions past this batch's seq_len, then store within max_seq_len.
+    p = page_pos * BLOCK_P + offs_t
+    seq_len = tl.load(seq_lens_ptr + b)
+    logit = tl.where(p < seq_len, logit, 0.0)
+    tl.store(
+        logits_ptr + b * stride_lg_b + p * stride_lg_p,
+        logit,
+        mask=p < max_seq_len,
+    )
+
+
+def fp8_paged_mqa_logits_triton(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """Triton FP8 paged MQA logits (gfx1250). Numerically matches
+    ``fp8_paged_mqa_logits_torch`` (bf16-upcast dot, fp32 accumulate) and is
+    CUDA-graph compatible: no ``.item()`` / host sync / data-dependent shapes."""
+    _ = deep_gemm_metadata
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    block_size = kvcache_fp8.shape[1]
+    device = q_fp8.device
+
+    assert head_dim == 128
+    assert block_size == 64
+    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
+    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
+    assert weight.shape == (batch_size, num_heads)
+    if seq_lens.dim() > 1:
+        seq_lens = seq_lens.squeeze(-1)
+    assert seq_lens.shape == (batch_size,)
+    assert page_table.shape[0] == batch_size
+    assert clean_logits == False
+
+    max_num_pages = page_table.shape[1]
+    num_pages = kvcache_fp8.shape[0]
+    total_dim = block_size * (head_dim + 4)  # 8448 bytes/page
+    SCALE_OFFSET = block_size * head_dim  # 8192-byte value region
+    SCALE_F32_OFFSET = SCALE_OFFSET // 4  # fp32-element offset of scale region
+
+    # Two zero-copy dtype views over the packed cache: fp8 values + fp32 scales.
+    kv_bytes = kvcache_fp8.reshape(num_pages, total_dim)
+    kv_val = kv_bytes.view(FP8_DTYPE)
+    kv_scale = kv_bytes.view(torch.float32)
+
+    q2 = q_fp8[:, 0]  # (batch, num_heads, head_dim)
+    seq_lens = seq_lens.to(torch.int32)
+    page_table = page_table.to(torch.int32)
+    weight = weight.to(torch.float32)
+
+    # zeros covers masked positions and any tail past max_num_pages*block_size.
+    logits = torch.zeros((batch_size, max_seq_len), dtype=torch.float32, device=device)
+
+    grid_pages = min(max_num_pages, triton.cdiv(max_seq_len, block_size))
+    if grid_pages == 0:
+        return logits
+
+    BLOCK_H = triton.next_power_of_2(num_heads)
+    _fp8_paged_mqa_logits_kernel[(batch_size, grid_pages)](
+        q2,
+        kv_val,
+        kv_scale,
+        weight,
+        seq_lens,
+        page_table,
+        logits,
+        q2.stride(0),
+        q2.stride(1),
+        q2.stride(2),
+        kv_val.stride(0),
+        kv_scale.stride(0),
+        weight.stride(0),
+        weight.stride(1),
+        page_table.stride(0),
+        page_table.stride(1),
+        logits.stride(0),
+        logits.stride(1),
+        max_seq_len,
+        num_heads,
+        SCALE_F32_OFFSET=SCALE_F32_OFFSET,
+        BLOCK_P=block_size,
+        HEAD_DIM=head_dim,
+        BLOCK_H=BLOCK_H,
+    )
     return logits
 
 
@@ -669,6 +839,8 @@ class C4IndexerBackendMixin:
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
                 fn = fp8_paged_mqa_logits_torch
+        elif _is_gfx1250:
+            fn = fp8_paged_mqa_logits_triton
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
@@ -695,11 +867,16 @@ class C4IndexerBackendMixin:
         _use_torch_fn = (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer
         )
+        _use_triton_fn = (
+            _is_gfx1250
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and not use_fp4_indexer
+        )
         if (
             _c4sl.dim() == 1
             and not _use_tilelang
             and not _use_aiter
-            and not _use_torch_fn
+            and not (_use_torch_fn or _use_triton_fn)
         ):
             _c4sl = _c4sl.unsqueeze(-1)
         nonpaged_plan = self._get_nonpaged_indexer_plan(

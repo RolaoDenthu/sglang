@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_gfx1250_supported
 
 if TYPE_CHECKING:
     pass
@@ -123,6 +124,7 @@ class PagedIndexerMetadata:
         if (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            or is_gfx1250_supported()
         ):
             self.deep_gemm_metadata = None
         else:
