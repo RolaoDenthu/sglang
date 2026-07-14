@@ -24,6 +24,7 @@ from mori.io import (
     PollCqMode,
     RdmaBackendConfig,
     StatusCode,
+    XgmiBackendConfig,
 )
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
@@ -362,21 +363,40 @@ class MoriKVManager(CommonKVManager):
         post_batch_size = envs.SGLANG_MORI_POST_BATCH_SIZE.get()
         num_worker_threads = envs.SGLANG_MORI_NUM_WORKERS.get()
 
-        rdma_cfg = RdmaBackendConfig(
-            qp_per_transfer,
-            post_batch_size,
-            num_worker_threads,
-            poll_mode,
-            False,
+        # Backend selection: "rdma" (default, cross-node capable) or "xgmi"
+        # (intra-node GPU-to-GPU over the XGMI fabric, no NIC/RDMA). XGMI is the
+        # right choice for single-node PD where the RoCE NIC cannot do GPUDirect
+        # (e.g. NIC and GPUs on separate PCIe domains). CPU-resident aux data
+        # still travels over ZMQ TCP unless SGLANG_MORI_SEND_AUX_RDMA is set.
+        self._mori_backend = (
+            os.environ.get("SGLANG_MORI_BACKEND", "rdma").strip().lower()
         )
-        engine.create_backend(BackendType.RDMA, rdma_cfg)
+        if self._mori_backend == "xgmi":
+            num_streams = int(os.environ.get("SGLANG_MORI_XGMI_NUM_STREAMS", "64"))
+            num_events = int(os.environ.get("SGLANG_MORI_XGMI_NUM_EVENTS", "64"))
+            xgmi_cfg = XgmiBackendConfig(num_streams, num_events)
+            engine.create_backend(BackendType.XGMI, xgmi_cfg)
+        else:
+            rdma_cfg = RdmaBackendConfig(
+                qp_per_transfer,
+                post_batch_size,
+                num_worker_threads,
+                poll_mode,
+                False,
+            )
+            engine.create_backend(BackendType.RDMA, rdma_cfg)
         actual_port = engine.get_engine_desc().port
-        assert actual_port > 0, f"Failed to bind port for engine {engine_key}"
+        # The RDMA backend binds a network port; the XGMI backend is intra-node
+        # IPC and legitimately reports port 0 (peers connect via the IPC info in
+        # the engine desc, and control/aux traffic uses rank_port, not this one).
+        if self._mori_backend != "xgmi":
+            assert actual_port > 0, f"Failed to bind port for engine {engine_key}"
         logger.debug(
-            "Initialized Mori IOEngine %s at %s:%s (qp_per_transfer=%s, workers=%s, poll_mode=%s)",
+            "Initialized Mori IOEngine %s at %s:%s (backend=%s, qp_per_transfer=%s, workers=%s, poll_mode=%s)",
             engine_key,
             self.local_ip,
             actual_port,
+            self._mori_backend,
             qp_per_transfer,
             num_worker_threads,
             poll_mode.name,
@@ -392,14 +412,21 @@ class MoriKVManager(CommonKVManager):
                 MemoryLocationType.GPU,
             )
             self.kv_mem_descs.append(mem_desc)
-        for ptr, length in zip(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens):
-            desc = self.engine.register_memory(
-                ptr,
-                length,
-                -1,
-                MemoryLocationType.CPU,
-            )
-            self.aux_mem_descs.append(desc)
+        # The XGMI backend only moves device memory; CPU-resident aux is not
+        # registered with the engine unless aux is explicitly sent over RDMA.
+        # Without engine descs, send_aux() falls back to the ZMQ TCP path.
+        register_cpu_aux = self._mori_backend != "xgmi" or self._send_aux_rdma
+        if register_cpu_aux:
+            for ptr, length in zip(
+                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+            ):
+                desc = self.engine.register_memory(
+                    ptr,
+                    length,
+                    -1,
+                    MemoryLocationType.CPU,
+                )
+                self.aux_mem_descs.append(desc)
         for component_ptrs, component_lens in zip(
             self.kv_args.state_data_ptrs,
             getattr(self.kv_args, "state_data_lens", []),
