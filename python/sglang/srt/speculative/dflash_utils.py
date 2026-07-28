@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_musa
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -32,13 +32,18 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda() or is_musa():
+if is_cuda() or is_musa() or is_hip():
     try:
         from sgl_kernel import (
             top_k_renorm_prob,
             top_p_renorm_prob,
             tree_speculative_sampling_target_only,
         )
+
+        if is_hip():
+            from sglang.kernels.ops.sampling.top_p_renorm_triton import (
+                top_p_renorm_probs_triton as top_p_renorm_prob,
+            )
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
     except Exception:
