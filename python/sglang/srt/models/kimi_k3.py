@@ -136,6 +136,8 @@ _aiter_mla_gate = get_bool_env_var("SGLANG_K3_AITER_MLA_GATE")
 _aiter_kda_group64 = get_bool_env_var("SGLANG_K3_AITER_KDA_GROUP64")
 _aiter_moe_preroute_fp8 = get_bool_env_var("SGLANG_K3_AITER_MOE_PREROUTE_FP8")
 _aiter_latent_tail_fp8 = get_bool_env_var("SGLANG_K3_AITER_LATENT_TAIL_FP8")
+_moe_latent_mxfp4 = get_bool_env_var("SGLANG_K3_MOE_LATENT_MXFP4")
+_MOE_MXFP4_MIN_TOKENS = 2048
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -536,6 +538,12 @@ class KimiK3MoE(nn.Module):
         self._preroute_shared_down_scale = None
         self._latent_tail_weight = None
         self._latent_tail_scale = None
+        # Prefill-only MXFP4 copies; the bf16 originals stay live alongside them.
+        self._front_head = None
+        self._front_down_w4 = None
+        self._front_down_scale4 = None
+        self._latent_up_w4 = None
+        self._latent_up_scale4 = None
         self._situ_beta = float(config.activation_situ_beta)
         self._situ_linear_beta = float(config.activation_situ_linear_beta)
 
@@ -698,6 +706,52 @@ class KimiK3MoE(nn.Module):
             self._preroute_shared_down_scale,
             situ_beta=self._situ_beta,
             situ_linear_beta=self._situ_linear_beta,
+        )
+
+    def _prepare_moe_latent_mxfp4(self) -> None:
+        """Build MXFP4 copies of the latent down/up projections for prefill.
+
+        The down rows are normally not a GEMM of their own: _merge_front_weights
+        folds them into one weight with the shared gate_up and the router gate so
+        hidden_states is read once. Quantizing just those rows means splitting that
+        merged GEMM in two, which is why the three-way case sets ``_front_head`` --
+        the bf16 remainder it still has to run. Where the rows come from depends on
+        how the merge ran: three-way under TP, ``[gate | latent down]`` under EP, or
+        unmerged, where down_proj already owns its GEMM and there is nothing to split.
+        """
+        if not _moe_latent_mxfp4 or not self.use_latent_moe:
+            return
+        from sglang.kernels.ops.kimi_k3 import (
+            latent_mxfp4_aiter_hip,
+        )
+
+        # gemm_a4w4 is gfx950-only; leaving the w4 buffers unset keeps forward on bf16.
+        if not latent_mxfp4_aiter_hip.supported():
+            return
+        if self._eligible_for_fused_front:
+            if self._front_sizes is None or len(self._front_sizes) != 3:
+                raise RuntimeError(
+                    "the fused front should merge three modules, got sizes "
+                    f"{self._front_sizes}"
+                )
+            # Rows are [shared gate_up | gate | latent down], so the bf16 head
+            # the prefill path keeps and the latent down it quantizes are both
+            # contiguous slices -- no repacking needed.
+            head_rows = self._front_sizes[0] + self._front_sizes[1]
+            self._front_head = self._front_w[:head_rows]
+            down = self._front_w[head_rows:]
+        elif self._front_is_ep_pair:
+            # EP merges [gate | latent down]; above 1024 tokens moe_front picks
+            # "unfused" anyway, so the prefill path reads the rows directly and
+            # the merged buffer stays for the small-batch fused kernel.
+            down = self._front_w[self._front_sizes[0] :]
+        else:
+            down = self.routed_expert_down_proj.weight.data
+        self._front_down_w4, self._front_down_scale4 = latent_mxfp4_aiter_hip.pack(
+            down, "latent down_proj"
+        )
+        self._latent_up_w4, self._latent_up_scale4 = latent_mxfp4_aiter_hip.pack(
+            self.routed_expert_up_proj.weight.data, "up_proj"
         )
 
     def _prepare_latent_tail_fp8(self) -> None:
@@ -1052,8 +1106,21 @@ class KimiK3MoE(nn.Module):
                 and self.routed_expert_up_proj is not None
             )
 
+        use_mxfp4 = (
+            self._front_down_w4 is not None
+            and hidden_states.shape[0] >= _MOE_MXFP4_MIN_TOKENS
+        )
         if routed_input is None:
-            routed_input, _ = self.routed_expert_down_proj(hidden_states)
+            if use_mxfp4:
+                from sglang.kernels.ops.kimi_k3 import (
+                    latent_mxfp4_aiter_hip,
+                )
+
+                routed_input = latent_mxfp4_aiter_hip.run(
+                    hidden_states, self._front_down_w4, self._front_down_scale4
+                )
+            else:
+                routed_input, _ = self.routed_expert_down_proj(hidden_states)
         expert_output = (
             self._forward_mega_experts(routed_input, topk_output)
             if self._use_mega_moe
@@ -1061,7 +1128,16 @@ class KimiK3MoE(nn.Module):
         )
         latent = self._reduce_latent(expert_output)
         # up_proj is replicated, so the routed output is now fully reduced.
-        out, _ = self.routed_expert_up_proj(latent)
+        if use_mxfp4:
+            from sglang.kernels.ops.kimi_k3 import (
+                latent_mxfp4_aiter_hip,
+            )
+
+            out = latent_mxfp4_aiter_hip.run(
+                latent, self._latent_up_w4, self._latent_up_scale4
+            )
+        else:
+            out, _ = self.routed_expert_up_proj(latent)
         if shared_event is not None:
             # SBO join: as late as possible, so the side-stream shared experts
             # get the whole routed a2a + latent tail to hide under.
@@ -1235,7 +1311,28 @@ class KimiK3MoE(nn.Module):
                     self.gate.weight,
                 )
                 preroute = True
-        if preroute is None:
+        use_mxfp4 = (
+            self._front_down_w4 is not None and num_tokens >= _MOE_MXFP4_MIN_TOKENS
+        )
+        if preroute is None and use_mxfp4:
+            from sglang.kernels.ops.kimi_k3 import (
+                latent_mxfp4_aiter_hip,
+            )
+
+            # Prefill: the router and shared gate_up stay in the bf16 head GEMM,
+            # the latent down-proj runs MXFP4.
+            head = _k3_bf16_gemm(
+                hidden_states,
+                self._front_head,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            gate_up, router_logits = torch.split(
+                head, self._front_sizes[:2], dim=-1
+            )
+            routed_input = latent_mxfp4_aiter_hip.run(
+                hidden_states, self._front_down_w4, self._front_down_scale4
+            )
+        elif preroute is None:
             fused = _k3_bf16_gemm(
                 hidden_states,
                 self._front_w,
@@ -1374,7 +1471,16 @@ class KimiK3MoE(nn.Module):
                 return out if prefix_sum is None else out + prefix_sum
         if not fused_norm:
             latent = self._latent_norm(latent)
-        out, _ = self.routed_expert_up_proj(latent)
+        if use_mxfp4:
+            from sglang.kernels.ops.kimi_k3 import (
+                latent_mxfp4_aiter_hip,
+            )
+
+            out = latent_mxfp4_aiter_hip.run(
+                latent, self._latent_up_w4, self._latent_up_scale4
+            )
+        else:
+            out, _ = self.routed_expert_up_proj(latent)
 
         # prefetch_bc: b (shared_output) was produced by the all-reduce and
         # c (prefix_sum) even earlier; the AR is a plain launch (full
@@ -3345,6 +3451,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
                 layer.mlp._prepare_preroute_fp8()
+                layer.mlp._prepare_moe_latent_mxfp4()
                 layer.mlp._prepare_latent_tail_fp8()
                 # The router consumes the correction bias in fp32; convert the
                 # bf16 checkpoint values once (exact) so the per-call
