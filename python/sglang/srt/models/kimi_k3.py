@@ -160,8 +160,9 @@ def _k3_bf16_gemm(
 ) -> torch.Tensor:
     """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
     through UnquantizedLinearMethod. The fused MoE front and the deferred
-    shared down GEMM call torch directly on raw merged weights, so the
-    --bf16-gemm-backend cutedsl selection would silently skip them."""
+    shared down GEMM call torch directly on raw merged weights, so neither the
+    aiter tuned selection on HIP nor the --bf16-gemm-backend cutedsl selection
+    would reach them."""
     if out is None and out_dtype is not None and out_dtype != x.dtype:
         out = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device
@@ -180,6 +181,12 @@ def _k3_bf16_gemm(
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
                 return cutedsl_bf16_gemm_out(x, weight, out)
+
+        # aiter tgemm doesn't support an output buffer, so only serve this path when out is None.
+        if out is None and _use_aiter and type(weight.data) is torch.Tensor:
+            from aiter.tuned_gemm import tgemm
+
+            return tgemm.mm(x, weight, None, otype=x.dtype)
     if out is None:
         return torch.nn.functional.linear(x, weight)
     if out.dtype != x.dtype:
