@@ -2066,7 +2066,11 @@ class ServerArgs:
     ] = False
     enable_deepseek_v4_fp4_indexer: A[
         bool,
-        "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
+        "Enable the experimental FP4 C4 indexer path for DeepSeek V4. On CUDA, "
+        "this requires SM100 or SM120 with DeepGEMM support. On ROCm, this "
+        "requires gfx950 and compatible AITER FP4 indexer APIs; the initial HIP "
+        "path is single-node only and does not support HiCache or PD "
+        "disaggregation. Default keeps the existing indexer implementation.",
         NS("exec.kernel"),
     ] = False
     disable_custom_all_reduce: A[
@@ -8789,13 +8793,12 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
-        if cfg.enable_deepseek_v4_fp4_indexer and not (
-            is_sm100_supported() or is_sm120_supported()
-        ):
-            raise ValueError(
-                "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
-                "DeepGEMM FP4 indexer support."
+        if cfg.enable_deepseek_v4_fp4_indexer:
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                validate_deepseek_v4_fp4_indexer,
             )
+
+            validate_deepseek_v4_fp4_indexer(self)
         # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
         # it, mirroring the forward scale split: the ue8m0 path
         # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
