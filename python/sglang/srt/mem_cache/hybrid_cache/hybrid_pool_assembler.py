@@ -456,6 +456,13 @@ def build_deepseek_v4_hicache_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    if getattr(kvcache, "uses_aiter_fp4_layout", False):
+        raise RuntimeError(
+            "DeepSeek V4 AITER FP4 split indexer cache does not support "
+            "HiCache/hybrid host-pool offload; disable "
+            "--enable-deepseek-v4-fp4-indexer or HiCache"
+        )
+
     page_size = params.page_size
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
