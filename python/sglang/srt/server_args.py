@@ -84,7 +84,7 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
-    is_gfx950_supported,
+    is_gfx95_supported,
     is_hip,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
@@ -110,37 +110,6 @@ from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
-
-_DEEPSEEK_V4_FP4_INDEXER_AITER_APIS = {
-    "aiter": (
-        "rope_rotate_activation",
-        "rmsnorm_rope_rotate_activation_fp4quant_kvcache",
-    ),
-    "aiter.ops.flydsl": (
-        "flydsl_pa_mqa_logits_fp4",
-        "flydsl_pa_mqa_logits_fp4_prefill",
-    ),
-}
-
-
-def _deepseek_v4_fp4_indexer_aiter_error() -> Optional[str]:
-    for module_name, api_names in _DEEPSEEK_V4_FP4_INDEXER_AITER_APIS.items():
-        try:
-            module = importlib.import_module(module_name)
-        except Exception as exc:
-            return f"could not import {module_name} ({exc})"
-
-        if module_name == "aiter":
-            if not hasattr(getattr(module, "dtypes", None), "fp4x2"):
-                return "missing AITER dtype: aiter.dtypes.fp4x2"
-
-        missing_apis = [
-            api for api in api_names if not callable(getattr(module, api, None))
-        ]
-        if missing_apis:
-            return f"missing AITER callables: {', '.join(missing_apis)}"
-    return None
-
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
@@ -2098,11 +2067,7 @@ class ServerArgs:
     ] = False
     enable_deepseek_v4_fp4_indexer: A[
         bool,
-        "Enable the experimental FP4 C4 indexer path for DeepSeek V4. On CUDA, "
-        "this requires SM100 or SM120 with DeepGEMM support. On ROCm, this "
-        "requires gfx950 and compatible AITER FP4 indexer APIs; the initial HIP "
-        "path is single-node only and does not support HiCache or PD "
-        "disaggregation. Default keeps the existing indexer implementation.",
+        "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
         NS("exec.kernel"),
     ] = False
     disable_custom_all_reduce: A[
@@ -8798,50 +8763,6 @@ class ServerArgs:
             "1" if requested_transport == "cuda_ipc" else "0"
         )
 
-    def _validate_deepseek_v4_fp4_indexer(self):
-        cfg = resolving_view(self)
-        if not cfg.enable_deepseek_v4_fp4_indexer:
-            return
-
-        if is_hip():
-            if cfg.nnodes != 1:
-                raise ValueError(
-                    "--enable-deepseek-v4-fp4-indexer on HIP supports "
-                    "single-node execution only; use --nnodes 1 or remove "
-                    "the FP4 indexer flag."
-                )
-            if cfg.enable_hierarchical_cache:
-                raise ValueError(
-                    "--enable-deepseek-v4-fp4-indexer on HIP does not support "
-                    "--enable-hierarchical-cache/HiCache; disable HiCache or "
-                    "remove the FP4 indexer flag."
-                )
-            if cfg.disaggregation_mode != "null":
-                raise ValueError(
-                    "--enable-deepseek-v4-fp4-indexer on HIP does not support "
-                    "PD disaggregation; use --disaggregation-mode null or "
-                    "remove the FP4 indexer flag. Got "
-                    f"--disaggregation-mode={cfg.disaggregation_mode!r}."
-                )
-            if not is_gfx950_supported():
-                raise ValueError(
-                    "--enable-deepseek-v4-fp4-indexer on HIP requires an AMD "
-                    "gfx950 GPU; remove the flag or run on gfx950."
-                )
-            if aiter_error := _deepseek_v4_fp4_indexer_aiter_error():
-                raise ValueError(
-                    "--enable-deepseek-v4-fp4-indexer on HIP requires the "
-                    f"compatible AITER FP4 APIs; {aiter_error}. Install a "
-                    "matching AITER build or remove the flag."
-                )
-            return
-
-        if not (is_sm100_supported() or is_sm120_supported()):
-            raise ValueError(
-                "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
-                "DeepGEMM FP4 indexer support."
-            )
-
     def _handle_environment_variables(self):
         cfg = resolving_view(self)
         self._handle_multimodal_feature_transport()
@@ -8869,7 +8790,13 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
-        self._validate_deepseek_v4_fp4_indexer()
+        if cfg.enable_deepseek_v4_fp4_indexer and not (
+            is_sm100_supported() or is_sm120_supported() or is_gfx95_supported()
+        ):
+            raise ValueError(
+                "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
+                "DeepGEMM FP4 indexer support."
+            )
         # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
         # it, mirroring the forward scale split: the ue8m0 path
         # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
