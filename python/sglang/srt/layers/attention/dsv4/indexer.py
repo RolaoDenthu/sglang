@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_rope_hadamard_fp4_quant,
     prepare_aiter_fp4_indexer_cos_sin,
+    validate_aiter_fp4_indexer_cos_sin,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -970,6 +971,9 @@ class C4Indexer(nn.Module):
                 owns_aiter_fp4_rope = True
             else:
                 owns_aiter_fp4_rope = False
+            validate_aiter_fp4_indexer_cos_sin(
+                aiter_fp4_cos, aiter_fp4_sin, freqs_cis.device
+            )
         else:
             aiter_fp4_cos = None
             aiter_fp4_sin = None

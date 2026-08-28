@@ -327,54 +327,5 @@ class TestDSV4FP4QProducer(unittest.TestCase):
         is_hip.assert_not_called()
         cuda_fp4.assert_not_called()
 
-    def test_hip_fp4_validates_q_positions_and_rope_shapes(self):
-        positions = torch.arange(self.num_tokens, dtype=torch.int64)
-
-        with self.assertRaisesRegex(ValueError, r"q shape \[T, 64, 128\]"):
-            aiter_fp4_indexer.aiter_q_indexer_rope_hadamard_fp4_quant(
-                torch.empty(self.num_tokens, 63, 128, dtype=torch.bfloat16),
-                self.freqs_cis.real.to(torch.bfloat16).contiguous(),
-                self.freqs_cis.imag.to(torch.bfloat16).contiguous(),
-                positions,
-            )
-        with self.assertRaisesRegex(ValueError, r"positions shape \[T\]"):
-            aiter_fp4_indexer.aiter_q_indexer_rope_hadamard_fp4_quant(
-                torch.empty(self.num_tokens, 64, 128, dtype=torch.bfloat16),
-                self.freqs_cis.real.to(torch.bfloat16).contiguous(),
-                self.freqs_cis.imag.to(torch.bfloat16).contiguous(),
-                positions[:1],
-            )
-        with self.assertRaisesRegex(
-            ValueError, r"cos/sin with shape \[max_position, 32\]"
-        ):
-            aiter_fp4_indexer.aiter_q_indexer_rope_hadamard_fp4_quant(
-                torch.empty(self.num_tokens, 64, 128, dtype=torch.bfloat16),
-                torch.empty(128, 64, dtype=torch.bfloat16),
-                torch.empty(128, 64, dtype=torch.bfloat16),
-                positions,
-            )
-        with self.assertRaisesRegex(ValueError, r"dtype torch.bfloat16"):
-            aiter_fp4_indexer.aiter_q_indexer_rope_hadamard_fp4_quant(
-                torch.empty(self.num_tokens, 64, 128, dtype=torch.bfloat16),
-                torch.empty(128, 32, dtype=torch.float32),
-                torch.empty(128, 32, dtype=torch.bfloat16),
-                positions,
-            )
-        with self.assertRaisesRegex(ValueError, r"contiguous cos"):
-            aiter_fp4_indexer.aiter_q_indexer_rope_hadamard_fp4_quant(
-                torch.empty(self.num_tokens, 64, 128, dtype=torch.bfloat16),
-                torch.empty(32, 128, dtype=torch.bfloat16).T,
-                torch.empty(128, 32, dtype=torch.bfloat16),
-                positions,
-            )
-        with self.assertRaisesRegex(ValueError, r"same device"):
-            aiter_fp4_indexer.aiter_q_indexer_rope_hadamard_fp4_quant(
-                torch.empty(self.num_tokens, 64, 128, dtype=torch.bfloat16),
-                torch.empty(128, 32, dtype=torch.bfloat16, device="meta"),
-                torch.empty(128, 32, dtype=torch.bfloat16, device="meta"),
-                positions,
-            )
-
-
 if __name__ == "__main__":
     unittest.main()

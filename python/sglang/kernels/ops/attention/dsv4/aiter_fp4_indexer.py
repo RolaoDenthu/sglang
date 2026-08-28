@@ -40,7 +40,7 @@ def prepare_aiter_fp4_indexer_cos_sin(
     return cos, sin
 
 
-def _validate_cos_sin(
+def validate_aiter_fp4_indexer_cos_sin(
     cos: torch.Tensor, sin: torch.Tensor, device: torch.device
 ) -> None:
     expected_rope_width = _ROPE_DIM // 2
@@ -81,26 +81,7 @@ def aiter_q_indexer_rope_hadamard_fp4_quant(
     sin: torch.Tensor,
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if q.ndim != 3 or tuple(q.shape[1:]) != (_Q_HEADS, _Q_HEAD_DIM):
-        raise ValueError(
-            "AITER FP4 C4Indexer requires q shape [T, 64, 128]; "
-            f"got {tuple(q.shape)}"
-        )
-    if q.dtype != torch.bfloat16:
-        raise ValueError(
-            "AITER FP4 C4Indexer requires q dtype torch.bfloat16; " f"got {q.dtype}"
-        )
-    if not q.is_contiguous():
-        raise ValueError("AITER FP4 C4Indexer requires contiguous q")
-
     num_tokens = q.shape[0]
-    if positions.ndim != 1 or positions.shape[0] != num_tokens:
-        raise ValueError(
-            "AITER FP4 C4Indexer requires positions shape [T] matching q; "
-            f"got positions {tuple(positions.shape)} for T={num_tokens}"
-        )
-
-    _validate_cos_sin(cos, sin, q.device)
     positions = positions.to(device=q.device, dtype=torch.int64).contiguous()
 
     # AITER is intentionally imported only after the HIP FP4 path is selected.
@@ -142,45 +123,6 @@ def aiter_fp4_paged_mqa_logits(
     is_decode: bool,
 ) -> torch.Tensor:
     num_tokens = q_fp4.shape[0]
-    if q_fp4.ndim != 3 or tuple(q_fp4.shape[1:]) != (_Q_HEADS, _Q_HEAD_DIM // 2):
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires q_fp4 shape [T, 64, 64]; "
-            f"got {tuple(q_fp4.shape)}"
-        )
-    if q_scale.shape != (num_tokens, *_Q_SCALE_SHAPE):
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires q_scale shape "
-            f"[T, 1, 4, 16, 4]; got {tuple(q_scale.shape)}"
-        )
-    if q_scale.dtype != torch.uint8:
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires uint8 Q scales; "
-            f"got {q_scale.dtype}"
-        )
-    if tuple(k_payload.shape[1:]) != (1, 4, _KV_BLOCK_SIZE, 16):
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires K payload shape "
-            f"[P, 1, 4, 64, 16]; got {tuple(k_payload.shape)}"
-        )
-    if k_payload.shape[0] == 0:
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires at least one K cache page"
-        )
-    if k_scale.shape != k_payload.shape[:-1] or k_scale.dtype != torch.uint8:
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires uint8 K scales with shape "
-            f"[P, 1, 4, 64]; got shape {tuple(k_scale.shape)} and "
-            f"dtype {k_scale.dtype}"
-        )
-    if weights.shape != (num_tokens, _Q_HEADS):
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires weights shape [T, 64]; "
-            f"got {tuple(weights.shape)}"
-        )
-    if weights.dtype != torch.bfloat16 or not weights.is_contiguous():
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires contiguous bfloat16 weights"
-        )
     if page_table.ndim != 2 or page_table.shape[0] != num_tokens:
         raise ValueError(
             "AITER FP4 C4Indexer logits requires row-expanded page_table "
@@ -273,42 +215,7 @@ def aiter_k_indexer_fp4_cache_write(
     k_payload: torch.Tensor,
     k_scale: torch.Tensor,
 ) -> None:
-    if k.ndim != 2 or k.shape[1] != _Q_HEAD_DIM:
-        raise ValueError(
-            "AITER FP4 C4Indexer requires k shape [N, 128]; " f"got {tuple(k.shape)}"
-        )
     num_rows = k.shape[0]
-    if plan.compress_ratio != 4 or plan[1].shape != (num_rows, 16):
-        raise ValueError(
-            "AITER FP4 C4Indexer requires a C4 plan with one 16-byte row "
-            f"per K row; got ratio={plan.compress_ratio}, "
-            f"plan shape={tuple(plan[1].shape)}, N={num_rows}"
-        )
-    if out_loc.ndim != 1:
-        raise ValueError(
-            "AITER FP4 C4Indexer requires one-dimensional out_loc; "
-            f"got {tuple(out_loc.shape)}"
-        )
-    if norm_weight.shape != (_Q_HEAD_DIM,):
-        raise ValueError(
-            "AITER FP4 C4Indexer requires norm_weight shape [128]; "
-            f"got {tuple(norm_weight.shape)}"
-        )
-    if tuple(k_payload.shape[1:]) != (1, 4, _KV_BLOCK_SIZE, 16):
-        raise ValueError(
-            "AITER FP4 C4Indexer requires payload shape [P, 1, 4, 64, 16]; "
-            f"got {tuple(k_payload.shape)}"
-        )
-    if k_scale.shape != k_payload.shape[:-1]:
-        raise ValueError(
-            "AITER FP4 C4Indexer requires scale shape [P, 1, 4, 64]; "
-            f"got {tuple(k_scale.shape)}"
-        )
-    if k_scale.dtype != torch.uint8:
-        raise ValueError(
-            "AITER FP4 C4Indexer requires uint8 K scales; " f"got {k_scale.dtype}"
-        )
-    _validate_cos_sin(cos, sin, k.device)
     if num_rows == 0:
         return
 
@@ -321,11 +228,6 @@ def aiter_k_indexer_fp4_cache_write(
 
     out_loc_i64 = out_loc.to(device=k.device, dtype=torch.int64)
     if plan.is_decode:
-        if out_loc_i64.shape[0] != num_rows:
-            raise ValueError(
-                "AITER FP4 C4Indexer decode requires out_loc length N; "
-                f"got {out_loc_i64.shape[0]} for N={num_rows}"
-            )
         selected_slots = out_loc_i64
     elif out_loc_i64.shape[0] == 0:
         selected_slots = torch.full_like(seq_lens, -1)
