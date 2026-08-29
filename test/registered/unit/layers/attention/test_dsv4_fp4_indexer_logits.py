@@ -274,7 +274,7 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
                     topk_output[-1], torch.full((512,), -1, dtype=torch.int32)
                 )
 
-    def test_page_table_padding_preserves_rows_and_logical_output_width(self):
+    def test_page_table_padding_preserves_rows_and_padded_output_width(self):
         num_tokens = 3
         q_fp4 = torch.empty((num_tokens, 64, 64), dtype=torch.float4_e2m1fn_x2)
         q_scale = torch.empty((num_tokens, 1, 4, 16, 4), dtype=torch.uint8)
@@ -339,11 +339,9 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
                     self.assertEqual(
                         selected_kernel.call_args.args[-1], padded_width * 64
                     )
-                    self.assertEqual(logits.shape, (num_tokens, page_table_width * 64))
+                    self.assertEqual(logits.shape, (num_tokens, padded_width * 64))
                     self.assertTrue(logits.is_contiguous())
-                    torch.testing.assert_close(
-                        logits, padded_logits[:, : page_table_width * 64]
-                    )
+                    torch.testing.assert_close(logits, padded_logits)
                     torch.testing.assert_close(page_table, original_page_table)
 
     def test_prefill_dispatch_uses_call_local_graph_pool_temporaries(self):

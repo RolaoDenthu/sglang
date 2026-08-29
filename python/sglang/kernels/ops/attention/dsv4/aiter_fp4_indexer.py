@@ -145,7 +145,6 @@ def aiter_fp4_paged_mqa_logits(
             "AITER FP4 C4Indexer logits requires row-expanded c4_seq_lens "
             f"shape [T]; got {tuple(c4_seq_lens.shape)}"
         )
-    logical_max_seq_len = logical_page_table_width * _KV_BLOCK_SIZE
     max_seq_len = padded_page_table_width * _KV_BLOCK_SIZE
 
     # AITER FlyDSL is intentionally imported only after the HIP FP4 path is selected.
@@ -200,7 +199,7 @@ def aiter_fp4_paged_mqa_logits(
             **common_kwargs,
         )
 
-    return logits[:, :logical_max_seq_len].contiguous()
+    return logits
 
 
 def aiter_k_indexer_fp4_cache_write(
