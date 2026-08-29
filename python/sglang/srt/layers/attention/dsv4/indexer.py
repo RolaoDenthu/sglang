@@ -805,6 +805,14 @@ class C4IndexerBackendMixin:
             )
         if use_aiter_fp4_indexer:
             q_fp4, q_scale = q
+            is_decode = forward_batch.forward_mode.is_decode()
+            prefill_plan = (
+                None
+                if is_decode
+                else indexer_metadata.get_aiter_fp4_prefill_plan(
+                    page_table, c4_seq_lens
+                )
+            )
             logits = aiter_fp4_paged_mqa_logits(
                 q_fp4=q_fp4,
                 q_scale=q_scale,
@@ -818,7 +826,8 @@ class C4IndexerBackendMixin:
                 page_table=page_table,
                 c4_seq_lens=c4_seq_lens,
                 weight_scale=c4_indexer.weight_scale,
-                is_decode=forward_batch.forward_mode.is_decode(),
+                is_decode=is_decode,
+                prefill_plan=prefill_plan,
             )
         elif nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)

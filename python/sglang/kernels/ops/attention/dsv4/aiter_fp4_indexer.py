@@ -17,6 +17,8 @@ _ROPE_DIM = 64
 _GROUP_SIZE = 32
 _KV_BLOCK_SIZE = 64
 _Q_SCALE_SHAPE = (1, 4, 16, 4)
+_BLOCK_K = 256
+_MIN_PARALLEL_UNIT_NUM = 512
 
 
 def prepare_aiter_fp4_indexer_cos_sin(
@@ -110,6 +112,34 @@ def aiter_q_indexer_rope_hadamard_fp4_quant(
     return q_fp4, q_scale
 
 
+def prepare_aiter_fp4_prefill_plan(
+    page_table: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        compute_prefill_schedule,
+    )
+
+    num_tokens = page_table.shape[0]
+    row_to_batch = torch.arange(
+        num_tokens, device=page_table.device, dtype=torch.int32
+    )
+    local_starts = torch.zeros(
+        num_tokens, device=page_table.device, dtype=torch.int32
+    )
+    padded_width = max(4, (page_table.shape[1] + 3) // 4 * 4)
+    parallel_unit_num = max(_MIN_PARALLEL_UNIT_NUM, num_tokens)
+    _, cta_info, n_ctas = compute_prefill_schedule(
+        row_to_batch,
+        local_starts,
+        c4_seq_lens,
+        _BLOCK_K,
+        parallel_unit_num,
+        padded_width * _KV_BLOCK_SIZE,
+    )
+    return row_to_batch, local_starts, cta_info, n_ctas
+
+
 def aiter_fp4_paged_mqa_logits(
     *,
     q_fp4: torch.Tensor,
@@ -121,6 +151,9 @@ def aiter_fp4_paged_mqa_logits(
     c4_seq_lens: torch.Tensor,
     weight_scale: float,
     is_decode: bool,
+    prefill_plan: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None
+    ) = None,
 ) -> torch.Tensor:
     num_tokens = q_fp4.shape[0]
     if page_table.ndim != 2 or page_table.shape[0] != num_tokens:
@@ -155,7 +188,7 @@ def aiter_fp4_paged_mqa_logits(
 
     common_kwargs = {
         "weight_scale": weight_scale,
-        "block_k": 256,
+        "block_k": _BLOCK_K,
         "kv_block_size": _KV_BLOCK_SIZE,
         "num_warps": 4,
     }
@@ -179,11 +212,15 @@ def aiter_fp4_paged_mqa_logits(
             **common_kwargs,
         )
     else:
-        row_to_batch = torch.arange(num_tokens, device=q_fp4.device, dtype=torch.int32)
-        local_starts = torch.zeros(num_tokens, device=q_fp4.device, dtype=torch.int32)
+        if prefill_plan is None:
+            prefill_plan = prepare_aiter_fp4_prefill_plan(
+                page_table,
+                c4_seq_lens,
+            )
+        row_to_batch, local_starts, cta_info, n_ctas = prefill_plan
         # This eager grid depends only on T, avoids sequence-value synchronization,
         # and guarantees at least one persistent unit for every query row.
-        parallel_unit_num = max(512, num_tokens)
+        parallel_unit_num = max(_MIN_PARALLEL_UNIT_NUM, num_tokens)
         logits = flydsl_pa_mqa_logits_fp4_prefill(
             q_payload,
             q_scale,
@@ -196,6 +233,8 @@ def aiter_fp4_paged_mqa_logits(
             c4_seq_lens,
             max_seq_len,
             parallel_unit_num=parallel_unit_num,
+            cta_info=cta_info,
+            n_ctas=n_ctas,
             **common_kwargs,
         )
 

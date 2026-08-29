@@ -60,8 +60,34 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 def _fake_flydsl():
     flydsl = ModuleType("aiter.ops.flydsl")
+    flydsl.__path__ = []
     flydsl.flydsl_pa_mqa_logits_fp4 = Mock()
     flydsl.flydsl_pa_mqa_logits_fp4_prefill = Mock()
+    kernels = ModuleType("aiter.ops.flydsl.kernels")
+    kernels.__path__ = []
+    mqa_logits = ModuleType("aiter.ops.flydsl.kernels.mqa_logits")
+    mqa_logits.__path__ = []
+    prefill = ModuleType(
+        "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill"
+    )
+
+    def compute_prefill_schedule(
+        row_to_batch,
+        local_starts,
+        local_ends,
+        block_k,
+        parallel_unit_num,
+        max_seq_len,
+    ):
+        del row_to_batch, local_starts, local_ends, block_k, max_seq_len
+        return (
+            torch.ones((), dtype=torch.int32),
+            torch.empty((parallel_unit_num, 6), dtype=torch.int32),
+            parallel_unit_num,
+        )
+
+    prefill.compute_prefill_schedule = Mock(side_effect=compute_prefill_schedule)
+    flydsl.compute_prefill_schedule = prefill.compute_prefill_schedule
     aiter = ModuleType("aiter")
     aiter.__path__ = []
     ops = ModuleType("aiter.ops")
@@ -72,6 +98,9 @@ def _fake_flydsl():
         "aiter": aiter,
         "aiter.ops": ops,
         "aiter.ops.flydsl": flydsl,
+        "aiter.ops.flydsl.kernels": kernels,
+        "aiter.ops.flydsl.kernels.mqa_logits": mqa_logits,
+        "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill": prefill,
     }
 
 
@@ -190,8 +219,13 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
         padded_width = max(4, (case.page_table.shape[1] + 3) // 4 * 4)
         self.assertEqual(args[4].shape, (case.q_fp4.shape[0], padded_width + 4))
         self.assertEqual(args[-1], padded_width * 64)
+        kwargs = call_args.kwargs.copy()
+        if not case.forward_batch.forward_mode.is_decode():
+            cta_info = kwargs.pop("cta_info")
+            self.assertEqual(cta_info.shape, (512, 6))
+            self.assertEqual(kwargs.pop("n_ctas"), 512)
         self.assertEqual(
-            call_args.kwargs,
+            kwargs,
             {
                 "weight_scale": case.c4_indexer.weight_scale,
                 "block_k": 256,
@@ -273,6 +307,30 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
                 torch.testing.assert_close(
                     topk_output[-1], torch.full((512,), -1, dtype=torch.int32)
                 )
+
+    def test_prefill_schedule_is_reused_across_layers(self):
+        case = self._make_dispatch(
+            mode=ForwardMode.EXTEND,
+            num_tokens=2,
+            metadata_rows=2,
+            batch_size=1,
+        )
+        flydsl, modules = _fake_flydsl()
+        flydsl.flydsl_pa_mqa_logits_fp4_prefill.return_value = torch.empty(
+            (2, 256), dtype=torch.float32
+        )
+
+        with patch.dict(sys.modules, modules):
+            for _ in range(2):
+                case.backend.forward_c4_indexer(
+                    x=torch.empty(2, 1),
+                    q_lora=torch.empty(2, 1),
+                    c4_indexer=case.c4_indexer,
+                    forward_batch=case.forward_batch,
+                )
+
+        flydsl.compute_prefill_schedule.assert_called_once()
+        self.assertEqual(flydsl.flydsl_pa_mqa_logits_fp4_prefill.call_count, 2)
 
     def test_page_table_padding_preserves_rows_and_padded_output_width(self):
         num_tokens = 3

@@ -177,6 +177,27 @@ class PagedIndexerMetadata:
     def max_c4_seq_len(self) -> int:
         return self.page_table.shape[1] * self.c4_page_size
 
+    def get_aiter_fp4_prefill_plan(
+        self,
+        page_table: torch.Tensor,
+        c4_seq_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Build AITER's prefill schedule once per forward and reuse it by layer."""
+        cached_plan = getattr(self, "_aiter_fp4_prefill_plan", None)
+        if cached_plan is not None:
+            return cached_plan
+
+        from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
+            prepare_aiter_fp4_prefill_plan,
+        )
+
+        cached_plan = prepare_aiter_fp4_prefill_plan(
+            page_table,
+            c4_seq_lens,
+        )
+        self._aiter_fp4_prefill_plan = cached_plan
+        return cached_plan
+
     def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
             copy_fields = ["page_table", "c4_seq_lens"]
@@ -198,6 +219,7 @@ class PagedIndexerMetadata:
             assign_fields=assign_fields,
         )
         self.nonpaged_plan = None
+        self._aiter_fp4_prefill_plan = None
 
 
 def maybe_copy_inplace(dst, *, src) -> None:
