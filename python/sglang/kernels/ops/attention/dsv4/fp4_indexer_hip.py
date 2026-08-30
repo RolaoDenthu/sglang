@@ -97,9 +97,9 @@ def prepare_fp4_decode_workspace(
         max_seq_len=max_seq_len,
         next_n=1,
     )
-    logits = torch.full(
+    # AITER overwrites every valid score; length-aware top-k ignores the tail.
+    logits = torch.empty(
         (page_table.shape[0], max_seq_len),
-        float("-inf"),
         dtype=torch.float32,
         device=page_table.device,
     )
@@ -131,9 +131,9 @@ def prepare_fp4_prefill_workspace(
         parallel_unit_num=cta_count,
         max_seq_len=max_seq_len,
     )
-    logits = torch.full(
+    # AITER overwrites every valid score; length-aware top-k ignores the tail.
+    logits = torch.empty(
         (num_queries, max_seq_len),
-        float("-inf"),
         dtype=torch.float32,
         device=page_table.device,
     )
