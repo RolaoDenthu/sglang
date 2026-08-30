@@ -664,7 +664,11 @@ class C4IndexerBackendMixin:
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
         use_aiter_fp4 = c4_indexer.use_fp4_indexer and is_hip()
 
-        positions = core_metadata.positions
+        positions = (
+            metadata.fp4_q_positions
+            if use_aiter_fp4 and metadata.fp4_q_positions is not None
+            else core_metadata.positions
+        )
         num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
         if x.shape[0] != num_queries:
             x = x[:num_queries]
@@ -794,6 +798,7 @@ class C4IndexerBackendMixin:
                 c4_seq_lens=c4_seq_lens,
                 weight_scale=c4_indexer.weight_scale,
                 is_decode=forward_batch.forward_mode.is_decode(),
+                decode_workspace=metadata.fp4_decode_workspace,
             )
         elif nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
@@ -968,6 +973,9 @@ class C4Indexer(nn.Module):
             rotary_emb=rotary_emb,
         )
         if self.use_fp4_indexer and is_hip():
+            self.compressor.norm.register_buffer(
+                "_fp4_weight_bf16", None, persistent=False
+            )
             self.compressor.fp4_cos = fp4_cos
             self.compressor.fp4_sin = fp4_sin
         self.rotary_emb = rotary_emb

@@ -47,6 +47,10 @@ from sglang.srt.utils import ceil_align
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
 
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        FP4DecodeWorkspace,
+        FP4KWriteMetadata,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -353,6 +357,11 @@ class DSV4Metadata:
 
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
+    # Graph-owned buffers are refreshed by init_forward_metadata_in_graph and
+    # intentionally excluded from copy_ so their captured addresses stay stable.
+    fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
+    fp4_k_write_metadata: Optional[FP4KWriteMetadata] = field(default=None, repr=False)
+    fp4_decode_workspace: Optional[FP4DecodeWorkspace] = field(default=None, repr=False)
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -451,6 +460,13 @@ class DeepseekV4HipRadixBackend(
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        self.fp4_max_position = int(
+            getattr(
+                model_runner.model_config.hf_text_config,
+                "max_position_embeddings",
+                self.MAX_SEQ_LEN_FOR_CAPTURE,
+            )
+        )
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
@@ -857,6 +873,34 @@ class DeepseekV4HipRadixBackend(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
                     torch.int32
                 )
+            )
+
+        if (
+            self.enable_deepseek_v4_fp4_indexer
+            and isinstance(metadata, DSV4Metadata)
+            and forward_batch.forward_mode.is_decode()
+            and metadata.c4_compress_metadata is not None
+        ):
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                prepare_fp4_decode_workspace,
+                prepare_fp4_k_write_metadata,
+            )
+
+            indexer_metadata = metadata.indexer_metadata
+            c4_out_loc = metadata.core_attn_metadata.c4_out_loc
+            assert indexer_metadata is not None and c4_out_loc is not None
+            metadata.fp4_q_positions = metadata.core_attn_metadata.positions.to(
+                torch.int64
+            ).contiguous()
+            metadata.fp4_k_write_metadata = prepare_fp4_k_write_metadata(
+                metadata.c4_compress_metadata,
+                c4_out_loc,
+                self.fp4_max_position,
+                self.device,
+            )
+            metadata.fp4_decode_workspace = prepare_fp4_decode_workspace(
+                indexer_metadata.page_table,
+                indexer_metadata.c4_seq_lens,
             )
 
     def init_forward_metadata_out_graph(

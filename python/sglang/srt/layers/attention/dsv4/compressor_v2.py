@@ -194,10 +194,15 @@ class CompressorBackendMixin:
         )
 
         # Step 2: norm + rope + store
+        norm_weight = norm.weight
+        if _is_hip and use_fp4_indexer:
+            cached_norm_weight = getattr(norm, "_fp4_weight_bf16", None)
+            if cached_norm_weight is not None:
+                norm_weight = cached_norm_weight
         compress_norm_rope_store(
             kv_compressed,
             plan,
-            norm_weight=norm.weight,
+            norm_weight=norm_weight,
             norm_eps=norm.variance_epsilon,
             freq_cis=freqs_cis_cache,
             out_loc=out_loc,
@@ -207,6 +212,11 @@ class CompressorBackendMixin:
             bf16_store=bf16_store,
             kvcache_scale=kv_scale_cache,
             rope_cache=rope_cache,
+            fp4_k_write_metadata=(
+                getattr(self.forward_metadata, "fp4_k_write_metadata", None)
+                if _is_hip and use_fp4_indexer
+                else None
+            ),
         )
 
     def forward_unified(

@@ -3428,6 +3428,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                 and not self_attn.indexer.compressor.ape_converted
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
+            if self_attn.compress_ratio == 4 and hasattr(
+                self_attn.indexer.compressor.norm, "_fp4_weight_bf16"
+            ):
+                norm = self_attn.indexer.compressor.norm
+                weight_bf16 = norm.weight.data.bfloat16().contiguous()
+                if norm._fp4_weight_bf16 is None:
+                    norm._fp4_weight_bf16 = weight_bf16
+                else:
+                    norm._fp4_weight_bf16.copy_(weight_bf16)
             layer.refresh_mhc_norm_weight_cache()
 
     @staticmethod
