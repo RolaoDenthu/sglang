@@ -207,6 +207,10 @@ class CompressorBackendMixin:
             )
 
             norm_weight = getattr(norm, "_aiter_fp4_weight_bf16", None)
+            if norm_weight is None:
+                norm_weight = norm.weight.to(
+                    device=kv_compressed.device, dtype=torch.bfloat16
+                ).contiguous()
             write_kwargs = {}
             forward_metadata = getattr(self, "forward_metadata", None)
             if forward_metadata is not None:
@@ -217,7 +221,7 @@ class CompressorBackendMixin:
                     write_kwargs["write_metadata"] = write_metadata
             aiter_k_indexer_fp4_cache_write(
                 k=kv_compressed,
-                norm_weight=norm.weight if norm_weight is None else norm_weight,
+                norm_weight=norm_weight,
                 norm_epsilon=norm.variance_epsilon,
                 cos=aiter_fp4_cos,
                 sin=aiter_fp4_sin,

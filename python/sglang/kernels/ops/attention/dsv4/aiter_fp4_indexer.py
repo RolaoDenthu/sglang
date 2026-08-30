@@ -105,17 +105,36 @@ def _validate_cos_sin(
         )
 
 
+def validate_aiter_fp4_indexer_static_contract(
+    *,
+    num_heads: int,
+    head_dim: int,
+    rope_dim: int,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_weight: torch.Tensor,
+) -> None:
+    """Validate model-owned FP4 tensors once, before the forward hot path."""
+    if (num_heads, head_dim, rope_dim) != (_Q_HEADS, _Q_HEAD_DIM, _ROPE_DIM):
+        raise ValueError(
+            "AITER FP4 C4Indexer requires 64 heads, head_dim=128, and rope_dim=64; "
+            f"got heads={num_heads}, head_dim={head_dim}, rope_dim={rope_dim}"
+        )
+    _validate_cos_sin(cos, sin, cos.device)
+    if norm_weight.shape != (_Q_HEAD_DIM,):
+        raise ValueError(
+            "AITER FP4 C4Indexer requires norm_weight shape [128]; "
+            f"got {tuple(norm_weight.shape)}"
+        )
+
+
 def aiter_q_indexer_rope_hadamard_fp4_quant(
     q: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if q.ndim != 3 or tuple(q.shape[1:]) != (_Q_HEADS, _Q_HEAD_DIM):
-        raise ValueError(
-            "AITER FP4 C4Indexer requires q shape [T, 64, 128]; "
-            f"got {tuple(q.shape)}"
-        )
+    """Quantize Q after model-owned geometry and RoPE tables are validated."""
     if q.dtype != torch.bfloat16:
         raise ValueError(
             "AITER FP4 C4Indexer requires q dtype torch.bfloat16; " f"got {q.dtype}"
@@ -130,7 +149,6 @@ def aiter_q_indexer_rope_hadamard_fp4_quant(
             f"got positions {tuple(positions.shape)} for T={num_tokens}"
         )
 
-    _validate_cos_sin(cos, sin, q.device)
     positions = positions.to(device=q.device, dtype=torch.int64).contiguous()
 
     # AITER is intentionally imported only after the HIP FP4 path is selected.
@@ -295,52 +313,15 @@ def aiter_fp4_paged_mqa_logits(
     decode_metadata: AiterFP4PagedMQADecodeMetadata | None = None,
     prefill_metadata: AiterFP4PagedMQAPrefillMetadata | None = None,
 ) -> torch.Tensor:
+    """Run logits with immutable Q/K layouts guaranteed by model and pool init."""
     num_tokens = q_fp4.shape[0]
-    if q_fp4.ndim != 3 or tuple(q_fp4.shape[1:]) != (_Q_HEADS, _Q_HEAD_DIM // 2):
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires q_fp4 shape [T, 64, 64]; "
-            f"got {tuple(q_fp4.shape)}"
-        )
-    if q_scale.shape != (num_tokens, *_Q_SCALE_SHAPE):
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires q_scale shape "
-            f"[T, 1, 4, 16, 4]; got {tuple(q_scale.shape)}"
-        )
-    if q_scale.dtype != torch.uint8:
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires uint8 Q scales; "
-            f"got {q_scale.dtype}"
-        )
-    if tuple(k_payload.shape[1:]) != (1, 4, _KV_BLOCK_SIZE, 16):
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires K payload shape "
-            f"[P, 1, 4, 64, 16]; got {tuple(k_payload.shape)}"
-        )
-    if k_payload.shape[0] == 0:
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires at least one K cache page"
-        )
-    if k_scale.shape != k_payload.shape[:-1] or k_scale.dtype != torch.uint8:
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires uint8 K scales with shape "
-            f"[P, 1, 4, 64]; got shape {tuple(k_scale.shape)} and "
-            f"dtype {k_scale.dtype}"
-        )
-    if weights.shape != (num_tokens, _Q_HEADS):
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires weights shape [T, 64]; "
-            f"got {tuple(weights.shape)}"
-        )
-    if weights.dtype != torch.bfloat16 or not weights.is_contiguous():
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires contiguous bfloat16 weights"
-        )
-    if page_table.ndim != 2 or page_table.shape[0] != num_tokens:
-        raise ValueError(
-            "AITER FP4 C4Indexer logits requires row-expanded page_table "
-            f"shape [T, max_blocks]; got {tuple(page_table.shape)}"
-        )
-
+    if (
+        q_scale.shape[0] != num_tokens
+        or weights.shape[0] != num_tokens
+        or page_table.ndim != 2
+        or page_table.shape[0] != num_tokens
+    ):
+        raise ValueError("AITER FP4 logits inputs must have the same row count")
     c4_seq_lens = c4_seq_lens.reshape(-1).to(dtype=torch.int32).contiguous()
     if c4_seq_lens.shape != (num_tokens,):
         raise ValueError(
@@ -349,42 +330,31 @@ def aiter_fp4_paged_mqa_logits(
         )
     if decode_metadata is not None and prefill_metadata is not None:
         raise ValueError("AITER FP4 logits accepts only one metadata mode")
+    if decode_metadata is not None and not is_decode:
+        raise ValueError("AITER FP4 prefill cannot use decode metadata")
+    if prefill_metadata is not None and is_decode:
+        raise ValueError("AITER FP4 decode cannot use prefill metadata")
+
     if decode_metadata is not None:
-        if not is_decode:
-            raise ValueError("AITER FP4 prefill cannot use decode metadata")
         padded_page_table = decode_metadata.padded_page_table
         logical_max_seq_len = page_table.shape[1] * _KV_BLOCK_SIZE
         max_seq_len = decode_metadata.out.shape[1]
         if (
             decode_metadata.logical_max_seq_len != logical_max_seq_len
-            or padded_page_table.shape
-            != (num_tokens, max_seq_len // _KV_BLOCK_SIZE + 4)
-            or padded_page_table.dtype != torch.int32
-            or decode_metadata.cta_info.shape != (decode_metadata.total_ctas, 4)
-            or decode_metadata.cta_info.dtype != torch.int32
-            or decode_metadata.out.shape != (num_tokens, max_seq_len)
-            or decode_metadata.out.dtype != torch.float32
+            or padded_page_table.shape[0] != num_tokens
+            or decode_metadata.out.shape[0] != num_tokens
         ):
             raise ValueError("AITER FP4 decode metadata does not match logits inputs")
     elif prefill_metadata is not None:
-        if is_decode:
-            raise ValueError("AITER FP4 decode cannot use prefill metadata")
         padded_page_table = prefill_metadata.padded_page_table
         logical_max_seq_len = page_table.shape[1] * _KV_BLOCK_SIZE
         max_seq_len = prefill_metadata.out.shape[1]
         if (
             prefill_metadata.logical_max_seq_len != logical_max_seq_len
-            or padded_page_table.shape
-            != (num_tokens, max_seq_len // _KV_BLOCK_SIZE + 4)
-            or padded_page_table.dtype != torch.int32
-            or prefill_metadata.row_to_batch.shape != (num_tokens,)
-            or prefill_metadata.row_to_batch.dtype != torch.int32
-            or prefill_metadata.local_starts.shape != (num_tokens,)
-            or prefill_metadata.local_starts.dtype != torch.int32
-            or prefill_metadata.cta_info.shape != (prefill_metadata.n_ctas, 6)
-            or prefill_metadata.cta_info.dtype != torch.int32
-            or prefill_metadata.out.shape != (num_tokens, max_seq_len)
-            or prefill_metadata.out.dtype != torch.float32
+            or padded_page_table.shape[0] != num_tokens
+            or prefill_metadata.row_to_batch.shape[0] != num_tokens
+            or prefill_metadata.local_starts.shape[0] != num_tokens
+            or prefill_metadata.out.shape[0] != num_tokens
         ):
             raise ValueError("AITER FP4 prefill metadata does not match logits inputs")
     else:
@@ -515,10 +485,11 @@ def aiter_k_indexer_fp4_cache_write(
     k_scale: torch.Tensor,
     write_metadata: Tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
-    if k.ndim != 2 or k.shape[1] != _Q_HEAD_DIM:
-        raise ValueError(
-            "AITER FP4 C4Indexer requires k shape [N, 128]; " f"got {tuple(k.shape)}"
-        )
+    """Write K after model-owned RoPE and cache layouts are validated."""
+    if k.dtype != torch.bfloat16 or not k.is_contiguous():
+        raise ValueError("AITER FP4 C4Indexer requires contiguous bfloat16 K")
+    if norm_weight.dtype != torch.bfloat16 or not norm_weight.is_contiguous():
+        raise ValueError("AITER FP4 C4Indexer requires contiguous bfloat16 norm_weight")
     num_rows = k.shape[0]
     if plan.compress_ratio != 4 or plan[1].shape != (num_rows, 16):
         raise ValueError(
@@ -531,26 +502,6 @@ def aiter_k_indexer_fp4_cache_write(
             "AITER FP4 C4Indexer requires one-dimensional out_loc; "
             f"got {tuple(out_loc.shape)}"
         )
-    if norm_weight.shape != (_Q_HEAD_DIM,):
-        raise ValueError(
-            "AITER FP4 C4Indexer requires norm_weight shape [128]; "
-            f"got {tuple(norm_weight.shape)}"
-        )
-    if tuple(k_payload.shape[1:]) != (1, 4, _KV_BLOCK_SIZE, 16):
-        raise ValueError(
-            "AITER FP4 C4Indexer requires payload shape [P, 1, 4, 64, 16]; "
-            f"got {tuple(k_payload.shape)}"
-        )
-    if k_scale.shape != k_payload.shape[:-1]:
-        raise ValueError(
-            "AITER FP4 C4Indexer requires scale shape [P, 1, 4, 64]; "
-            f"got {tuple(k_scale.shape)}"
-        )
-    if k_scale.dtype != torch.uint8:
-        raise ValueError(
-            "AITER FP4 C4Indexer requires uint8 K scales; " f"got {k_scale.dtype}"
-        )
-    _validate_cos_sin(cos, sin, k.device)
     if num_rows == 0:
         return
     if plan.is_decode and out_loc.shape[0] != num_rows:
@@ -582,11 +533,7 @@ def aiter_k_indexer_fp4_cache_write(
                     f"{tensor.dtype}, device {tensor.device}, contiguous "
                     f"{tensor.is_contiguous()}"
                 )
-    k_bf16 = k.to(dtype=torch.bfloat16).contiguous().view(num_rows, 1, _Q_HEAD_DIM)
-    # Convert all 128 values per call so post-load weight mutations cannot stale a cache.
-    norm_weight_bf16 = norm_weight.to(
-        device=k.device, dtype=torch.bfloat16
-    ).contiguous()
+    k_bf16 = k.view(num_rows, 1, _Q_HEAD_DIM)
 
     # AITER is intentionally imported only after the HIP FP4 path is selected.
     import aiter
@@ -595,7 +542,7 @@ def aiter_k_indexer_fp4_cache_write(
         k_payload,
         k_scale,
         k_bf16,
-        norm_weight_bf16,
+        norm_weight,
         cos,
         sin,
         positions,

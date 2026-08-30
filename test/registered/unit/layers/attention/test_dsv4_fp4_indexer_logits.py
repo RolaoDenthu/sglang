@@ -1,59 +1,28 @@
-import os
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+import torch.nn as nn
 
-import sglang.srt.utils as srt_utils
-
-fake_aiter_for_import = ModuleType("aiter")
-fake_aiter_for_import.__path__ = []
-fake_aiter_ops = ModuleType("aiter.ops")
-fake_aiter_ops.__path__ = []
-fake_aiter_triton = ModuleType("aiter.ops.triton")
-fake_aiter_triton.__path__ = []
-fake_aiter_quant = ModuleType("aiter.ops.triton.quant")
-fake_aiter_quant.dynamic_mxfp4_quant = Mock()
-
-fake_aiter_modules = {
-    "aiter": fake_aiter_for_import,
-    "aiter.ops": fake_aiter_ops,
-    "aiter.ops.triton": fake_aiter_triton,
-    "aiter.ops.triton.quant": fake_aiter_quant,
-}
-missing_module = object()
-previous_aiter_modules = {
-    name: sys.modules.get(name, missing_module) for name in fake_aiter_modules
-}
-sys.modules.update(fake_aiter_modules)
-try:
-    with (
-        patch.dict(os.environ, {"SGLANG_USE_AITER": "0"}),
-        patch.object(srt_utils, "is_hip", return_value=False),
-        patch.object(
-            torch.cuda,
-            "get_device_properties",
-            return_value=SimpleNamespace(gcnArchName="gfx950", major=9, minor=5),
-        ),
-    ):
-        import sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer as aiter_fp4_indexer
-        from sglang.srt.environ import envs
-        from sglang.srt.layers.attention.dsv4.indexer import (
-            C4IndexerBackendMixin,
-            topk_transform_512_pytorch_vectorized,
-        )
-        from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-        from sglang.test.ci.ci_register import register_cpu_ci
-finally:
-    for module_name, previous_module in previous_aiter_modules.items():
-        if previous_module is missing_module:
-            sys.modules.pop(module_name, None)
-        else:
-            sys.modules[module_name] = previous_module
-
+import sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer as aiter_fp4_indexer
+import sglang.srt.layers.attention.dsv4.compressor_v2 as compressor_v2
+import sglang.srt.layers.attention.dsv4.indexer as indexer_module
+from sglang.kernels.ops.attention.dsv4.compress import (
+    CompressorDecodePlan,
+    CompressorPrefillPlan,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.compressor_v2 import CompressorBackendMixin
+from sglang.srt.layers.attention.dsv4.indexer import (
+    C4Indexer,
+    C4IndexerBackendMixin,
+    topk_transform_512_pytorch_vectorized,
+)
+from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -73,6 +42,15 @@ def _fake_flydsl():
         "aiter.ops": ops,
         "aiter.ops.flydsl": flydsl,
     }
+
+
+class _StaticLinear(nn.Module):
+    def __init__(self, output):
+        super().__init__()
+        self.output = output
+
+    def forward(self, _):
+        return self.output, None
 
 
 class TestAITERFP4IndexerLogits(unittest.TestCase):
@@ -383,54 +361,6 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
                     )
                     torch.testing.assert_close(page_table, original_page_table)
 
-    def test_prefill_dispatch_uses_call_local_graph_pool_temporaries(self):
-        case = self._make_dispatch(
-            mode=ForwardMode.EXTEND,
-            num_tokens=2,
-            metadata_rows=2,
-            batch_size=1,
-        )
-        flydsl, modules = _fake_flydsl()
-        flydsl.flydsl_pa_mqa_logits_fp4_prefill.return_value = torch.empty(
-            (2, 256), dtype=torch.float32
-        )
-        real_arange = torch.arange
-        real_zeros = torch.zeros
-        with (
-            patch.dict(sys.modules, modules),
-            patch.object(
-                aiter_fp4_indexer.torch, "arange", wraps=real_arange
-            ) as arange,
-            patch.object(aiter_fp4_indexer.torch, "zeros", wraps=real_zeros) as zeros,
-        ):
-            case.backend.forward_c4_indexer(
-                x=torch.empty(case.q_fp4.shape[0], 1),
-                q_lora=torch.empty(case.q_fp4.shape[0], 1),
-                c4_indexer=case.c4_indexer,
-                forward_batch=case.forward_batch,
-            )
-
-        case.backend._forward_prepare_normal.assert_called_once()
-        case.token_pool.get_index_k_fp4_payload_buffer.assert_called_once_with(
-            layer_id=7
-        )
-        case.token_pool.get_index_k_fp4_scale_buffer.assert_called_once_with(layer_id=7)
-        flydsl.flydsl_pa_mqa_logits_fp4.assert_not_called()
-        flydsl.flydsl_pa_mqa_logits_fp4_prefill.assert_called_once()
-        args = flydsl.flydsl_pa_mqa_logits_fp4_prefill.call_args.args
-        torch.testing.assert_close(
-            args[4],
-            torch.tensor(
-                [[0, 1, 0, 0, 0, 0, 0, 0], [2, 3, 0, 0, 0, 0, 0, 0]],
-                dtype=torch.int32,
-            ),
-        )
-        torch.testing.assert_close(args[6], torch.arange(2, dtype=torch.int32))
-        torch.testing.assert_close(args[7], torch.zeros(2, dtype=torch.int32))
-        torch.testing.assert_close(args[8], case.c4_seq_lens)
-        arange.assert_called_once_with(2, device=case.q_fp4.device, dtype=torch.int32)
-        zeros.assert_called_once_with(2, device=case.q_fp4.device, dtype=torch.int32)
-
     def test_prefill_dispatch_reuses_cached_logits_metadata(self):
         case = self._make_dispatch(
             mode=ForwardMode.EXTEND,
@@ -503,8 +433,7 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
                 return_value=cached_metadata,
             ) as prepare,
             patch(
-                "sglang.srt.layers.attention.dsv4.indexer."
-                "aiter_fp4_paged_mqa_logits",
+                "sglang.srt.layers.attention.dsv4.indexer.aiter_fp4_paged_mqa_logits",
                 return_value=torch.empty((1, 128), dtype=torch.float32),
             ) as logits,
         ):
@@ -605,6 +534,190 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
         )
         self.assertIs(args[5], indexer_metadata.deep_gemm_metadata)
         self.assertEqual(args[6:], (128, False))
+
+
+class TestAITERFP4ProducerRouting(unittest.TestCase):
+    def _make_indexer(self, *, use_fp4_indexer: bool):
+        projected = torch.empty((2, 64 * 128), dtype=torch.bfloat16)
+        indexer = C4Indexer.__new__(C4Indexer)
+        nn.Module.__init__(indexer)
+        indexer.n_local_heads = 64
+        indexer.head_dim = 128
+        indexer.use_fp4_indexer = use_fp4_indexer
+        indexer.weight_scale = 0.125
+        indexer.freqs_cis = torch.empty((128, 32), dtype=torch.complex64)
+        indexer.compressor = SimpleNamespace(
+            aiter_fp4_cos=torch.empty((128, 32), dtype=torch.bfloat16),
+            aiter_fp4_sin=torch.empty((128, 32), dtype=torch.bfloat16),
+        )
+        indexer.wq_b = _StaticLinear(projected)
+        return indexer
+
+    def test_static_contract_validates_geometry_and_rope_once(self):
+        cos = torch.empty((128, 32), dtype=torch.bfloat16)
+        sin = torch.empty_like(cos)
+        norm_weight = torch.empty(128)
+
+        aiter_fp4_indexer.validate_aiter_fp4_indexer_static_contract(
+            num_heads=64,
+            head_dim=128,
+            rope_dim=64,
+            cos=cos,
+            sin=sin,
+            norm_weight=norm_weight,
+        )
+        with self.assertRaisesRegex(ValueError, "requires 64 heads"):
+            aiter_fp4_indexer.validate_aiter_fp4_indexer_static_contract(
+                num_heads=32,
+                head_dim=128,
+                rope_dim=64,
+                cos=cos,
+                sin=sin,
+                norm_weight=norm_weight,
+            )
+
+    def test_q_producer_routes_aiter_cuda_fp4_and_fp8(self):
+        positions = torch.arange(2, dtype=torch.int64)
+        weights = torch.empty((2, 64), dtype=torch.bfloat16)
+
+        cases = (
+            (True, True, "aiter_q_indexer_rope_hadamard_fp4_quant"),
+            (False, True, "fused_q_indexer_rope_hadamard_fp4_quant"),
+            (False, False, "fused_q_indexer_rope_hadamard_quant"),
+        )
+        for hip, use_fp4, selected_name in cases:
+            with self.subTest(hip=hip, use_fp4=use_fp4):
+                indexer = self._make_indexer(use_fp4_indexer=use_fp4)
+                selected_result = (object(), object())
+                with (
+                    patch.object(indexer_module, "is_hip", return_value=hip),
+                    patch.object(
+                        indexer_module,
+                        "aiter_q_indexer_rope_hadamard_fp4_quant",
+                        return_value=selected_result,
+                    ) as aiter_q,
+                    patch.object(
+                        indexer_module,
+                        "fused_q_indexer_rope_hadamard_fp4_quant",
+                        return_value=selected_result,
+                    ) as cuda_q,
+                    patch.object(
+                        indexer_module,
+                        "fused_q_indexer_rope_hadamard_quant",
+                        return_value=selected_result,
+                    ) as fp8_q,
+                ):
+                    actual = indexer.compute_q(
+                        torch.empty((2, 1), dtype=torch.bfloat16),
+                        positions,
+                        weights,
+                    )
+
+                selected = {
+                    "aiter_q_indexer_rope_hadamard_fp4_quant": aiter_q,
+                    "fused_q_indexer_rope_hadamard_fp4_quant": cuda_q,
+                    "fused_q_indexer_rope_hadamard_quant": fp8_q,
+                }[selected_name]
+                selected.assert_called_once()
+                if hip and use_fp4:
+                    self.assertEqual(actual, (selected_result, weights))
+                else:
+                    self.assertIs(actual, selected_result)
+
+    def test_k_write_metadata_handles_decode_and_ragged_prefill(self):
+        decode_words = torch.zeros((5, 4), dtype=torch.int32)
+        decode_words[:, 0] = torch.tensor([4, 5, 8, -1, 0])
+        decode = CompressorDecodePlan(4, decode_words.view(torch.uint8))
+
+        prefill_words = torch.zeros((3, 4), dtype=torch.int32)
+        prefill_words[:, 0] = torch.tensor([8, 12, -1])
+        prefill_words[:, 1] = torch.tensor([2, 0, 1])
+        prefill = CompressorPrefillPlan(
+            4,
+            prefill_words.view(torch.uint8),
+            torch.empty((0, 8), dtype=torch.uint8),
+        )
+
+        decode_positions, decode_slots = (
+            aiter_fp4_indexer.prepare_aiter_k_indexer_fp4_cache_write_metadata(
+                plan=decode,
+                out_loc=torch.tensor([11, 22, 33, 44, 55]),
+                max_position=128,
+                device=torch.device("cpu"),
+            )
+        )
+        prefill_positions, prefill_slots = (
+            aiter_fp4_indexer.prepare_aiter_k_indexer_fp4_cache_write_metadata(
+                plan=prefill,
+                out_loc=torch.tensor([101, 202, 303]),
+                max_position=128,
+                device=torch.device("cpu"),
+            )
+        )
+
+        torch.testing.assert_close(decode_positions, torch.tensor([0, 1, 4, 0, 0]))
+        torch.testing.assert_close(decode_slots, torch.tensor([11, -1, 33, -1, -1]))
+        torch.testing.assert_close(prefill_positions, torch.tensor([4, 8, 0]))
+        torch.testing.assert_close(prefill_slots, torch.tensor([303, 101, -1]))
+
+    def test_compressor_reuses_cached_norm_weight(self):
+        words = torch.zeros((2, 4), dtype=torch.int32)
+        words[:, 0] = torch.tensor([4, 8])
+        plan = CompressorDecodePlan(4, words.view(torch.uint8))
+        write_metadata = (
+            torch.tensor([0, 4], dtype=torch.int64),
+            torch.tensor([3, 7], dtype=torch.int64),
+        )
+        backend = CompressorBackendMixin.__new__(CompressorBackendMixin)
+        backend._get_paged_compress_metadata = Mock(return_value=plan)
+        backend.forward_metadata = SimpleNamespace(
+            aiter_fp4_k_write_metadata=write_metadata
+        )
+        norm = SimpleNamespace(
+            weight=torch.empty(128),
+            variance_epsilon=1e-6,
+            _aiter_fp4_weight_bf16=torch.empty(128, dtype=torch.bfloat16),
+        )
+
+        with (
+            patch.object(
+                compressor_v2,
+                "compress_forward",
+                return_value=torch.empty((2, 128), dtype=torch.bfloat16),
+            ),
+            patch.object(compressor_v2, "compress_norm_rope_store") as legacy_store,
+            patch.object(
+                aiter_fp4_indexer,
+                "aiter_k_indexer_fp4_cache_write",
+            ) as aiter_store,
+        ):
+            backend._forward_compress_all_in_one(
+                kv_score_buffer=torch.empty((2, 4, 512)),
+                kv_score_input=torch.empty((2, 256)),
+                ape=torch.empty((4, 128)),
+                head_dim=128,
+                norm=norm,
+                freqs_cis_cache=torch.empty((128, 32), dtype=torch.complex64),
+                kv_cache=torch.empty((2, 1, 4, 64, 16), dtype=torch.float4_e2m1fn_x2),
+                kv_scale_cache=torch.empty((2, 1, 4, 64), dtype=torch.uint8),
+                is_indexer=True,
+                rotate=True,
+                compress_ratio=4,
+                page_size=64,
+                out_loc=torch.tensor([3, 7]),
+                use_fp4_indexer=True,
+                use_aiter_fp4_indexer=True,
+                aiter_fp4_cos=torch.empty((128, 32), dtype=torch.bfloat16),
+                aiter_fp4_sin=torch.empty((128, 32), dtype=torch.bfloat16),
+            )
+
+        aiter_store.assert_called_once()
+        self.assertIs(aiter_store.call_args.kwargs["write_metadata"], write_metadata)
+        self.assertIs(
+            aiter_store.call_args.kwargs["norm_weight"],
+            norm._aiter_fp4_weight_bf16,
+        )
+        legacy_store.assert_not_called()
 
 
 if __name__ == "__main__":

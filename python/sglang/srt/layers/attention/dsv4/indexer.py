@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
     aiter_q_indexer_rope_hadamard_fp4_quant,
     prepare_aiter_fp4_indexer_cos_sin,
     prepare_aiter_fp4_paged_mqa_prefill_metadata,
+    validate_aiter_fp4_indexer_static_contract,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -1057,6 +1058,14 @@ class C4Indexer(nn.Module):
             else:
                 self.compressor.aiter_fp4_cos = aiter_fp4_cos
                 self.compressor.aiter_fp4_sin = aiter_fp4_sin
+            validate_aiter_fp4_indexer_static_contract(
+                num_heads=self.n_heads,
+                head_dim=self.head_dim,
+                rope_dim=self.rope_head_dim,
+                cos=aiter_fp4_cos,
+                sin=aiter_fp4_sin,
+                norm_weight=self.compressor.norm.weight,
+            )
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5

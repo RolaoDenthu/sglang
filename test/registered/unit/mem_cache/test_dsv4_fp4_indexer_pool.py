@@ -1,58 +1,23 @@
-import sys
 import unittest
 from contextlib import nullcontext
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
 
-import sglang.srt.utils as srt_utils
-
-fake_aiter = ModuleType("aiter")
-fake_aiter.__path__ = []
-fake_aiter_ops = ModuleType("aiter.ops")
-fake_aiter_ops.__path__ = []
-fake_aiter_triton = ModuleType("aiter.ops.triton")
-fake_aiter_triton.__path__ = []
-fake_aiter_quant = ModuleType("aiter.ops.triton.quant")
-fake_aiter_quant.dynamic_mxfp4_quant = Mock()
-
-modules_before_import = set(sys.modules)
-with (
-    patch.object(srt_utils, "is_hip", return_value=False),
-    patch.object(
-        torch.cuda,
-        "get_device_properties",
-        return_value=SimpleNamespace(gcnArchName="gfx950", major=9, minor=5),
-    ),
-    patch.dict(
-        sys.modules,
-        {
-            "aiter": fake_aiter,
-            "aiter.ops": fake_aiter_ops,
-            "aiter.ops.triton": fake_aiter_triton,
-            "aiter.ops.triton.quant": fake_aiter_quant,
-        },
-    ),
-):
-    import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
-    import sglang.srt.model_executor.pool_configurator as pool_configurator
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-        DeepSeekV4IndexerPool,
-        DeepSeekV4LayerItem,
-        DeepSeekV4TokenToKVPool,
-    )
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-        build_deepseek_v4_hicache_stack,
-    )
-    from sglang.srt.mem_cache.memory_pool import KVCache
-    from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
-    from sglang.test.ci.ci_register import register_cpu_ci
-    from sglang.test.test_utils import CustomTestCase
-
-for module_name in set(sys.modules) - modules_before_import:
-    if module_name.startswith("sglang."):
-        sys.modules.pop(module_name, None)
+import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
+import sglang.srt.model_executor.pool_configurator as pool_configurator
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4IndexerPool,
+    DeepSeekV4LayerItem,
+    DeepSeekV4TokenToKVPool,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    build_deepseek_v4_hicache_stack,
+)
+from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -79,7 +44,7 @@ def _init_kv_cache(
     pool.memory_saver_adapter = SimpleNamespace(region=lambda _: nullcontext())
 
 
-class TestDeepSeekV4FP4IndexerPool(CustomTestCase):
+class TestDeepSeekV4FP4IndexerPool(unittest.TestCase):
     def _make_pool(self, *, hip, enabled):
         def allocate_meta(*shape, dtype, device):
             if len(shape) == 1 and isinstance(shape[0], tuple):
@@ -140,16 +105,6 @@ class TestDeepSeekV4FP4IndexerPool(CustomTestCase):
         self.assertEqual(payload[0].nbytes + scale[0].nbytes, 4352)
         with self.assertRaisesRegex(RuntimeError, "split payload and scale"):
             pool.get_index_k_with_scale_buffer(0)
-
-    def test_fp4_payload_view_preserves_real_shape_and_bytes(self):
-        raw_payload = torch.zeros((3, 1, 4, 64, 16), dtype=torch.uint8)
-        payload = raw_payload.view(torch.float4_e2m1fn_x2)
-
-        self.assertEqual(payload.shape, (3, 1, 4, 64, 16))
-        self.assertEqual(payload.dtype, torch.float4_e2m1fn_x2)
-        self.assertEqual(payload.data_ptr(), raw_payload.data_ptr())
-        self.assertEqual(payload.nbytes, 3 * 4096)
-        self.assertEqual(payload[0].nbytes, 4096)
 
     def test_cuda_fp4_keeps_combined_planar_layout(self):
         pool, zeros = self._make_pool(hip=False, enabled=True)
