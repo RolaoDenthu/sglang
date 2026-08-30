@@ -55,12 +55,12 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
             validate_deepseek_v4_fp4_indexer(self._server_args())
 
     @patch(
-        "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx950_supported",
+        "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx95_supported",
         return_value=True,
     )
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.is_hip", return_value=True)
     def test_hip_ordinary_single_node_with_required_aiter_is_accepted(
-        self, _mock_is_hip, _mock_gfx950
+        self, _mock_is_hip, _mock_gfx95
     ):
         with patch(
             "sglang.srt.arg_groups.deepseek_v4_hook.importlib.import_module",
@@ -93,17 +93,17 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
                 True,
                 "PD disaggregation",
             ),
-            ({}, False, "requires an AMD gfx950 GPU"),
+            ({}, False, "requires an AMD gfx95 GPU"),
         )
-        for server_args_kwargs, gfx950_supported, error_pattern in cases:
+        for server_args_kwargs, gfx95_supported, error_pattern in cases:
             with (
                 self.subTest(
                     server_args_kwargs=server_args_kwargs,
-                    gfx950_supported=gfx950_supported,
+                    gfx95_supported=gfx95_supported,
                 ),
                 patch(
-                    "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx950_supported",
-                    return_value=gfx950_supported,
+                    "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx95_supported",
+                    return_value=gfx95_supported,
                 ),
                 patch(
                     "sglang.srt.arg_groups.deepseek_v4_hook.importlib.import_module",
@@ -120,11 +120,11 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
             mock_import.assert_not_called()
 
     @patch(
-        "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx950_supported",
+        "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx95_supported",
         return_value=True,
     )
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.is_hip", return_value=True)
-    def test_hip_invalid_aiter_dependency_is_rejected(self, _mock_is_hip, _mock_gfx950):
+    def test_hip_invalid_aiter_dependency_is_rejected(self, _mock_is_hip, _mock_gfx95):
         cases = tuple(
             (
                 {"missing": missing_api},
@@ -151,11 +151,11 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
                 validate_deepseek_v4_fp4_indexer(self._server_args())
 
     @patch(
-        "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx950_supported",
+        "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx95_supported",
         return_value=True,
     )
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.is_hip", return_value=True)
-    def test_hip_aiter_import_failure_is_rejected(self, _mock_is_hip, _mock_gfx950):
+    def test_hip_aiter_import_failure_is_rejected(self, _mock_is_hip, _mock_gfx95):
         with (
             patch(
                 "sglang.srt.arg_groups.deepseek_v4_hook.importlib.import_module",

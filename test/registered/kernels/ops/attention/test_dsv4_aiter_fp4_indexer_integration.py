@@ -20,6 +20,7 @@ from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
 )
 from sglang.kernels.ops.attention.dsv4.compress import CompressorDecodePlan
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
@@ -36,8 +37,7 @@ SCALE_SENTINEL = 0xD0
 def _has_required_aiter_apis() -> bool:
     if not is_hip() or not torch.cuda.is_available():
         return False
-    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
-    if arch != "gfx950":
+    if not is_gfx95_supported():
         return False
 
     import aiter
@@ -70,7 +70,7 @@ def _has_required_aiter_apis() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _has_required_aiter_apis(),
-    reason="requires HIP on exact gfx950 with AITER FP4 indexer APIs",
+    reason="requires HIP on gfx95 with AITER FP4 indexer APIs",
 )
 
 

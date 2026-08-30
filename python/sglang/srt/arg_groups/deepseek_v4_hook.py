@@ -10,7 +10,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import (
-    is_gfx950_supported,
+    is_gfx95_supported,
     is_hip,
     is_sm100_supported,
     is_sm120_supported,
@@ -77,10 +77,10 @@ def validate_deepseek_v4_fp4_indexer(server_args: ServerArgs) -> None:
                 "remove the FP4 indexer flag. Got "
                 f"--disaggregation-mode={cfg.disaggregation_mode!r}."
             )
-        if not is_gfx950_supported():
+        if not is_gfx95_supported():
             raise ValueError(
                 "--enable-deepseek-v4-fp4-indexer on HIP requires an AMD "
-                "gfx950 GPU; remove the flag or run on gfx950."
+                "gfx95 GPU; remove the flag or run on gfx95."
             )
         if aiter_error := _deepseek_v4_fp4_indexer_aiter_error():
             raise ValueError(
