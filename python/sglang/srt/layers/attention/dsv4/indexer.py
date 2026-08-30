@@ -799,6 +799,7 @@ class C4IndexerBackendMixin:
                 weight_scale=c4_indexer.weight_scale,
                 is_decode=forward_batch.forward_mode.is_decode(),
                 decode_workspace=metadata.fp4_decode_workspace,
+                prefill_workspace=metadata.fp4_prefill_workspace,
             )
         elif nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)

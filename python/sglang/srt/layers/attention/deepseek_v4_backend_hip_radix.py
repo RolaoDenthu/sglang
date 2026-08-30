@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
         FP4DecodeWorkspace,
         FP4KWriteMetadata,
+        FP4PrefillWorkspace,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -362,6 +363,9 @@ class DSV4Metadata:
     fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
     fp4_k_write_metadata: Optional[FP4KWriteMetadata] = field(default=None, repr=False)
     fp4_decode_workspace: Optional[FP4DecodeWorkspace] = field(default=None, repr=False)
+    fp4_prefill_workspace: Optional[FP4PrefillWorkspace] = field(
+        default=None, repr=False
+    )
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -875,15 +879,22 @@ class DeepseekV4HipRadixBackend(
                 )
             )
 
+        can_prepare_fp4_prefill = (
+            forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and get_parallel().attn_cp_size == 1
+            and not forward_batch.tbo_children
+            and forward_batch.tbo_parent_token_range is None
+        )
         if (
             self.enable_deepseek_v4_fp4_indexer
             and isinstance(metadata, DSV4Metadata)
-            and forward_batch.forward_mode.is_decode()
+            and (forward_batch.forward_mode.is_decode() or can_prepare_fp4_prefill)
             and metadata.c4_compress_metadata is not None
         ):
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
                 prepare_fp4_decode_workspace,
                 prepare_fp4_k_write_metadata,
+                prepare_fp4_prefill_workspace,
             )
 
             indexer_metadata = metadata.indexer_metadata
@@ -898,10 +909,16 @@ class DeepseekV4HipRadixBackend(
                 self.fp4_max_position,
                 self.device,
             )
-            metadata.fp4_decode_workspace = prepare_fp4_decode_workspace(
-                indexer_metadata.page_table,
-                indexer_metadata.c4_seq_lens,
-            )
+            if forward_batch.forward_mode.is_decode():
+                metadata.fp4_decode_workspace = prepare_fp4_decode_workspace(
+                    indexer_metadata.page_table,
+                    indexer_metadata.c4_seq_lens,
+                )
+            else:
+                metadata.fp4_prefill_workspace = prepare_fp4_prefill_workspace(
+                    indexer_metadata.page_table,
+                    indexer_metadata.c4_seq_lens,
+                )
 
     def init_forward_metadata_out_graph(
         self,

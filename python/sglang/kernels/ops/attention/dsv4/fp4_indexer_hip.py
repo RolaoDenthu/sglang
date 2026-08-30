@@ -23,6 +23,7 @@ _Q_SCALE_SHAPE = (1, 4, 16, 4)
 _DECODE_BASE_CTA_TARGET = 1024
 # Preserve per-query parallelism when the batch itself exceeds one CTA per CU.
 _DECODE_CTAS_PER_QUERY = 4
+_PREFILL_BASE_CTA_TARGET = 512
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +33,15 @@ _DECODE_CTAS_PER_QUERY = 4
 
 class FP4DecodeWorkspace(NamedTuple):
     guarded_page_table: torch.Tensor
+    cta_info: torch.Tensor
+    cta_count: int
+    logits: torch.Tensor
+
+
+class FP4PrefillWorkspace(NamedTuple):
+    guarded_page_table: torch.Tensor
+    row_to_batch: torch.Tensor
+    local_starts: torch.Tensor
     cta_info: torch.Tensor
     cta_count: int
     logits: torch.Tensor
@@ -94,6 +104,47 @@ def prepare_fp4_decode_workspace(
         device=page_table.device,
     )
     return FP4DecodeWorkspace(page_table, cta_info, cta_count, logits)
+
+
+def prepare_fp4_prefill_workspace(
+    page_table: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+) -> FP4PrefillWorkspace:
+    """Build reusable page-table, schedule, and logits buffers for prefill."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        compute_prefill_schedule,
+    )
+
+    page_table, max_seq_len = _guard_page_table(page_table)
+    c4_seq_lens = c4_seq_lens.reshape(-1).to(torch.int32).contiguous()
+    num_queries = page_table.shape[0]
+    row_to_batch = torch.arange(
+        num_queries, device=page_table.device, dtype=torch.int32
+    )
+    local_starts = torch.zeros(num_queries, device=page_table.device, dtype=torch.int32)
+    cta_count = max(_PREFILL_BASE_CTA_TARGET, num_queries)
+    _, cta_info, _ = compute_prefill_schedule(
+        row_to_batch,
+        local_starts,
+        c4_seq_lens,
+        block_k=256,
+        parallel_unit_num=cta_count,
+        max_seq_len=max_seq_len,
+    )
+    logits = torch.full(
+        (num_queries, max_seq_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=page_table.device,
+    )
+    return FP4PrefillWorkspace(
+        page_table,
+        row_to_batch,
+        local_starts,
+        cta_info,
+        cta_count,
+        logits,
+    )
 
 
 def prepare_fp4_k_write_metadata(
@@ -175,6 +226,7 @@ def aiter_fp4_paged_mqa_logits(
     weight_scale: float,
     is_decode: bool,
     decode_workspace: FP4DecodeWorkspace | None = None,
+    prefill_workspace: FP4PrefillWorkspace | None = None,
 ) -> torch.Tensor:
     """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel."""
     from aiter.ops.flydsl import (
@@ -184,11 +236,22 @@ def aiter_fp4_paged_mqa_logits(
 
     num_tokens = q_fp4.shape[0]
     c4_seq_lens = c4_seq_lens.reshape(-1).to(torch.int32).contiguous()
-    if decode_workspace is None:
-        page_table, max_seq_len = _guard_page_table(page_table)
-    else:
+    if (
+        not is_decode
+        and prefill_workspace is not None
+        and prefill_workspace.logits.shape[0] != num_tokens
+    ):
+        # Preserve the dynamic-row path when activations were truncated after
+        # the shared workspace was prepared.
+        prefill_workspace = None
+    if is_decode and decode_workspace is not None:
         page_table = decode_workspace.guarded_page_table
         max_seq_len = decode_workspace.logits.shape[1]
+    elif not is_decode and prefill_workspace is not None:
+        page_table = prefill_workspace.guarded_page_table
+        max_seq_len = prefill_workspace.logits.shape[1]
+    else:
+        page_table, max_seq_len = _guard_page_table(page_table)
     q_payload = q_fp4.view(torch.uint8)
     k_payload = k_payload.view(torch.uint8)
     common = {
@@ -221,8 +284,22 @@ def aiter_fp4_paged_mqa_logits(
             **common,
         )
     else:
-        row_to_batch = torch.arange(num_tokens, device=q_fp4.device, dtype=torch.int32)
-        local_starts = torch.zeros(num_tokens, device=q_fp4.device, dtype=torch.int32)
+        prefill_kwargs = {}
+        if prefill_workspace is None:
+            row_to_batch = torch.arange(
+                num_tokens, device=q_fp4.device, dtype=torch.int32
+            )
+            local_starts = torch.zeros(
+                num_tokens, device=q_fp4.device, dtype=torch.int32
+            )
+        else:
+            row_to_batch = prefill_workspace.row_to_batch
+            local_starts = prefill_workspace.local_starts
+            prefill_kwargs = {
+                "out": prefill_workspace.logits,
+                "cta_info": prefill_workspace.cta_info,
+                "n_ctas": prefill_workspace.cta_count,
+            }
         logits = flydsl_pa_mqa_logits_fp4_prefill(
             q_payload,
             q_scale,
@@ -234,7 +311,8 @@ def aiter_fp4_paged_mqa_logits(
             local_starts,
             c4_seq_lens,
             max_seq_len,
-            parallel_unit_num=max(512, num_tokens),
+            parallel_unit_num=max(_PREFILL_BASE_CTA_TARGET, num_tokens),
+            **prefill_kwargs,
             **common,
         )
 
