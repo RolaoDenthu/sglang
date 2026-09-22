@@ -21,6 +21,8 @@ class LinearAttnKernelBackend(Enum):
     NVIDIA_KDA = "nvidia_kda"
     PTX_KDA = "ptx_kda"
     HELION = "helion"
+    # gfx950 TLX decode + chunk prefill, via kernels/ops/kimi_k3/tlx.
+    TLX = "tlx"
     INTEL_XPU = "intel_xpu"
     CUSTOM = "custom"
 
@@ -51,6 +53,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_helion(self):
         return self == LinearAttnKernelBackend.HELION
+
+    def is_tlx(self):
+        return self == LinearAttnKernelBackend.TLX
 
     def is_intel_xpu(self):
         return self == LinearAttnKernelBackend.INTEL_XPU

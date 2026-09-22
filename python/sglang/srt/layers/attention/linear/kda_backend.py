@@ -93,10 +93,19 @@ class KDAKernelDispatcher:
             )
 
             self.decode_kernel = FlashInferKDAKernel()
+        elif decode_backend.is_tlx():
+            # gfx950 only, and only under a TLX-capable triton; the kernel
+            # class raises with the launch instructions when either is missing.
+            if not is_gfx95_supported():
+                raise ValueError("KDA TLX backend requires gfx950")
+            from sglang.srt.layers.attention.linear.kernels.kda_tlx import TlxKDAKernel
+
+            self.decode_kernel = TlxKDAKernel()
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA supports 'triton', 'helion', 'cutedsl', or 'flashinfer'."
+                "KDA supports 'triton', 'helion', 'cutedsl', 'flashinfer', "
+                "or 'tlx'."
             )
 
         # target_verify kernel, selected via --linear-attn-verify-backend (defaults
@@ -191,12 +200,22 @@ class KDAKernelDispatcher:
                 rank0_log(
                     "NVIDIA KDA prefill needs SM100; falling back to Triton extend."
                 )
+        elif prefill_backend.is_tlx():
+            from sglang.srt.layers.attention.linear.kernels.kda_tlx import TlxKDAKernel
+
+            # Reuse the decode instance when both phases asked for tlx so the
+            # two share one availability check.
+            self.extend_kernel = (
+                self.decode_kernel
+                if isinstance(self.decode_kernel, TlxKDAKernel)
+                else TlxKDAKernel()
+            )
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
                 "KDA supports 'triton', 'helion', 'flashkda', 'cutedsl', "
-                "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
-                "SM100, ptx_kda SM103)."
+                "'nvidia_kda', 'ptx_kda', or 'tlx' (cutedsl/nvidia_kda prefill "
+                "need SM100, ptx_kda SM103, tlx gfx950)."
             )
 
         self.supports_packed_decode = getattr(
