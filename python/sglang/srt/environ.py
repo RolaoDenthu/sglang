@@ -906,7 +906,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
+    # ROCm decode attention kernel; "auto" resolves to aiter_sparse on gfx950, tilelang elsewhere
+    # (resolve_hip_flashmla_backend). Also: triton | torch | comparison | unified_kv_triton.
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
