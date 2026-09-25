@@ -1,5 +1,5 @@
 """DeepSeek V4.1 low-ratio (1 / 2) indexer on ROCm: FlyDSL fp4 paged MQA logits over the split
-payload / scale index-K pools, then the AOT top-k transform -- the DeepGEMM path's contract."""
+payload / scale index-K pools, then the top-k v2 (or AOT) transform -- the DeepGEMM path's contract."""
 
 from __future__ import annotations
 
@@ -13,7 +13,11 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4 import topk_transform_paged
+from sglang.kernels.ops.attention.dsv4 import (
+    plan_topk_v2,
+    topk_transform_paged,
+    topk_transform_paged_v2,
+)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     LOW_RATIO_PAGE_TABLE_BUCKET,
     FP4DecodeWorkspace,
@@ -28,6 +32,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     sort_selection_rows,
 )
 from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _TORCH_INDEXER_SCORE_BUDGET_BYTES,
     _as_int_list,
@@ -59,6 +64,36 @@ def _aot_topk_sorts_output() -> bool:
     return supported
 
 
+def _topk_v2_fits(scores: torch.Tensor) -> bool:
+    """The one layout the top-k v2 kernel adds over the AOT one: 16-byte aligned score rows."""
+    return envs.SGLANG_OPT_USE_TOPK_V2.get() and scores.stride(0) % 4 == 0
+
+
+def _topk_transform_paged_hip(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_indices: torch.Tensor,
+    page_size: int,
+    raw_indices: Optional[torch.Tensor],
+) -> None:
+    """topk_transform_paged (rows unordered), on the top-k v2 kernel where the scores fit it."""
+    if _topk_v2_fits(scores):
+        topk_transform_paged_v2(
+            scores,
+            seq_lens,
+            page_table,
+            page_indices,
+            page_size,
+            plan_topk_v2(seq_lens),
+            raw_indices,
+        )
+    else:
+        topk_transform_paged(
+            scores, seq_lens, page_table, page_indices, page_size, raw_indices
+        )
+
+
 def topk_transform_paged_sorted(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -68,14 +103,14 @@ def topk_transform_paged_sorted(
     raw_indices: Optional[torch.Tensor],
 ) -> None:
     """topk_transform_paged followed by sort_selection_rows: the -1 padded
-    paged top-k of every row, ascending by position. One launch when the AOT
-    kernel sorts in its epilogue (bitwise the same rows)."""
-    if _aot_topk_sorts_output():
+    paged top-k of every row, ascending by position. On MI355 the v2 kernel plus the
+    sort launch is faster than the AOT kernel sorting in its epilogue."""
+    if not _topk_v2_fits(scores) and _aot_topk_sorts_output():
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
             scores, seq_lens, page_table, page_indices, page_size, raw_indices, True
         )
         return
-    topk_transform_paged(
+    _topk_transform_paged_hip(
         scores, seq_lens, page_table, page_indices, page_size, raw_indices
     )
     sort_selection_rows(page_indices, raw_indices)
@@ -171,7 +206,12 @@ def candidate_block_scores(
     assert block_size & (block_size - 1) == 0, f"{block_size = } must be a power of 2"
     rows, width = logits.shape
     num_blocks = _num_candidate_blocks(width, block_size)
-    scores = torch.empty((rows, num_blocks), dtype=torch.float32, device=logits.device)
+    # rows padded to 16 bytes: the top-k v2 kernel only takes 16-byte aligned rows
+    scores = torch.empty(
+        (rows, triton.cdiv(num_blocks, 4) * 4),
+        dtype=torch.float32,
+        device=logits.device,
+    )[:, :num_blocks]
     grid = (rows, triton.cdiv(num_blocks, _LEVEL_ONE_BLOCKS_PER_PROGRAM))
     _candidate_block_scores_kernel[grid](
         logits,
@@ -352,7 +392,12 @@ def select_candidate_blocks_hip(
     if use_aot:
         # exact top-k over the first ceil(len / block_size) block scores of each row, -1 padded
         ids = torch.empty((rows, topk_blocks), dtype=torch.int32, device=device)
-        torch.ops.sgl_kernel.fast_topk(scores, ids, block_lens, None)
+        if _topk_v2_fits(scores):
+            topk_transform_paged_v2(
+                scores, block_lens, None, ids, 1, plan_topk_v2(block_lens), None
+            )
+        else:
+            torch.ops.sgl_kernel.fast_topk(scores, ids, block_lens, None)
     else:
         picked = scores.topk(min(topk_blocks, num_blocks), dim=-1)
         ids = picked.indices.to(torch.int32).masked_fill(
@@ -426,7 +471,7 @@ def topk_within_candidate_blocks_hip(
     )
     assert compact.shape[1] <= candidates.compact_page_size
     compact_pos = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
-    topk_transform_paged(
+    _topk_transform_paged_hip(
         compact,
         candidates.compact_lens,
         candidates.compact_page_table,
