@@ -10,10 +10,8 @@ from sglang.kernels.ops.activation.silu_and_mul_clamp_hip import (
     silu_and_mul_clamp_fp8_grid_supported,
     silu_and_mul_clamp_triton,
 )
-from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
-    native_consumer_wants_fp8,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_hip import mxfp8_operand_policy
 
 
 def resolve_fused_clamp_route(mlp, half_width: int) -> None:
@@ -26,30 +24,30 @@ def resolve_fused_clamp_route(mlp, half_width: int) -> None:
         and quant_method.block_quant
         and quant_method.weight_block_size == [128, 128]
     )
-    # gfx950 32-block route: the activation lands on the fp8 grid, so down_proj skips its fake-quant
+    # gfx950 32-block native or aiter route: the activation lands on the fp8 grid, so down_proj
+    # skips its fake-quant
     mlp._hip_act_fp8_grid = bool(
         isinstance(quant_method, Fp8LinearMethod)
         and quant_method.block_fp8_as_mxfp8
         and mlp.down_proj.block_fp8_mxfp8_ready
-        and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
+        and (
+            quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
+            or quant_method.mxfp8_dense_backend.is_gfx95_aiter_group32()
+        )
         and silu_and_mul_clamp_fp8_grid_supported(half_width)
     )
-    # the native MXFP8 route takes fp8 + ue8m0 straight from the epilogue at decode token counts
-    mlp._hip_act_native_consumer = bool(
-        mlp._hip_act_fp8_grid
-        and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
-        and mlp.down_proj.mxfp8_native_ready
+    # a route that takes fp8 + ue8m0 gets them straight from the epilogue at the token counts it wants
+    mlp._hip_act_fp8_consumer = (
+        mxfp8_operand_policy(mlp.down_proj) if mlp._hip_act_fp8_grid else None
     )
     mlp._fused_clamp_fp8_checked = True
 
 
 def _emit_fp8(mlp, num_tokens: int) -> bool:
-    """The silu fp8-grid epilogue hands down_proj fp8 + ue8m0 when its native kernel for
-    this token count consumes it directly (skinny range, or a measured dot_scaled bucket)."""
-    if not mlp._hip_act_native_consumer:
-        return False
-    tiles, steps, _ = mlp.down_proj.weight.shape  # lane-order [N/16, K/128, 2048]
-    return native_consumer_wants_fp8(num_tokens, tiles * 16, steps * 128)
+    """The silu fp8-grid epilogue hands down_proj fp8 + ue8m0 when its route consumes them for
+    this token count (aiter always; native: skinny range, or a measured dot_scaled bucket)."""
+    consumer = mlp._hip_act_fp8_consumer
+    return consumer is not None and consumer(num_tokens)
 
 
 def silu_and_mul_clamp(mlp, gate_up: torch.Tensor):

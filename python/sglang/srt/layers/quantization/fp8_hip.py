@@ -1,11 +1,13 @@
 """gfx950 dense routes of Fp8LinearMethod for 32x32-block fp8 checkpoints served as
 MXFP8 (block_fp8_as_mxfp8): the Triton dot_scaled kernel, or the native scaled-MFMA
-kernels on a lane-ordered weight. The fused gfx950 producers hand these routes their
-operand as an Fp8GridActivation (bf16 already on the fp8 grid) or an Mxfp8Activation."""
+kernels on a lane-ordered weight (or aiter's group32 GEMM on the plain one). The fused gfx950
+producers hand these routes their operand as an Fp8GridActivation (bf16 already on the fp8
+grid) or an Mxfp8Activation."""
 
 from __future__ import annotations
 
-from typing import Optional
+import functools
+from typing import Callable, Optional
 
 import torch
 
@@ -17,10 +19,39 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     dequant_mxfp8_to_bf16,
 )
 from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+    native_consumer_wants_fp8,
     native_route_supports,
     prepare_mxfp8_native_weight,
+    ue8m0_weight_scale,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+
+
+def _wants_fp8_at_every_token_count(num_tokens: int) -> bool:
+    return True
+
+
+def mxfp8_operand_policy(
+    layer: Optional[torch.nn.Module],
+) -> Optional[Callable[[int], bool]]:
+    """For a linear whose gfx950 route consumes fp8 + ue8m0 scales directly, whether a fused
+    producer should hand it that operand for a token count (aiter's group32 GEMM always, the
+    native kernels per their tuned table); None when the route takes bf16. Needs loaded weights."""
+    method = getattr(layer, "quant_method", None)
+    if not (
+        getattr(method, "block_fp8_as_mxfp8", False)
+        and getattr(layer, "block_fp8_mxfp8_ready", False)
+    ):
+        return None
+    backend = method.mxfp8_dense_backend
+    if backend.is_gfx95_aiter_group32():
+        return _wants_fp8_at_every_token_count
+    if backend.is_gfx95_mxfp8_native() and layer.mxfp8_native_ready:
+        tiles, steps, _ = (
+            layer.weight.shape
+        )  # the lane-order layout [N/16, K/128, 2048]
+        return functools.partial(native_consumer_wants_fp8, n=tiles * 16, k=steps * 128)
+    return None
 
 
 def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
@@ -30,6 +61,14 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
         # dot_scaled reads canonical [N, K // 32] e8m0 bytes; block scales stay for direct readers
         if scale_u8 is not None:
             copy_or_rebind_param(layer, "weight_scale_inv_mx", scale_u8.contiguous())
+        return
+    if backend.is_gfx95_aiter_group32():
+        # the weight stays [N, K]; aiter reads the block scales compact, one row per 32 output rows
+        copy_or_rebind_param(
+            layer,
+            "weight_scale_mx_e8m0",
+            ue8m0_weight_scale(layer.weight_scale_inv.data),
+        )
         return
     assert backend.is_gfx95_mxfp8_native()
     n, k = layer.weight.shape
@@ -69,12 +108,13 @@ def apply_dense(
     backend = method.mxfp8_dense_backend
     mxfp8_ready = layer.block_fp8_mxfp8_ready
     native_route = mxfp8_ready and backend.is_gfx95_mxfp8_native()
-    # Unwrap the producer's operand: the native route takes fp8 + scales or the fp8-grid
-    # bf16 directly; the dot_scaled route quantizes the plain tensor itself (per-32
-    # rounding is idempotent, so the wrapper's rounding is exact for it).
+    aiter_route = mxfp8_ready and backend.is_gfx95_aiter_group32()
+    # Unwrap the producer's operand: the native and aiter routes take fp8 + scales directly,
+    # the native one also the fp8-grid bf16; the other routes quantize the plain tensor
+    # themselves (per-32 rounding is idempotent, so the wrapper's rounding is exact for them).
     input_scale, on_fp8_grid = None, False
     if isinstance(x, Mxfp8Activation):
-        if native_route:
+        if native_route or aiter_route:
             x, input_scale = x.q, x.scale
         else:
             x = dequant_mxfp8_to_bf16(x.q, x.scale)
@@ -84,6 +124,14 @@ def apply_dense(
         x, input_scale = x
     if native_route:
         return _apply_native(method, layer, x, bias, input_scale, on_fp8_grid)
+    if aiter_route:
+        return method.w8a8_mxfp8_linear(
+            input=x,
+            weight=layer.weight,
+            weight_scale_ue8m0=layer.weight_scale_mx_e8m0,
+            input_scale=input_scale,
+            bias=bias,
+        )
     if mxfp8_ready and input_scale is None:
         return method.w8a8_mxfp8_linear(
             input=x,
