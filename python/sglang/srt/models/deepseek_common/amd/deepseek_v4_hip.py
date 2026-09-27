@@ -27,6 +27,7 @@ fused_rmsnorm_fp8_quant_eligible = gfx95_dense.fused_rmsnorm_fp8_quant_eligible
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
 wo_b_takes_fp8_grid = gfx95_dense.wo_b_takes_fp8_grid
+wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 
 
 # ---- MqaAttentionBase / MQALayer ----
