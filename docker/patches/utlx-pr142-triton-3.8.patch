@@ -5,6 +5,18 @@ The PR targets Triton main, where AsyncCopyGlobalToLocalOp takes a cachePolicy
 attribute. On release/3.8 the op takes cache/evict/isVolatile/contiguity
 instead, and their defaults are what the PR passes on main.
 
+Release/3.8 also has no TritonSemantic.make_tensor, so uTLX falls back to
+patching tl.tensor.__init__ process-wide. _promote then re-types every gluon
+distributed_type (a block_type subclass whose IR always carries an encoding)
+as a plain carrier, and every gluon kernel in the process -- e.g. aiter's
+mla_gluon decode -- fails with "expected ... to be a distributed_type".
+Gluon values already carry their layout, so _promote leaves them alone.
+
+On AMD the add_stages hook also replaced the ttgir stage of every kernel,
+gluon included, with the uTLX TTIR->TTGIR pipeline; that conversion marks
+gluon's amdg.buffer_load_to_local illegal. The hook now leaves non-Triton
+languages on their own stages.
+
 diff --git a/extensions/utlx/ops/NewOps.cpp b/extensions/utlx/ops/NewOps.cpp
 index 4c3feaf..b078cc0 100644
 --- a/extensions/utlx/ops/NewOps.cpp
@@ -19,3 +31,55 @@ index 4c3feaf..b078cc0 100644
    // NB: op->getResult(0), not op.getResult(). This op has an *operand* named
    // `result` (the destination memdesc), so the generated getResult() accessor
    // returns that operand and shadows Operation::getResult() -- which silently
+diff --git a/extensions/utlx/python/utlx_plugin/compiler/semantic.py b/extensions/utlx/python/utlx_plugin/compiler/semantic.py
+index 9f8e583..68d413f 100644
+--- a/extensions/utlx/python/utlx_plugin/compiler/semantic.py
++++ b/extensions/utlx/python/utlx_plugin/compiler/semantic.py
+@@ -30,6 +30,11 @@ from triton.language.semantic import TritonSemantic as _BaseSemantic
+ 
+ from ..layout_ops import _carrier_type, _require
+ 
++try:
++    from triton.experimental.gluon.language import distributed_type as _gluon_type
++except ImportError:  # Triton built without gluon
++    _gluon_type = ()
++
+ _TensorTy = TypeVar("_TensorTy")
+ 
+ 
+@@ -48,6 +53,11 @@ def _promote(handle, type):
+     """
+     if not isinstance(type, tl.block_type) or isinstance(type, _carrier_type):
+         return type
++    # Gluon's distributed_type subclasses block_type and always carries its
++    # layout; re-typing it as a carrier makes gluon ops reject the value. This
++    # path also sees gluon kernels whenever the tl.tensor fallback patch is in.
++    if isinstance(type, _gluon_type):
++        return type
+     try:
+         ir_ty = handle.get_type()
+     except AttributeError:
+diff --git a/extensions/utlx/python/utlx_plugin/custom_stages.py b/extensions/utlx/python/utlx_plugin/custom_stages.py
+index f9841f2..ac4aaf0 100644
+--- a/extensions/utlx/python/utlx_plugin/custom_stages.py
++++ b/extensions/utlx/python/utlx_plugin/custom_stages.py
+@@ -5,6 +5,7 @@ Hooks into triton's compilation pipeline to inject uTLX passes.
+ 
+ from triton._C.libtriton import ir, passes, amd
+ from triton import knobs
++from triton.backends.compiler import Language
+ import hashlib
+ import pathlib
+ 
+@@ -52,6 +53,11 @@ def inspect_stages_hook(self=None,
+     if all(arg is None for arg in (stages, options, language, capability)):
+         return get_key(), get_hash()
+ 
++    # Gluon kernels have their own ttgir stage (gluon_to_ttgir) and are already
++    # in TTGIR; the uTLX TTIR->TTGIR conversion marks their amdg ops illegal.
++    if language is not None and language != Language.TRITON:
++        return get_key(), get_hash()
++
+     backend_name = getattr(self, 'name', '') if self else ''
+     target = getattr(options, 'arch', '') if options else ''
+ 
