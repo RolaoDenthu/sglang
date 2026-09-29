@@ -142,4 +142,6 @@ class TlxKDAKernel(TritonKDAKernel):
             cu_seqlens=query_start_loc,
         )
         ssm_states[cache_indices.long()] = final_state
-        return out, None
+        # Same contract as chunk_kda: a bare tensor unless intermediate states
+        # were requested, and those requests take the Triton path above.
+        return out

@@ -31,7 +31,13 @@ def _tlx_module():
     try:
         from triton.language.extra import tlx
     except ImportError:
-        return None
+        # Under uTLX (upstream Triton + plugin) the module only exists once
+        # utlx_plugin has been imported; its .pth just registers libutlx.so.
+        try:
+            import utlx_plugin  # noqa: F401
+            from triton.language.extra import tlx
+        except ImportError:
+            return None
     return tlx
 
 
