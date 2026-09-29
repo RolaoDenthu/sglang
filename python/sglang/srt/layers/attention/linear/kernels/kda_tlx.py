@@ -110,10 +110,13 @@ class TlxKDAKernel(TritonKDAKernel):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # draft_extend_v2 (is_spec_decode) must stay rollback-able; like the
+        # FlashKDA / PTX backends, leave it to the Triton kernel.
         if (
             not self._prefill_ok
             or return_intermediate_states
             or kwargs.get("track_state") is not None
+            or kwargs.get("is_spec_decode")
             or A_log is None
         ):
             return super().extend(
