@@ -37,6 +37,7 @@ requires_tlx_prefill = pytest.mark.skipif(
 )
 
 if _gfx950_tlx_available():
+    from sglang.kernels.ops.kimi_k3.tlx.kimi_k3_kda_prepare import prepare_kda_inputs
     from sglang.srt.layers.attention.linear.kernels.kda_tlx import TlxKDAKernel
     from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 
@@ -271,6 +272,79 @@ def test_extend_saturated_safe_gate_stays_finite(seq_lens: list[int]) -> None:
     assert _relative_rmse(ref, out) < _EXTEND_TOL
     idx = case.cache_indices.long()
     assert _relative_rmse(ref_pool[idx], tlx_pool[idx]) < _EXTEND_TOL
+
+
+def _prepare_reference(q, k, a, b, A_log, dt_bias, lower_bound, sigmoid_beta):
+    tokens = a.numel() // (_HEADS * _DIM)
+    q, k = (x.reshape(tokens, _HEADS, _DIM).float() for x in (q, k))
+    q = q / torch.sqrt(q.square().sum(-1, keepdim=True) + 1e-6)
+    k = k / torch.sqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+    x = a.reshape(tokens, _HEADS, _DIM).float() + dt_bias.view(_HEADS, _DIM)
+    A = A_log.exp().view(1, _HEADS, 1)
+    if lower_bound is None:
+        g = -A * torch.nn.functional.softplus(x, threshold=20.0)
+    else:
+        g = lower_bound * torch.sigmoid(A * x)
+    beta = b.reshape(tokens, _HEADS).float()
+    if sigmoid_beta:
+        beta = beta.sigmoid()
+    return q.bfloat16(), k.bfloat16(), g, beta
+
+
+# 341 * 12 = 4092 rows and 342 * 12 = 4104 rows sit on either side of the
+# small/large tile switch; 37 and 1000 leave a partial last tile.
+@pytest.mark.parametrize("sigmoid_beta", [True, False])
+@pytest.mark.parametrize("lower_bound", [None, _LOWER_BOUND])
+@pytest.mark.parametrize("strided", [True, False])
+@pytest.mark.parametrize("tokens", [1, 37, 341, 342, 1000])
+def test_prepare_matches_reference(
+    tokens: int, strided: bool, lower_bound: Optional[float], sigmoid_beta: bool
+) -> None:
+    case = _make_case([tokens], decode=True)
+    if strided:
+        q, k, _ = _split_qkv(case.qkv)
+    else:
+        q, k, _ = (t.contiguous() for t in _split_qkv(case.qkv))
+    args = (q, k, case.a, case.b, case.A_log, case.dt_bias)
+
+    qn, kn, g, beta = prepare_kda_inputs(
+        *args, num_heads=_HEADS, head_dim=_DIM,
+        lower_bound=lower_bound, sigmoid_beta=sigmoid_beta,
+    )
+    ref = _prepare_reference(*args, lower_bound, sigmoid_beta)
+
+    assert qn.shape == kn.shape == g.shape == (1, tokens, _HEADS, _DIM)
+    assert beta.shape == (1, tokens, _HEADS)
+    # q/k are rounded to bf16 after a reduction whose order differs from torch,
+    # so they get bf16 tolerances; the fp32 gate and beta must match tightly.
+    for out, expected in zip((qn, kn), ref[:2]):
+        torch.testing.assert_close(out[0], expected)
+    for out, expected in zip((g, beta), ref[2:]):
+        torch.testing.assert_close(out[0], expected, rtol=1e-5, atol=1e-5)
+
+
+@requires_tlx_prefill
+def test_extend_spec_decode_falls_back_to_triton() -> None:
+    # draft_extend_v2 must stay on Triton, so TLX has to match it exactly.
+    case = _make_case([37, 300], decode=False, beta_is_raw=False)
+    ref_pool, tlx_pool = case.pool.clone(), case.pool.clone()
+
+    def run(kernel, pool):
+        q, k, v = _split_qkv(case.qkv.clone())
+        return kernel.extend(
+            q, k, v, case.a.clone(), case.b.clone(),
+            ssm_states=pool, cache_indices=case.cache_indices,
+            query_start_loc=case.query_start_loc, A_log=case.A_log,
+            dt_bias=case.dt_bias, lower_bound=_LOWER_BOUND,
+            beta_is_raw=False, is_spec_decode=True,
+        )
+
+    ref = run(TritonKDAKernel(), ref_pool)
+    out = run(TlxKDAKernel(), tlx_pool)
+    torch.cuda.synchronize()
+
+    assert torch.equal(ref, out)
+    assert torch.equal(ref_pool, tlx_pool)
 
 
 @requires_tlx_prefill
