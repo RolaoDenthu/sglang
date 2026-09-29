@@ -1,0 +1,60 @@
+Applied to ROCm/triton 4cff872c by docker/rocm-triton-ext.Dockerfile.
+
+A TRITON_EXT_ENABLED libtriton exports its statically linked LLVM, while the
+ROCm SDK loads its own libLLVM.so.23 RTLD_GLOBAL (torch preloads it; comgr and
+the hipblaslt preload in triton_amd.cc depend on it). The two copies must not
+resolve each other's symbols:
+
+- CMakeLists.txt: link libtriton with -Bsymbolic so its own references bind to
+  itself. Without it, `import torch; import triton` crashes in libtriton's
+  static initializers.
+- PluginUtils.cpp: dlopen plugins RTLD_LOCAL instead of DynamicLibrary's
+  RTLD_GLOBAL, which also promotes libtriton to the global scope; the SDK's
+  libLLVM then binds to libtriton's LLVM and aborts with
+  "Option 'default' already exists!". Plugins find libtriton through their
+  DT_NEEDED entry, so they do not need the global scope.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3f066ea..2e1efe5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -438,6 +438,9 @@ if(TRITON_BUILD_PYTHON_MODULE)
+     target_link_libraries(triton PRIVATE z)
+   endif()
+   target_link_options(triton PRIVATE ${LLVM_LDFLAGS})
++  if(TRITON_EXT_ENABLED AND UNIX AND NOT APPLE)
++    target_link_options(triton PRIVATE "LINKER:-Bsymbolic")
++  endif()
+ 
+   if(NOT TRITON_EXT_ENABLED)
+     # When extensions are disabled, only export the Python entrypoint.
+diff --git a/lib/Tools/PluginUtils.cpp b/lib/Tools/PluginUtils.cpp
+index 5dc41b2..be88e9e 100644
+--- a/lib/Tools/PluginUtils.cpp
++++ b/lib/Tools/PluginUtils.cpp
+@@ -2,6 +2,7 @@
+ #include "triton/Tools/Sys/GetEnv.h"
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/Error.h"
++#include <dlfcn.h>
+ 
+ #define DEBUG_TYPE "triton-plugins"
+ 
+@@ -29,13 +30,12 @@ static bool isTritonAndPluginsVersionsMatch(const std::string &pluginVersion) {
+ }
+ 
+ llvm::Expected<TritonPlugin> TritonPlugin::load(const std::string &filename) {
+-  std::string error;
+-  auto library =
+-      llvm::sys::DynamicLibrary::getPermanentLibrary(filename.c_str(), &error);
+-  if (!library.isValid())
++  void *handle = ::dlopen(filename.c_str(), RTLD_NOW | RTLD_LOCAL);
++  if (!handle)
+     return llvm::make_error<llvm::StringError>(
+-        Twine("Could not load library '") + filename + "': " + error,
++        Twine("Could not load library '") + filename + "': " + ::dlerror(),
+         llvm::inconvertibleErrorCode());
++  llvm::sys::DynamicLibrary library(handle);
+ 
+   TritonPlugin plugin{filename, library};
+ 

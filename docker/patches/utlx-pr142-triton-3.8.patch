@@ -1,0 +1,21 @@
+Applied to triton-ext 1afa671b (head of triton-ext#142) by
+docker/rocm-triton-ext.Dockerfile.
+
+The PR targets Triton main, where AsyncCopyGlobalToLocalOp takes a cachePolicy
+attribute. On release/3.8 the op takes cache/evict/isVolatile/contiguity
+instead, and their defaults are what the PR passes on main.
+
+diff --git a/extensions/utlx/ops/NewOps.cpp b/extensions/utlx/ops/NewOps.cpp
+index 4c3feaf..b078cc0 100644
+--- a/extensions/utlx/ops/NewOps.cpp
++++ b/extensions/utlx/ops/NewOps.cpp
+@@ -642,8 +642,7 @@ void utlx::createAsyncLoad(TritonOpBuilder &self,
+   // attribute 'operandSegmentSizes'".
+   auto token = self.getBuilder().getType<ttg::AsyncTokenType>();
+   auto op = ttg::AsyncCopyGlobalToLocalOp::create(
+-      self.getBuilder(), self.getLastLoc(), token, src, result, mask, other,
+-      /*cachePolicy=*/mlir::Attribute(), /*isVolatile=*/false);
++      self.getBuilder(), self.getLastLoc(), token, src, result, mask, other);
+   // NB: op->getResult(0), not op.getResult(). This op has an *operand* named
+   // `result` (the destination memdesc), so the generated getResult() accessor
+   // returns that operand and shadows Operation::getResult() -- which silently
