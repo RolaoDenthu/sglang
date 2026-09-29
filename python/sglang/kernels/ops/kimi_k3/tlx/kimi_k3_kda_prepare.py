@@ -33,44 +33,67 @@ def _kda_prepare_kernel(
     g,
     beta_out,
     lower_bound,
-    stride_tok: tl.constexpr,
-    stride_head: tl.constexpr,
-    stride_b_tok: tl.constexpr,
+    stride_q_tok,
+    stride_k_tok,
+    stride_a_tok,
+    stride_b_tok,
+    R,
+    H: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
+    BLOCK_R: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     SIGMOID_BETA: tl.constexpr,
 ):
-    i_t, i_h = tl.program_id(0), tl.program_id(1)
+    # One program owns BLOCK_R (token, head) rows of D elements: a single
+    # (token, head) per program leaves most lanes idle and moves too few bytes
+    # to reach HBM bandwidth.
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     o_d = tl.arange(0, BD)
-    mask = o_d < D
-    base = i_t * stride_tok + i_h * stride_head + o_d
+    row_mask = rows < R
+    mask = row_mask[:, None] & (o_d < D)[None, :]
+    i_t = (rows // H).to(tl.int64)
+    i_h = rows % H
+    # Inputs keep their token stride (split views of the packed qkv); every
+    # head vector is contiguous. Outputs are dense [T, H, D].
+    head = (i_h * D)[:, None] + o_d[None, :]
+    out = rows.to(tl.int64)[:, None] * D + o_d[None, :]
 
-    b_q = tl.load(q + base, mask=mask, other=0.0).to(tl.float32)
-    b_k = tl.load(k + base, mask=mask, other=0.0).to(tl.float32)
-    b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-    b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-    tl.store(qn + base, b_q.to(qn.dtype.element_ty), mask=mask)
-    tl.store(kn + base, b_k.to(kn.dtype.element_ty), mask=mask)
+    b_q = tl.load(q + i_t[:, None] * stride_q_tok + head, mask=mask, other=0.0)
+    b_k = tl.load(k + i_t[:, None] * stride_k_tok + head, mask=mask, other=0.0)
+    b_q = b_q.to(tl.float32)
+    b_k = b_k.to(tl.float32)
+    b_q = b_q / tl.sqrt(tl.sum(b_q * b_q, axis=1) + 1e-6)[:, None]
+    b_k = b_k / tl.sqrt(tl.sum(b_k * b_k, axis=1) + 1e-6)[:, None]
+    tl.store(qn + out, b_q.to(qn.dtype.element_ty), mask=mask)
+    tl.store(kn + out, b_k.to(kn.dtype.element_ty), mask=mask)
 
-    b_a = tl.load(a + base, mask=mask, other=0.0).to(tl.float32)
-    b_dt = tl.load(dt_bias + i_h * D + o_d, mask=mask, other=0.0).to(tl.float32)
-    A = tl.exp(tl.load(A_log + i_h).to(tl.float32))
+    b_a = tl.load(a + i_t[:, None] * stride_a_tok + head, mask=mask, other=0.0)
+    b_a = b_a.to(tl.float32)
+    b_dt = tl.load(dt_bias + head, mask=mask, other=0.0).to(tl.float32)
+    A = tl.exp(tl.load(A_log + i_h, mask=row_mask, other=0.0).to(tl.float32))[:, None]
     x = b_a + b_dt
     if USE_LOWER_BOUND:
         b_g = lower_bound * tl.sigmoid(A * x)
     else:
         softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
         b_g = -A * softplus_x
-    tl.store(g + base, b_g.to(g.dtype.element_ty), mask=mask)
+    tl.store(g + out, b_g.to(g.dtype.element_ty), mask=mask)
 
-    # One scalar per (token, head); every program owns exactly one.
-    p_b = i_t * stride_b_tok + i_h
-    b_val = tl.load(b + p_b).to(tl.float32)
+    # One scalar per (token, head) row.
+    b_val = tl.load(b + i_t * stride_b_tok + i_h, mask=row_mask, other=0.0)
+    b_val = b_val.to(tl.float32)
     if SIGMOID_BETA:
         b_val = tl.sigmoid(b_val)
-    tl.store(beta_out + p_b, b_val.to(beta_out.dtype.element_ty))
+    tl.store(beta_out + rows, b_val.to(beta_out.dtype.element_ty), mask=row_mask)
+
+
+def _prepare_config(rows: int) -> Tuple[int, int]:
+    """(BLOCK_R, num_warps). Few rows (decode) are latency-bound and want the
+    most programs; many rows (extend) are bandwidth-bound and want bigger tiles.
+    Measured on gfx950 with H=12, D=128."""
+    return (4, 4) if rows <= 4096 else (16, 4)
 
 
 def prepare_kda_inputs(
@@ -95,21 +118,28 @@ def prepare_kda_inputs(
     extend path does, decode does not); beta is then passed through as fp32.
     """
     T = a.numel() // (num_heads * head_dim)
-    q = q.reshape(T, num_heads, head_dim)
-    k = k.reshape(T, num_heads, head_dim)
-    a = a.reshape(T, num_heads, head_dim)
+
+    def rows(x):
+        # A token stride is fine (split views of the packed qkv); only the
+        # [H, D] block inside a token has to be dense.
+        x = x.reshape(T, num_heads, head_dim)
+        if x.stride(2) != 1 or x.stride(1) != head_dim:
+            x = x.contiguous()
+        return x
+
+    q, k, a = rows(q), rows(k), rows(a)
     b = b.reshape(T, num_heads)
-    if not (q.is_contiguous() and k.is_contiguous() and a.is_contiguous()):
-        q, k, a = q.contiguous(), k.contiguous(), a.contiguous()
     if not b.is_contiguous():
         b = b.contiguous()
 
-    qn = torch.empty_like(q)
-    kn = torch.empty_like(k)
+    qn = torch.empty(T, num_heads, head_dim, dtype=q.dtype, device=q.device)
+    kn = torch.empty(T, num_heads, head_dim, dtype=k.dtype, device=k.device)
     g = torch.empty(T, num_heads, head_dim, dtype=torch.float32, device=q.device)
     beta = torch.empty(T, num_heads, dtype=torch.float32, device=q.device)
 
-    _kda_prepare_kernel[(T, num_heads)](
+    R = T * num_heads
+    block_r, num_warps = _prepare_config(R)
+    _kda_prepare_kernel[(triton.cdiv(R, block_r),)](
         q,
         k,
         a,
@@ -121,15 +151,19 @@ def prepare_kda_inputs(
         g,
         beta,
         lower_bound,
-        stride_tok=num_heads * head_dim,
-        stride_head=head_dim,
+        stride_q_tok=q.stride(0),
+        stride_k_tok=k.stride(0),
+        stride_a_tok=a.stride(0),
         stride_b_tok=num_heads,
+        R=R,
+        H=num_heads,
         D=head_dim,
         BD=triton.next_power_of_2(head_dim),
+        BLOCK_R=block_r,
         SOFTPLUS_THRESHOLD=20.0,
         USE_LOWER_BOUND=lower_bound is not None,
         SIGMOID_BETA=sigmoid_beta,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return (
         qn.unsqueeze(0),

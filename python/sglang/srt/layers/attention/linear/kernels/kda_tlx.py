@@ -76,10 +76,11 @@ class TlxKDAKernel(TritonKDAKernel):
             q, k, a, b, A_log, dt_bias, num_heads=HV, head_dim=K,
             lower_bound=lower_bound, sigmoid_beta=True,
         )
+        # The decode kernel takes v's token stride, so the split view goes in as is.
         return tlx_kernels.kda_recurrent_decode(
             q_n,
             k_n,
-            v.contiguous(),
+            v,
             g,
             beta,
             scale=K**-0.5,
@@ -130,18 +131,19 @@ class TlxKDAKernel(TritonKDAKernel):
 
         # kda_paged_prefill takes a dense [N, H, V, K] block per sequence and
         # returns a new one, so the indexed pool is gathered in and written back.
-        initial_state = ssm_states[cache_indices.long()].contiguous()
+        slots = cache_indices.long()
+        initial_state = ssm_states[slots]
         out, final_state = tlx_kernels.kda_paged_prefill(
             q_n,
             k_n,
-            v.contiguous(),
+            v,
             log_g,
             beta_act,
             scale=K**-0.5,
             initial_state=initial_state,
             cu_seqlens=query_start_loc,
         )
-        ssm_states[cache_indices.long()] = final_state
+        ssm_states[slots] = final_state
         # Same contract as chunk_kda: a bare tensor unless intermediate states
         # were requested, and those requests take the Triton path above.
         return out
