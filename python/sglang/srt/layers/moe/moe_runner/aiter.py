@@ -293,6 +293,9 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+        extra["moe_sorting_dispatch_policy"] = (
+            envs.SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY.get()
+        )
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,

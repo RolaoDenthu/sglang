@@ -1443,8 +1443,12 @@ def biased_topk_jit_kernel_impl(
     packed_out: Optional[torch.Tensor] = None,
     sqrtsoftplus_log1p: bool = False,
     router_logits_partials: Optional[torch.Tensor] = None,
+    num_shared_append: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """num_shared_append (partials only): the gate also writes the aiter shared-expert
+    columns that _post_process_topk_ids would otherwise append."""
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert num_shared_append == 0 or router_logits_partials is not None
 
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
@@ -1459,6 +1463,7 @@ def biased_topk_jit_kernel_impl(
                 renormalize,
                 routed_scaling_factor,
                 partials=router_logits_partials,
+                num_shared=num_shared_append,
             )
 
         from aiter import topk_gating
@@ -2275,7 +2280,17 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    # The router already wrote the aiter shared columns (see _aiter_append below).
+    _gate_appended = (
+        num_fused_shared_experts > 0
+        and _use_aiter
+        and not use_per_rank_shared_slots
+        and topk_ids.shape[-1] == topk_config.top_k
+    )
+    routed_topk_ids = (
+        topk_ids[:, :-num_fused_shared_experts] if _gate_appended else topk_ids
+    )
+    capture_routed_experts_if_allowed(topk_config, layer_id, routed_topk_ids)
     recorder_topk_ids = None
     _fold_pad_into_append = False
     if _is_cuda:
@@ -2354,13 +2369,17 @@ def _post_process_topk_ids(
         # second zeroing here would be redundant (zeroing is idempotent).
 
     if recorder_topk_ids is None:
-        recorder_topk_ids = topk_ids
+        recorder_topk_ids = (
+            topk_ids[:, :-num_fused_shared_experts] if _gate_appended else topk_ids
+        )
 
-    _aiter_append = num_fused_shared_experts > 0 and _use_aiter
-    if _aiter_append and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
-        # That router emits the shared slots itself; appending again would write
-        # the shared id twice and evict a real routed expert.
-        _aiter_append = topk_ids.shape[-1] < topk_config.top_k
+    # The JIT grouped router and the ROCm decode gate emit the shared slots themselves;
+    # appending again would write the shared id twice and evict a real routed expert.
+    _aiter_append = (
+        num_fused_shared_experts > 0
+        and _use_aiter
+        and topk_ids.shape[-1] < topk_config.top_k
+    )
 
     if _aiter_append and use_per_rank_shared_slots:
         # Fused path: append shared experts AND apply the per-rank shared-slot
@@ -2512,6 +2531,7 @@ def select_experts(
         and (
             num_fused_shared_experts == 0
             or has_per_rank_fused_shared_slots(num_fused_shared_experts)
+            or not _eplb_remap_enabled()
         )
     ):
         # only the aiter sqrtsoftplus gate takes the partials; every other route reads router_logits
@@ -2647,6 +2667,12 @@ def select_experts(
                 if router_logits_partials is not None
                 else {}
             )
+            if (
+                router_logits_partials is not None
+                and num_fused_shared_experts > 0
+                and not has_per_rank_fused_shared_slots(num_fused_shared_experts)
+            ):
+                _partials_kwargs["num_shared_append"] = num_fused_shared_experts
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
