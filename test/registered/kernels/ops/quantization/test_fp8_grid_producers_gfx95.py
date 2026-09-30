@@ -1,6 +1,7 @@
 """The gfx950 fused fp8-grid producers (RMSNorm + fake-quant, clamp + silu * mul, wo_a GEMM epilogue) must match the unfused launches bitwise on the quant step."""
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -246,6 +247,41 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
             plain = self.gemm(x, w, fp8_grid=False)
             self._assert_within_bf16_of_exact(plain, x, w, (g, r, d, 65))
             self.assertTrue(torch.equal(self.gemm(x, w), self.fake_quant(plain)))
+
+    def test_single_launch_tile_table_is_bitwise_the_16_row_tile(self):
+        """
+        Every single-launch tile picked by row count gives the 16-row tile's output bit for bit
+        (plain, fp8 grid and emitted fp8 + ue8m0), at each bucket edge.
+        """
+        from sglang.kernels.ops.gemm import gfx95_batched_gemm_bf16_fp8_grid as mod
+
+        only_16_row_tile = ((None, mod._TILE_BY_MAX_M[0][1]),)
+        for g, r, d in GEMM_SHAPES + [(4, 1024, 4096)]:
+            torch.manual_seed(11)
+            w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
+            for t in (65, 128, 129, 256, 257, 384):
+                x = torch.randn(t, g, d, device="cuda").bfloat16()
+                kwargs = [
+                    dict(fp8_grid=False),
+                    dict(fp8_grid=True),
+                    dict(fp8_grid=False, emit_fp8=True),
+                ]
+                outs = [self.gemm(x, w, split_k=False, **kw) for kw in kwargs]
+                with mock.patch.object(mod, "_TILE_BY_MAX_M", only_16_row_tile):
+                    refs = [self.gemm(x, w, split_k=False, **kw) for kw in kwargs]
+                for kw, out, ref in zip(kwargs, outs, refs):
+                    if isinstance(out, tuple):
+                        self.assertTrue(
+                            torch.equal(
+                                out[0].view(torch.uint8), ref[0].view(torch.uint8)
+                            ),
+                            (g, t, kw),
+                        )
+                        self.assertTrue(
+                            torch.equal(out[1], ref[1]), (g, t, kw, "scale")
+                        )
+                    else:
+                        self.assertTrue(torch.equal(out, ref), (g, r, d, t, kw))
 
     def test_split_k_regime(self):
         """T <= 64 takes the split-K launches: within one bf16 ulp of the fp32 product
