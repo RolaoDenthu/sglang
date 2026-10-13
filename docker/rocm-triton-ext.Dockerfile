@@ -19,7 +19,7 @@
 # The uTLX examples and tests are kept in /sgl-workspace/utlx; on a gfx950 GPU:
 #   python /sgl-workspace/utlx/examples/kda_prefill/run.py
 
-ARG BASE_IMAGE="rocm/sgl-dev:v0.5.20-rocm10-mi35x-20260928"
+ARG BASE_IMAGE="rocm/sgl-dev:v0.5.21-rocm10-mi35x-20261012"
 FROM ${BASE_IMAGE}
 
 # The commit lives on ROCm/triton release/internal/3.8.x, not on triton-lang/triton.
@@ -31,8 +31,9 @@ ARG TRITON_EXT_COMMIT="4cff872ced001ea92d9fcf05b3f6517e2b486d19"
 ARG TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
 ARG MAX_JOBS="64"
 ARG UTLX_REPO="https://github.com/triton-lang/triton-ext.git"
-# Head of triton-ext#142 (AMD MFMA register layouts; KDA prefill on gfx950), not yet merged.
-ARG UTLX_COMMIT="1afa671b54e138eff8f29de1a0744c04e129889d"
+# triton-ext main, the source of triton-utlx 3.8.0.post12; includes #142 (AMD MFMA
+# register layouts; KDA prefill on gfx950).
+ARG UTLX_COMMIT="e312c803e9c4aead7c8f78ba41a61b19ab89f710"
 
 COPY docker/patches/ /tmp/patches/
 
@@ -44,7 +45,7 @@ COPY docker/patches/ /tmp/patches/
 RUN set -eux; \
     git init -q /tmp/triton && cd /tmp/triton; \
     git fetch -q --depth 1 "${TRITON_REPO}" "${TRITON_EXT_COMMIT}" && git checkout -q FETCH_HEAD; \
-    git apply /tmp/patches/triton-4cff872c-ext.patch; \
+    git apply /tmp/patches/triton-3.8-ext-llvm-symbols.patch; \
     env -u CPATH -u LIBRARY_PATH TRITON_EXT_ENABLED=ON MAX_JOBS="${MAX_JOBS}" \
         TRITON_WHEEL_VERSION_SUFFIX="${TRITON_WHEEL_VERSION_SUFFIX}" \
         pip install --no-build-isolation --no-deps --force-reinstall .; \
@@ -59,7 +60,7 @@ RUN set -eux; \
     \
     git init -q /tmp/triton-ext && cd /tmp/triton-ext; \
     git fetch -q --depth 1 "${UTLX_REPO}" "${UTLX_COMMIT}" && git checkout -q FETCH_HEAD; \
-    git apply /tmp/patches/utlx-pr142-triton-3.8.patch; \
+    git apply /tmp/patches/utlx-triton-3.8-gluon.patch; \
     env -u CPATH -u LIBRARY_PATH TRITON_WHEEL_DIR="${triton_dir}" \
         LLVM_INSTALL_DIR="$(readlink -f /root/.triton/llvm/llvm-ubuntu-x64)" \
         pip install --no-build-isolation --no-deps ./extensions/utlx; \

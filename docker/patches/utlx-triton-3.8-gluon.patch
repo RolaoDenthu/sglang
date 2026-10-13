@@ -1,12 +1,8 @@
-Applied to triton-ext 1afa671b (head of triton-ext#142) by
+Applied to triton-ext e312c803 (the source of triton-utlx 3.8.0.post12) by
 docker/rocm-triton-ext.Dockerfile.
 
-The PR targets Triton main, where AsyncCopyGlobalToLocalOp takes a cachePolicy
-attribute. On release/3.8 the op takes cache/evict/isVolatile/contiguity
-instead, and their defaults are what the PR passes on main.
-
-Release/3.8 also has no TritonSemantic.make_tensor, so uTLX falls back to
-patching tl.tensor.__init__ process-wide. _promote then re-types every gluon
+Release/3.8 has no TritonSemantic.make_tensor, so uTLX falls back to patching
+tl.tensor.__init__ process-wide. _promote then re-types every gluon
 distributed_type (a block_type subclass whose IR always carries an encoding)
 as a plain carrier, and every gluon kernel in the process -- e.g. aiter's
 mla_gluon decode -- fails with "expected ... to be a distributed_type".
@@ -17,22 +13,8 @@ gluon included, with the uTLX TTIR->TTGIR pipeline; that conversion marks
 gluon's amdg.buffer_load_to_local illegal. The hook now leaves non-Triton
 languages on their own stages.
 
-diff --git a/extensions/utlx/ops/NewOps.cpp b/extensions/utlx/ops/NewOps.cpp
-index 4c3feaf..b078cc0 100644
---- a/extensions/utlx/ops/NewOps.cpp
-+++ b/extensions/utlx/ops/NewOps.cpp
-@@ -642,8 +642,7 @@ void utlx::createAsyncLoad(TritonOpBuilder &self,
-   // attribute 'operandSegmentSizes'".
-   auto token = self.getBuilder().getType<ttg::AsyncTokenType>();
-   auto op = ttg::AsyncCopyGlobalToLocalOp::create(
--      self.getBuilder(), self.getLastLoc(), token, src, result, mask, other,
--      /*cachePolicy=*/mlir::Attribute(), /*isVolatile=*/false);
-+      self.getBuilder(), self.getLastLoc(), token, src, result, mask, other);
-   // NB: op->getResult(0), not op.getResult(). This op has an *operand* named
-   // `result` (the destination memdesc), so the generated getResult() accessor
-   // returns that operand and shadows Operation::getResult() -- which silently
 diff --git a/extensions/utlx/python/utlx_plugin/compiler/semantic.py b/extensions/utlx/python/utlx_plugin/compiler/semantic.py
-index 9f8e583..68d413f 100644
+index c1741ac..64f6e54 100644
 --- a/extensions/utlx/python/utlx_plugin/compiler/semantic.py
 +++ b/extensions/utlx/python/utlx_plugin/compiler/semantic.py
 @@ -30,6 +30,11 @@ from triton.language.semantic import TritonSemantic as _BaseSemantic
@@ -60,7 +42,7 @@ index 9f8e583..68d413f 100644
          ir_ty = handle.get_type()
      except AttributeError:
 diff --git a/extensions/utlx/python/utlx_plugin/custom_stages.py b/extensions/utlx/python/utlx_plugin/custom_stages.py
-index f9841f2..ac4aaf0 100644
+index 096a524..234bfc6 100644
 --- a/extensions/utlx/python/utlx_plugin/custom_stages.py
 +++ b/extensions/utlx/python/utlx_plugin/custom_stages.py
 @@ -5,6 +5,7 @@ Hooks into triton's compilation pipeline to inject uTLX passes.
@@ -71,7 +53,7 @@ index f9841f2..ac4aaf0 100644
  import hashlib
  import pathlib
  
-@@ -52,6 +53,11 @@ def inspect_stages_hook(self=None,
+@@ -84,6 +85,11 @@ def inspect_stages_hook(self=None,
      if all(arg is None for arg in (stages, options, language, capability)):
          return get_key(), get_hash()
  
