@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -14,7 +15,10 @@ from sglang.kernels.ops.moe.fill_padded_rows import _fill_padded_rows
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_parallel
@@ -23,9 +27,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
+logger = logging.getLogger(__name__)
 
 _MORI_SHMEM_READY = False
 _MEGA_MOE_INSTANCE: dict = {}
+_LOGGED_CAPACITY_USE: set = set()
 
 
 def _import_aiter_megamoe():
@@ -52,6 +58,48 @@ def _mtpr() -> int:
             f"SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR={mtpr} must be a positive power of two"
         )
     return mtpr
+
+
+def _decode_mtpr() -> int:
+    decode_mtpr = int(envs.SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR.get())
+    if decode_mtpr <= 0:
+        return 0
+    if decode_mtpr & (decode_mtpr - 1):
+        raise ValueError(
+            f"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR={decode_mtpr} must be a "
+            "positive power of two"
+        )
+    return decode_mtpr if decode_mtpr < _mtpr() else 0
+
+
+def _capacities() -> tuple[int, ...]:
+    decode_mtpr = _decode_mtpr()
+    return (decode_mtpr, _mtpr()) if decode_mtpr else (_mtpr(),)
+
+
+def _select_mtpr(num_tokens: int) -> int:
+    """The capacity this forward runs with.
+
+    MTPR selects the dispatch wire format, so every EP rank must pick the same
+    one: decide only from counts the group agrees on, never this rank's own.
+    """
+    mtpr = _mtpr()
+    decode_mtpr = _decode_mtpr()
+    if not decode_mtpr:
+        return mtpr
+    if get_is_capture_mode():
+        # Warmup and capture run the same graph shape on every rank.
+        run_tokens = num_tokens
+    elif get_is_extend_in_batch() or is_dsa_enable_prefill_cp():
+        # In a step with an extend anywhere, an idle rank's DP token counts are
+        # rewritten locally (prepare_mlp_sync_batch), so they are not agreed.
+        return mtpr
+    else:
+        global_num_tokens = get_dp_global_num_tokens()
+        if not global_num_tokens:
+            return mtpr
+        run_tokens = max(global_num_tokens)
+    return decode_mtpr if run_tokens <= decode_mtpr else mtpr
 
 
 def _ep_rank_world():
@@ -133,20 +181,15 @@ def _get_or_build_mega_moe(
     _ensure_mori_shmem()
     backend = _import_aiter_megamoe()
     rank, world = _ep_rank_world()
-    key = (
-        rank,
-        world,
-        model_dim,
-        inter_dim,
-        experts,
-        topk,
-        quant,
-        swiglu_limit,
-        mtpr,
-    )
-    mega = _MEGA_MOE_INSTANCE.get(key)
-    if mega is None:
-        mega = backend.op(
+    shape_key = (rank, world, model_dim, inter_dim, experts, topk, quant, swiglu_limit)
+    # Construction synchronizes the device and barriers every EP rank, so all
+    # capacities are built together on the first (eager) call, in the same order
+    # on every rank: a capacity first used later could be inside graph capture.
+    for capacity in _capacities():
+        key = (*shape_key, capacity)
+        if key in _MEGA_MOE_INSTANCE:
+            continue
+        _MEGA_MOE_INSTANCE[key] = backend.op(
             rank=rank,
             world_size=world,
             model_dim=model_dim,
@@ -158,11 +201,11 @@ def _get_or_build_mega_moe(
             w1_scale=layer._mega_w1_scale,
             w2=layer._mega_w2,
             w2_scale=layer._mega_w2_scale,
-            max_tok_per_rank=mtpr,
+            max_tok_per_rank=capacity,
             swiglu_limit=swiglu_limit,
         )
-        _MEGA_MOE_INSTANCE[key] = mega
-    return mega
+        logger.info("Aiter MegaMoE: built capacity max_tok_per_rank=%d", capacity)
+    return _MEGA_MOE_INSTANCE[(*shape_key, mtpr)]
 
 
 def _swap_layer_weights(mega, layer) -> None:
@@ -288,7 +331,15 @@ def _run_mega_routed(
             )
             topk_weights = hidden_states.new_zeros((1, topk), dtype=torch.float32)
 
-    selected_mtpr = _mtpr()
+    selected_mtpr = _select_mtpr(num_tokens)
+    if selected_mtpr not in _LOGGED_CAPACITY_USE:
+        _LOGGED_CAPACITY_USE.add(selected_mtpr)
+        logger.info(
+            "Aiter MegaMoE: capacity %d first used (local tokens=%d, capture=%s)",
+            selected_mtpr,
+            num_tokens,
+            get_is_capture_mode(),
+        )
     x_in = x_in.contiguous()
     topk_ids = topk_ids.contiguous()
     topk_weights = topk_weights.contiguous()
