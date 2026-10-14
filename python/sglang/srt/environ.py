@@ -1626,6 +1626,15 @@ class Envs:
     # for MIN_ROWS..32768 rows; needs aiter >= ROCm/aiter#6126.
     SGLANG_DSV4_FP8_HCA_PERSIST = EnvBool(True)
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
+    # ROCm gfx950, DeepSeek-V4 128x128 block-fp8 dense linears: run the GEMM as
+    # aiter's e8m0 mxscale bpreshuffle (flydsl) instead of the fp32-scale
+    # CK/asm/triton bpreshuffle. The weight bytes are shared; only an e8m0 copy
+    # of the (power-of-two) weight scale is added at load, and activations are
+    # quantized with power-of-two (ue8m0) scales. Restricted to the (N, K)
+    # shapes in SGLANG_DSV4_DENSE_MXSCALE_SHAPES ("N:K,N:K"; empty = built-in
+    # whitelist of shapes that win in the microbench, "all" = every shape).
+    SGLANG_DSV4_DENSE_MXSCALE = EnvBool(False)
+    SGLANG_DSV4_DENSE_MXSCALE_SHAPES = EnvStr("")
 
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
