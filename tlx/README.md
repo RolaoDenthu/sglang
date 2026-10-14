@@ -72,6 +72,8 @@ Each side runs in its serving configuration: fbtriton with
 | `setup_fbtriton_venv.sh` | Creates the fbtriton venv (`VENV=`, `FBTRITON_VERSION=`, `FBTRITON_WHEEL=`) |
 | `run_bench_tlx_kda.sh [OUT]` | Runs `bench_tlx_kda.py` under uTLX, fbtriton, then uTLX again as a noise check; writes `compare.md`. `GPU=`, `FB_ASYNC_COPY=`, `UTLX_PY=`, `FB_PY=` |
 | `bench_tlx_kda.py` | Times the TLX core (`kda_recurrent_decode` / `kda_paged_prefill`), `prepare_kda_inputs`, and the full `TlxKDAKernel` call. Decode batch 1–256 in a CUDA graph; prefill M <= 16384 in graph and eager. `marker.do_bench`, median, L2 and the 256 MB Infinity Cache flushed |
+| `run_bench_kda_vs_aiter.sh [OUT]` | sglang Triton vs TLX vs aiter's Gluon KDA kernels, see [below](#sglang-triton-vs-tlx-vs-aiter). `GPU=`, `PY=`, `AITER_MAIN=` |
+| `bench_kda_vs_aiter.py` | The three steps `run_bench_kda_vs_aiter.sh` runs: `sglang`, `aiter-main`, `report` |
 
 ## fbtriton needs async copy off
 
@@ -224,3 +226,75 @@ batch 128–256.
 | prefill 16x1024 | total eager | 611.6 | 702.8 | 625.3 | 1.15 | 1.02 |
 
 </details>
+
+## sglang Triton vs TLX vs aiter
+
+`run_bench_kda_vs_aiter.sh` times, on the same inputs and the same way
+(`marker.do_bench` median; decode in a CUDA graph, prefill eager):
+
+- sglang's default KDA kernels (`TritonKDAKernel`, the FLA Triton kernels in
+  `python/sglang/kernels/ops/attention/fla/`) and `TlxKDAKernel`, under uTLX;
+- aiter's KDA kernels from upstream aiter main, which the installed aiter does not
+  have yet: Gluon decode `fused_recurrent_kda`, FlashKDA `chunk_kimi_delta_attn`
+  and Gluon prefill `chunk_kda`. They take the raw gate and beta, and read and
+  write the state pool in place through the slot indices.
+
+Shapes and cases match the TLX benchmark above. Errors are relative to sglang
+Triton's output and final state.
+
+It needs an upstream aiter checkout. A worktree leaves the installed
+`/sgl-workspace/aiter` untouched:
+
+```bash
+git -C /sgl-workspace/aiter fetch origin main
+git -C /sgl-workspace/aiter worktree add --detach /sgl-workspace/aiter-main origin/main
+cd /sgl-workspace/sglang/tlx
+./run_bench_kda_vs_aiter.sh       # -> /tmp/kda_vs_aiter_<time>/compare.md
+```
+
+The aiter side runs in a separate process, because the installed aiter and the
+checkout share the package name. It imports only aiter's Triton and Gluon modules
+from the checkout and skips `aiter/__init__.py`, which loads the installed C++
+extensions. The step writes a reference file of about 670 MB into `OUT`.
+
+### Results
+
+One idle MI355X (GPU 2), 2026-10-14, uTLX environment as above, aiter main at
+`4bb520bac` (2026-10-07): `GPU=2 ./run_bench_kda_vs_aiter.sh`. Time per KDA layer
+call in us.
+
+Decode, in a CUDA graph:
+
+| Batch | sglang Triton | TLX | aiter Gluon decode |
+|---|---|---|---|
+| 1 | 6.4 | 7.3 | 6.2 |
+| 4 | 7.1 | 8.5 | 6.8 |
+| 16 | 11.0 | 12.8 | 8.9 |
+| 32 | 16.4 | 17.4 | 13.0 |
+| 64 | 26.1 | 27.3 | 21.8 |
+| 128 | 49.3 | 47.0 | 42.3 |
+| 256 | 91.2 | 87.5 | 80.1 |
+
+Prefill, eager:
+
+| Case (seqs × tokens) | sglang Triton | TLX | aiter FlashKDA | aiter chunk_kda |
+|---|---|---|---|---|
+| 1×512 | 103.6 | 91.4 | 51.9 | 43.7 |
+| 1×1024 | 125.8 | 113.4 | 76.5 | 56.2 |
+| 1×2048 | 165.0 | 160.1 | 131.3 | 77.6 |
+| 1×4096 | 278.7 | 266.9 | 195.1 | 105.7 |
+| 1×8192 | 509.2 | 541.4 | 326.0 | 172.4 |
+| 1×16384 | 1035.0 | 1039.5 | 581.6 | 317.1 |
+| 2×8192 | 758.5 | 792.8 | 571.8 | 313.8 |
+| 4×4096 | 626.2 | 643.7 | 570.6 | 316.5 |
+| 16×1024 | 585.0 | 635.0 | 446.6 | 269.8 |
+
+Largest relative error against sglang Triton over all cases:
+
+| Kernel | Output | Final state |
+|---|---|---|
+| TLX decode | 3.4e-3 | 1.7e-3 |
+| aiter Gluon decode | 3.5e-5 | 1.1e-7 |
+| TLX prefill | 3.4e-3 | 5.3e-4 |
+| aiter FlashKDA | 4.9e-3 | 2.5e-3 |
+| aiter chunk_kda | 5.4e-3 | 3.4e-3 |
