@@ -376,7 +376,16 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.attn_dp_size == cfg.tp_size
                 and cfg.attn_cp_size == 1
                 and (
-                    (get_platform().is_hip and cfg.moe_a2a_backend == "none")
+                    (
+                        get_platform().is_hip
+                        and (
+                            cfg.moe_a2a_backend == "none"
+                            or (
+                                cfg.moe_a2a_backend == "megamoe"
+                                and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+                            )
+                        )
+                    )
                     or (
                         get_platform().is_cuda
                         and cfg.moe_a2a_backend in ("none", "megamoe")

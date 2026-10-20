@@ -10,6 +10,8 @@ import torch
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
+from sglang.srt.arg_groups import deepseek_v4_hook
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
@@ -19,7 +21,11 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import SparseTableBackend
 from sglang.srt.model_executor import forward_batch_info
-from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -30,7 +36,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, override_platform
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -271,6 +277,83 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             ):
                 counts = late_layer_dp_counts(fb, local_rows, in_graph=False)
             self.assertEqual(counts, [SWA_WINDOW, 0])
+
+
+class TestDecoderReplayDpAdmission(CustomTestCase):
+    """Decoder SWA bounded replay under attention DP needs every rank's late-layer
+    row count wired into the MoE path, which TP MoE and MegaMoE have."""
+
+    def _validate(self, *, platform, a2a, flydsl=False, replay=True):
+        view = SimpleNamespace(
+            dsv4_attn_backend="dsv4",
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED)
+            ),
+            enable_encoder_swa_bounded_replay=False,
+            speculative_algorithm="DSPARK",
+            enable_hisparse=False,
+            enable_two_batch_overlap=False,
+            pp_size=1,
+            disaggregation_mode="null",
+            tp_size=4,
+            attn_dp_size=4,
+            attn_cp_size=1,
+            dcp_size=1,
+            enable_prefill_cp=False,
+            enable_return_hidden_states=False,
+            ep_join_mode=None,
+            moe_a2a_backend=a2a,
+            enable_decoder_swa_bounded_replay=replay,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        )
+        with (
+            override_platform(
+                is_cuda=platform == "cuda",
+                is_hip=platform == "rocm",
+                is_npu=False,
+                is_musa=False,
+            ),
+            envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.override(flydsl),
+            patch.object(deepseek_v4_hook, "resolving_view", return_value=view),
+            patch.object(
+                deepseek_v4_hook, "model_config_of", return_value=model_config
+            ),
+            patch.object(deepseek_v4_hook, "declare_resolution") as declare,
+            patch(
+                "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
+                return_value=False,
+            ),
+        ):
+            deepseek_v4_hook.validate_deepseek_v41_features(object())
+        if declare.call_args is None:
+            return None
+        return declare.call_args.kwargs["enable_decoder_swa_bounded_replay"]
+
+    def test_supported_moe_paths_admit_dp(self):
+        for platform, a2a, flydsl in (
+            ("rocm", "none", False),
+            ("rocm", "megamoe", True),
+            ("cuda", "none", False),
+            ("cuda", "megamoe", False),
+        ):
+            with self.subTest(platform=platform, a2a=a2a):
+                self._validate(platform=platform, a2a=a2a, flydsl=flydsl)
+                self.assertTrue(
+                    self._validate(
+                        platform=platform, a2a=a2a, flydsl=flydsl, replay=None
+                    )
+                )
+
+    def test_other_rocm_moe_paths_refuse_dp(self):
+        for a2a, flydsl in (("megamoe", False), ("mori", True)):
+            with self.subTest(a2a=a2a, flydsl=flydsl):
+                with self.assertRaisesRegex(ValueError, "DP attention other than"):
+                    self._validate(platform="rocm", a2a=a2a, flydsl=flydsl)
+                self.assertFalse(
+                    self._validate(platform="rocm", a2a=a2a, flydsl=flydsl, replay=None)
+                )
 
 
 def _prefill_graph_replay(*, any_context, seq_len):
