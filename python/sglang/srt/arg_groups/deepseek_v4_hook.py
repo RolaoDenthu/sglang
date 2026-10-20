@@ -481,13 +481,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and not (
                 cfg.attn_dp_size == cfg.tp_size
                 and cfg.attn_cp_size == 1
-                and (
-                    (get_platform().is_hip and cfg.moe_a2a_backend == "none")
-                    or (
-                        get_platform().is_cuda
-                        and cfg.moe_a2a_backend in ("none", "megamoe")
-                    )
-                )
+                and (get_platform().is_cuda or get_platform().is_hip)
+                and cfg.moe_a2a_backend in ("none", "megamoe")
             ),
         ),
     )
