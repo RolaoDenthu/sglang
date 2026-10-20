@@ -329,30 +329,11 @@ def _run_mega_routed(
                 experts,
             )
     else:
-        rank_sync = envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
-        x_in = (
-            hidden_states.new_ones((1, hidden_size))
-            if rank_sync
-            else hidden_states.new_zeros((1, hidden_size))
-        )
-        if rank_sync:
-            ep_rank, ep_world = _ep_rank_world()
-            expert_base = ep_rank * (experts // ep_world)
-            topk_ids = (
-                expert_base
-                + torch.arange(topk, device=hidden_states.device, dtype=torch.int32)
-            ).unsqueeze(0)
-            topk_weights = hidden_states.new_full(
-                (1, topk), 1.0 / topk, dtype=torch.float32
-            )
-        else:
-            topk_ids = torch.full(
-                (1, topk),
-                experts,
-                device=hidden_states.device,
-                dtype=torch.int32,
-            )
-            topk_weights = hidden_states.new_zeros((1, topk), dtype=torch.float32)
+        # An idle rank still enters the collective dispatch; MegaMoEv2 takes
+        # zero source rows.
+        x_in = hidden_states
+        topk_ids = hidden_states.new_empty((0, topk), dtype=torch.int32)
+        topk_weights = hidden_states.new_empty((0, topk), dtype=torch.float32)
 
     selected_mtpr = _select_mtpr(forward_batch)
     x_in = x_in.contiguous()

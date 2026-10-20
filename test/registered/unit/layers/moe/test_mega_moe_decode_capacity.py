@@ -47,6 +47,7 @@ def runtime(monkeypatch):
         global_tokens=None,
         events=[],
         instances={},
+        source_shapes=[],
     )
     monkeypatch.setenv("SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR", str(LARGE))
     monkeypatch.setenv("SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR", str(DECODE))
@@ -80,6 +81,7 @@ def runtime(monkeypatch):
 
         def forward(self, x, weights, ids, slice_output=False):
             state.events.append(("forward", self.rank, self.capacity))
+            state.source_shapes.append((x.shape, weights.shape, ids.shape))
             return torch.full_like(x, self.capacity)
 
     monkeypatch.setattr(
@@ -226,6 +228,19 @@ def test_idle_rank_enters_with_the_decode_capacity(runtime):
 
     assert _forwarded(runtime) == [DECODE]
     assert output.shape == (0, HIDDEN)
+
+
+@pytest.mark.parametrize("rank_sync", ["0", "1"])
+def test_idle_rank_enters_with_zero_source_rows(runtime, monkeypatch, rank_sync):
+    # A fabricated row would be counted only by this rank, while DP
+    # collectives outside the MoE size their buffers from the synced counts.
+    monkeypatch.setenv("SGLANG_AITER_MEGA_RANK_SYNC", rank_sync)
+    runtime.run(0, [4096, 0], rank=1, mode=ForwardMode.IDLE, extend=True)
+
+    assert _forwarded(runtime) == [LARGE]
+    assert runtime.source_shapes == [
+        ((0, HIDDEN), (0, TOPK), (0, TOPK)),
+    ]
 
 
 @pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.EXTEND])
