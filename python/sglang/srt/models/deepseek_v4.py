@@ -4840,12 +4840,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                 or get_parallel().pp_group.world_size != 1
                 or not (
                     get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
+                    or ((_is_cuda or _is_hip) and get_moe_a2a_backend().is_megamoe())
                 )
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
-                    "MoE A2A requires CUDA MegaMoE"
+                    "V4.1 vision supports TP/EP/DP without CP or PP; MoE A2A "
+                    "requires MegaMoE (CUDA, or aiter MegaMoEv2 on ROCm)"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)

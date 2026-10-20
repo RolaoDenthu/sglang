@@ -83,10 +83,11 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         self.assertTrue(is_shared_experts_fusion_disabled())
         self.assertFalse(get_exec().moe.disable_shared_experts_fusion)
 
-    def test_v41_vision_admits_cuda_megamoe_with_dp_attention(self):
+    def test_v41_vision_admits_megamoe_with_dp_attention(self):
         """A vision-capable checkpoint must initialize for text or image serving
-        with DP attention and CUDA MegaMoE. CP, PP and other A2A paths still lack
-        vision routing support and must fail before constructing the tower.
+        with DP attention and MegaMoE: CUDA MegaMoE, or aiter MegaMoEv2 on ROCm.
+        CP, PP and other A2A paths still lack vision routing support and must fail
+        before constructing the tower.
         """
         self._publish(enforce=False)
         config = DeepSeekV4Config(
@@ -108,15 +109,19 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         backbone.start_layer = 0
         backbone.end_layer = 0
         cases = (
-            (MoeA2ABackend.MEGAMOE, True, 1, 1, True),
-            (MoeA2ABackend.NONE, True, 1, 1, True),
-            (MoeA2ABackend.MEGAMOE, False, 1, 1, False),
-            (MoeA2ABackend.DEEPEP, True, 1, 1, False),
-            (MoeA2ABackend.MEGAMOE, True, 2, 1, False),
-            (MoeA2ABackend.MEGAMOE, True, 1, 2, False),
+            (MoeA2ABackend.MEGAMOE, "cuda", 1, 1, True),
+            (MoeA2ABackend.NONE, "cuda", 1, 1, True),
+            (MoeA2ABackend.MEGAMOE, "other", 1, 1, False),
+            (MoeA2ABackend.DEEPEP, "cuda", 1, 1, False),
+            (MoeA2ABackend.MEGAMOE, "cuda", 2, 1, False),
+            (MoeA2ABackend.MEGAMOE, "cuda", 1, 2, False),
+            (MoeA2ABackend.MEGAMOE, "rocm", 1, 1, True),
+            (MoeA2ABackend.NONE, "rocm", 1, 1, True),
+            (MoeA2ABackend.MORI, "rocm", 1, 1, False),
+            (MoeA2ABackend.MEGAMOE, "rocm", 2, 1, False),
         )
-        for backend, cuda, cp, pp, admitted in cases:
-            with self.subTest(backend=backend, cuda=cuda, cp=cp, pp=pp):
+        for backend, platform, cp, pp, admitted in cases:
+            with self.subTest(backend=backend, platform=platform, cp=cp, pp=pp):
                 with (
                     get_parallel().override(
                         tp_size=4,
@@ -131,7 +136,8 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
                     get_model().override(
                         shared_experts=SharedExpertsConfig(fusion_disabled=True)
                     ),
-                    patch.object(deepseek_v4, "_is_cuda", cuda),
+                    patch.object(deepseek_v4, "_is_cuda", platform == "cuda"),
+                    patch.object(deepseek_v4, "_is_hip", platform.startswith("rocm")),
                     patch.object(deepseek_v4, "ViT", return_value=nn.Identity()),
                     patch.object(deepseek_v4, "Aligner", return_value=nn.Identity()),
                     patch.object(deepseek_v4, "DeepseekV4Model", return_value=backbone),
