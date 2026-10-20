@@ -4493,11 +4493,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                 or not (
                     get_moe_a2a_backend().is_none()
                     or (_is_cuda and get_moe_a2a_backend().is_megamoe())
+                    or (
+                        _is_hip
+                        and get_moe_a2a_backend().is_megamoe()
+                        and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+                    )
                 )
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
-                    "MoE A2A requires CUDA MegaMoE"
+                    "V4.1 vision supports TP/EP/DP without CP or PP; MoE A2A "
+                    "requires MegaMoE (CUDA, or aiter MegaMoEv2 on ROCm with "
+                    "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1)"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)

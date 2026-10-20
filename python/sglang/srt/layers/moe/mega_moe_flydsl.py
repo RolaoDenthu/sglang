@@ -22,6 +22,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.models.deepseek_common.amd.deepseek_v2_hip_moe import batch_has_images
+from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -303,22 +305,35 @@ def _run_mega_routed(
     experts = moe.experts.num_experts
     if num_tokens:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.num_token_non_padded
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=(
-                ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
-                if moe.experts.uses_expert_location
-                else None
-            ),
-            **topk_kwargs,
+        num_token_non_padded = (
+            forward_batch.num_token_non_padded if forward_batch is not None else None
         )
+        dispatch_info = (
+            ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+            if moe.experts.uses_expert_location
+            else None
+        )
+        if (
+            not moe.is_hash
+            and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
+            and batch_has_images(forward_batch)
+        ):
+            topk_output = vision_topk(
+                moe,
+                router_logits,
+                input_ids_global,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+            )
+        else:
+            topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+            topk_output = moe.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+                **topk_kwargs,
+            )
         x_in = hidden_states
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights.to(torch.float32)
