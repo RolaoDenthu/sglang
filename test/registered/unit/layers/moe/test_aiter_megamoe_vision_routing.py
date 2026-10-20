@@ -22,6 +22,8 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 IMAGE_TOKEN_ID = 99
 NUM_ROUTED_EXPERTS = 4
+# Rows past this bound are padding.
+NON_PADDED_ROWS = 2
 
 
 def _fill_padded_rows(x, num_token_non_padded, fill_value):
@@ -75,7 +77,11 @@ class TestAiterMegaMoeVisionRouting(CustomTestCase):
                     renormalize=True,
                     routed_scaling_factor=2.0,
                     apply_routed_scaling_factor_on_output=scale_in_topk,
-                )
+                ),
+                routing_inputs=lambda: (
+                    torch.tensor(NON_PADDED_ROWS, dtype=torch.int32),
+                    None,
+                ),
             ),
             is_hash=False,
             num_fused_shared_experts=fused_shared,
@@ -87,7 +93,6 @@ class TestAiterMegaMoeVisionRouting(CustomTestCase):
     @staticmethod
     def _batch(*, extend=True, images=True):
         return SimpleNamespace(
-            num_token_non_padded=torch.tensor(2, dtype=torch.int32),
             forward_mode=SimpleNamespace(is_extend=lambda: extend),
             contains_image_inputs=lambda: images,
         )
@@ -97,11 +102,6 @@ class TestAiterMegaMoeVisionRouting(CustomTestCase):
         with (
             get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
             get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
-            patch.object(
-                mega_moe_flydsl.ExpertLocationDispatchInfo,
-                "init_new",
-                return_value=None,
-            ),
             patch.object(mega_moe_flydsl, "_get_or_build_mega_moe", return_value=mega),
             patch.object(mega_moe_flydsl, "_swap_layer_weights"),
             patch.object(mega_moe_flydsl, "_select_mtpr", return_value=8),
@@ -156,6 +156,7 @@ class TestAiterMegaMoeVisionRouting(CustomTestCase):
                         topk_weights=torch.full((3, 2), 0.5),
                     )
                 )
+                topk.routing_inputs.return_value = (None, None)
                 moe = self._v41_moe(0, True, topk=topk)
                 moe.is_hash = is_hash
                 ids = torch.tensor([7, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID])
