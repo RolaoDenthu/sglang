@@ -204,6 +204,33 @@ class TestMxfp8AiterRouteGfx95(CustomTestCase):
         with envs.SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE.override(True):
             self._check_route(AITER_MS + (2049,), preshuffled=True)
 
+    @unittest.skipUnless(
+        _aiter_has_preshuffled_mxfp8(), "aiter FlyDSL MXFP8 GEMM (ROCm/aiter#5896)"
+    )
+    def test_preshuffled_weight_keeps_the_flydsl_prefill_kernel(self):
+        """The FlyDSL prefill kernel reads the preshuffled weight in place, to the plain
+        weight's output bit for bit."""
+        from unittest.mock import patch
+
+        # (N, K % 128 == 0): a TP4 projection and the shared-expert down projection
+        for n, k in ((1792, 5120), (5120, 2304)):
+            torch.manual_seed(0)
+            wq, ws = _quant_weight_block32(
+                torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+            )
+            with envs.SGLANG_OPT_HIP_FLYDSL_MXFP8.override(True):
+                plain = self._route(wq, ws)
+                with envs.SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE.override(True):
+                    shuffled = self._route(wq, ws)
+            self.assertTrue(shuffled.layer.mxfp8_aiter_preshuffled, (n, k))
+            x = torch.randn(2049, k, device="cuda", dtype=torch.bfloat16)
+            with patch.object(
+                fp8_hip, "_apply_flydsl_mxfp8", wraps=fp8_hip._apply_flydsl_mxfp8
+            ) as flydsl:
+                out = shuffled(x)
+            flydsl.assert_called_once()
+            self.assertTrue(torch.equal(out, plain(x)), (n, k))
+
     def _check_route(self, ms, preshuffled=False):
         for n, k in ROUTE_SHAPES:
             torch.manual_seed(0)

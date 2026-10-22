@@ -2,9 +2,9 @@
 MXFP8 (block_fp8_as_mxfp8): the Triton dot_scaled kernel, the native scaled-MFMA
 kernels on a lane-ordered weight, or aiter's MXFP8 GEMM on the plain one. With
 SGLANG_OPT_HIP_FLYDSL_MXFP8 the aiter route hands its large-M (prefill) calls to the FlyDSL
-kernel of mxfp8_flydsl_gfx95 on the same weight. The fused gfx950 producers hand these
-routes their operand as an Fp8GridActivation (bf16 already on the fp8 grid) or an
-Mxfp8Activation."""
+kernel of mxfp8_flydsl_gfx95 on the same weight, plain or aiter-preshuffled. The fused
+gfx950 producers hand these routes their operand as an Fp8GridActivation (bf16 already on
+the fp8 grid) or an Mxfp8Activation."""
 
 from __future__ import annotations
 
@@ -66,8 +66,6 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
             copy_or_rebind_param(
                 layer, "weight", shuffle_weight(layer.weight.data, (16, 16))
             )
-            # mxfp8_flydsl_gfx95 reads the plain [N, K] weight
-            layer.weight_scale_mx_flydsl = None
         return
     assert backend.is_gfx95_mxfp8_native()
     n, k = layer.weight.shape
@@ -195,7 +193,11 @@ def _apply_flydsl_mxfp8(
     xq, xs = mxfp8_operand(x, input_scale)
     flydsl = _flydsl_mxfp8_module()
     out = flydsl.mxfp8_gemm(
-        xq, flydsl.mxfp8_scale_layout(xs), layer.weight, layer.weight_scale_mx_flydsl
+        xq,
+        flydsl.mxfp8_scale_layout(xs),
+        layer.weight,
+        layer.weight_scale_mx_flydsl,
+        b_shuffled=getattr(layer, "mxfp8_aiter_preshuffled", False),
     )
     if bias is not None:
         out = out + bias
