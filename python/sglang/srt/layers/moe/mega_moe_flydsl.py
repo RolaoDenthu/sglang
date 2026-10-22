@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 _MORI_SHMEM_READY = False
 _MEGA_MOE_INSTANCE: dict = {}
+# (model_dim, inter_dim, experts) of DeepSeek-V4.1-Flash.
+_FLASH_SHAPE = (5120, 2304, 384)
 
 
 def _import_aiter_megamoe():
@@ -119,6 +122,25 @@ def _select_mtpr(forward_batch: ForwardBatch | None) -> int:
         return decode_mtpr
     # is_extend_in_batch is max-reduced over the DP group.
     return mtpr if get_is_extend_in_batch() else decode_mtpr
+
+
+@functools.cache
+def _forward_accepts_config_tokens(op_cls) -> bool:
+    return "config_tokens" in inspect.signature(op_cls.forward).parameters
+
+
+def _config_tokens(op_cls, shape, run_tokens: int, mtpr: int) -> int | None:
+    """The source-row count every EP rank selects the MegaMoE configuration for.
+
+    aiter's DeepSeek-V4.1-Flash tables change the dispatch layout with the token
+    bucket, so those ranks, idle ones with zero rows included, must agree; other
+    shapes select per rank.
+    """
+    if shape != _FLASH_SHAPE or not _forward_accepts_config_tokens(op_cls):
+        return None
+    global_num_tokens = get_dp_global_num_tokens()
+    tokens = max(global_num_tokens) if global_num_tokens else run_tokens
+    return min(max(tokens, run_tokens, 1), mtpr)
 
 
 def _ep_rank_world():
@@ -341,10 +363,11 @@ def _run_mega_routed(
     assert x_in.shape[0] <= selected_mtpr, (
         f"Aiter MegaMoE local tokens {x_in.shape[0]} exceed MTPR {selected_mtpr}"
     )
+    inter_dim = moe.config.moe_intermediate_size
     mega = _get_or_build_mega_moe(
         moe.experts,
         model_dim=hidden_size,
-        inter_dim=moe.config.moe_intermediate_size,
+        inter_dim=inter_dim,
         experts=experts,
         topk=topk,
         quant=envs.SGLANG_AMD_FLYDSL_MEGA_QUANT.get() or "a8w4",
@@ -353,7 +376,13 @@ def _run_mega_routed(
     )
     _swap_layer_weights(mega, moe.experts)
 
-    output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[:num_tokens]
+    config_tokens = _config_tokens(
+        type(mega), (hidden_size, inter_dim, experts), x_in.shape[0], selected_mtpr
+    )
+    forward_kwargs = {} if config_tokens is None else {"config_tokens": config_tokens}
+    output = mega.forward(
+        x_in, topk_weights, topk_ids, slice_output=False, **forward_kwargs
+    )[:num_tokens]
 
     if not moe.routed_scaling_factor_fused_in_topk:
         output.mul_(moe.routed_scaling_factor)
