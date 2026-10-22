@@ -103,19 +103,20 @@ def test_idle_flash_rank_enters_with_the_widest_rank_config(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "a2a_backend, flydsl, recorder_mode, remap, dropped",
+    "a2a_backend, flydsl, recorder_mode, remap, gate_masked, padded",
     [
-        # MegaMoE drops the out-of-range id 8 along with its weight.
-        (MoeA2ABackend.MEGAMOE, True, None, False, True),
+        # MegaMoE drops the out-of-range id 8; a gate that wrote it leaves nothing to do.
+        (MoeA2ABackend.MEGAMOE, True, None, False, False, "dropped"),
+        (MoeA2ABackend.MEGAMOE, True, None, False, True, "kept"),
         # A remap table, the recorder or another consumer needs in-range ids.
-        (MoeA2ABackend.MEGAMOE, True, "stat", False, False),
-        (MoeA2ABackend.MEGAMOE, True, None, True, False),
-        (MoeA2ABackend.MEGAMOE, False, None, False, False),
-        (MoeA2ABackend.NONE, True, None, False, False),
+        (MoeA2ABackend.MEGAMOE, True, "stat", False, False, "zeroed"),
+        (MoeA2ABackend.MEGAMOE, True, None, True, False, "zeroed"),
+        (MoeA2ABackend.MEGAMOE, False, None, False, False, "zeroed"),
+        (MoeA2ABackend.NONE, True, None, False, False, "zeroed"),
     ],
 )
 def test_hip_megamoe_padded_rows_leave_topk_with_a_dropped_id(
-    monkeypatch, a2a_backend, flydsl, recorder_mode, remap, dropped
+    monkeypatch, a2a_backend, flydsl, recorder_mode, remap, gate_masked, padded
 ):
     monkeypatch.setenv("SGLANG_AMD_USE_FLYDSL_MEGA_MOE", "1" if flydsl else "0")
     monkeypatch.setattr(topk_module, "_is_cuda", False)
@@ -138,29 +139,36 @@ def test_hip_megamoe_padded_rows_leave_topk_with_a_dropped_id(
                 router_logits=torch.zeros(3, 8),
                 layer_id=0,
                 num_token_non_padded=torch.tensor(1),
+                padded_rows_masked=gate_masked,
             )
     finally:
         config.restore()
     assert out_ids[:1].tolist() == ids[:1].tolist()
     torch.testing.assert_close(out_weights[:1], weights[:1])
-    if dropped:
-        assert out_ids[1:].tolist() == [[8, 8], [8, 8]]
-        torch.testing.assert_close(out_weights[1:], weights[1:])
-    else:
+    if padded == "zeroed":
         assert out_ids[1:].tolist() == [[0, 0], [0, 0]]
         assert not out_weights[1:].any()
+        return
+    expected_ids = [[8, 8], [8, 8]] if padded == "dropped" else ids[1:].tolist()
+    assert out_ids[1:].tolist() == expected_ids
+    torch.testing.assert_close(out_weights[1:], weights[1:])
 
 
 @pytest.mark.parametrize(
     "is_hash, topk_masks, filled",
     [(False, True, False), (False, False, True), (True, True, True)],
 )
-def test_mega_routed_fills_only_the_rows_topk_left_unmasked(
+def test_mega_routed_takes_the_decode_router_and_fills_only_unmasked_rows(
     monkeypatch, is_hash, topk_masks, filled
 ):
     import sglang.srt.layers.moe.mega_moe_flydsl as mega
 
+    partials = torch.zeros(2, 4, _FLASH[2])
     seen = {"fill": None}
+
+    def forward_gate(moe, hidden_states, allocator, *, fused_gate):
+        seen["fused_gate"] = fused_gate
+        return torch.zeros(hidden_states.shape[0], _FLASH[2]), partials
 
     class Router:
         topk_config = TopKConfig(top_k=6)
@@ -179,6 +187,7 @@ def test_mega_routed_fills_only_the_rows_topk_left_unmasked(
         def forward(self, x, wts, ids, *, slice_output=True, config_tokens=None):
             return x
 
+    monkeypatch.setattr(mega, "forward_gate", forward_gate)
     monkeypatch.setattr(mega, "megamoe_topk_masks_padded_rows", lambda c: topk_masks)
     monkeypatch.setattr(
         mega, "_fill_padded_rows", lambda ids, n, value: seen.update(fill=value)
@@ -199,12 +208,12 @@ def test_mega_routed_fills_only_the_rows_topk_left_unmasked(
         routed_scaling_factor=1.0,
         routed_scaling_factor_fused_in_topk=True,
         is_hash=is_hash,
-        gate=lambda hidden_states, **kwargs: torch.zeros(
-            hidden_states.shape[0], _FLASH[2]
-        ),
+        gate=SimpleNamespace(),
         topk=Router(),
     )
     mega._run_mega_routed(moe, torch.zeros(4, _FLASH[0]), None, "ids")
+    assert seen["fused_gate"]
+    assert seen["topk_kwargs"]["router_logits_partials"] is partials
     assert seen["fill"] == (_FLASH[2] if filled else None)
 
 

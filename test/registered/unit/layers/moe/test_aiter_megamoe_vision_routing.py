@@ -66,6 +66,7 @@ class TestAiterMegaMoeVisionRouting(CustomTestCase):
                 return_value=torch.zeros((3, 4)),
                 e_score_correction_bias=torch.tensor([4.0, 3.0, 0.0, 0.0]),
                 e_score_correction_bias_vl=torch.tensor([0.0, 0.0, 3.0, 4.0]),
+                rocm_router_max_tokens=-1,
             ),
             topk=topk
             or SimpleNamespace(

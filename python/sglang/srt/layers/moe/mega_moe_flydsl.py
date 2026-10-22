@@ -23,7 +23,10 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe.topk import megamoe_topk_masks_padded_rows
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.models.deepseek_common.amd.deepseek_v2_hip_moe import batch_has_images
+from sglang.srt.models.deepseek_common.amd.deepseek_v2_hip_moe import (
+    batch_has_images,
+    forward_gate,
+)
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import get_parallel
 
@@ -331,11 +334,15 @@ def _run_mega_routed(
             and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
             and batch_has_images(forward_batch)
         )
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+        router_logits, router_logits_partials = forward_gate(
+            moe, hidden_states, None, fused_gate=not use_vision_topk
+        )
         if use_vision_topk:
             topk_output = vision_topk(moe, router_logits, input_ids_global)
         else:
             topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+            if router_logits_partials is not None:
+                topk_kwargs["router_logits_partials"] = router_logits_partials
             topk_output = moe.topk(
                 hidden_states,
                 router_logits,

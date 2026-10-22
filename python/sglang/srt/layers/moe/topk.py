@@ -245,7 +245,10 @@ if _use_aiter:
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_reduce_partials
-    from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
+    from sglang.kernels.ops.moe.rocm_router_gate import (
+        rocm_router_gate,
+        rocm_router_gate_supports,
+    )
 if _is_musa:
     try:
         from mate import moe_fused_gate
@@ -1653,15 +1656,18 @@ def biased_topk_jit_kernel_impl(
     sqrtsoftplus_log1p: bool = False,
     router_logits_partials: Optional[torch.Tensor] = None,
     num_shared_append: int = 0,
+    padded_id: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """num_shared_append is only workable when router_logits_partials is not None
-    and it is only used by rocm_router_gate"""
+    and it is only used by rocm_router_gate. padded_id also takes the aiter gate to
+    rocm_router_gate, which writes it, with weight 0, into the rows from
+    num_token_non_padded on"""
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert num_shared_append == 0 or router_logits_partials is not None
 
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
-        if router_logits_partials is not None:
+        if router_logits_partials is not None or padded_id is not None:
             # ROCm decode router: split-K reduce + gate in one launch
             return rocm_router_gate(
                 gating_output,
@@ -1671,6 +1677,10 @@ def biased_topk_jit_kernel_impl(
                 routed_scaling_factor,
                 partials=router_logits_partials,
                 num_shared=num_shared_append,
+                num_token_non_padded=(
+                    num_token_non_padded if padded_id is not None else None
+                ),
+                padded_id=0 if padded_id is None else padded_id,
             )
 
         from aiter import topk_gating
@@ -2664,9 +2674,10 @@ def _post_process_topk_ids(
         )
         _megamoe_pad_mask = megamoe_topk_masks_padded_rows(topk_config)
         if _megamoe_pad_mask:
-            _mask_topk_ids_padded_region(
-                topk_ids, num_token_non_padded, fill_value=router_logits.shape[1]
-            )
+            if not padded_rows_masked:
+                _mask_topk_ids_padded_region(
+                    topk_ids, num_token_non_padded, fill_value=router_logits.shape[1]
+                )
         elif not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
@@ -3020,6 +3031,18 @@ def select_experts(
                 ):
                     # the ROCm decode gate writes the aiter shared columns itself
                     _packed_kwargs["num_shared_append"] = num_shared_topk_slots
+            if (
+                num_token_non_padded is not None
+                and not routing_overridden
+                and _use_aiter
+                and scoring_func == "sqrtsoftplus"
+                and rocm_router_gate_supports(
+                    num_experts=router_logits.shape[1], topk=top_k_for_gate
+                )
+                and router_logits.stride(1) == 1
+                and megamoe_topk_masks_padded_rows(topk_config)
+            ):
+                _packed_kwargs["padded_id"] = router_logits.shape[1]
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -3034,7 +3057,10 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 **_packed_kwargs,
             )
-            padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
+            padded_rows_masked = (
+                _fused_gate_masks_padded_rows(scoring_func)
+                or "padded_id" in _packed_kwargs
+            )
         elif (
             topk_config.runner_backend is not None
             and topk_config.runner_backend.is_flashinfer_trtllm_routed()
