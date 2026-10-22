@@ -16,7 +16,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers.moe import MoeA2ABackend, mega_moe_flydsl
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import TopKConfig
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -96,6 +96,7 @@ class TestAiterMegaMoeVisionRouting(CustomTestCase):
         mega = _FakeMega(moe.experts.num_experts)
         moe.topk.routing_inputs = lambda: (batch.num_token_non_padded, None)
         with (
+            get_context().override_server_args(tp_size=2, ep_size=2),
             get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
             get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
             patch.object(mega_moe_flydsl, "_get_or_build_mega_moe", return_value=mega),
