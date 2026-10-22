@@ -128,6 +128,83 @@ class TestRocmRouterGate(CustomTestCase):
             self.assertTrue(torch.equal(ref_w, out_w), f"weights M={num_tokens}")
             self.assertTrue(torch.equal(fused_logits, logits), f"logits M={num_tokens}")
 
+    def test_gate_writes_padded_id_past_the_real_rows(self):
+        weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
+        x = self._randn(ROCM_ROUTER_MAX_TOKENS, HIDDEN).to(torch.bfloat16)
+        partials = rocm_router_gemv_split_k(x, weight)
+        logits = torch.empty(ROCM_ROUTER_MAX_TOKENS, NUM_EXPERTS, device=self.device)
+        ref_w, ref_i = rocm_router_gate(
+            logits, self.bias_bf16, TOPK, True, ROUTED_SCALING, partials=partials
+        )
+        for num_valid in (0, 1, 37, ROCM_ROUTER_MAX_TOKENS):
+            out_w, out_i = rocm_router_gate(
+                torch.empty_like(logits),
+                self.bias_bf16,
+                TOPK,
+                True,
+                ROUTED_SCALING,
+                partials=partials,
+                num_token_non_padded=torch.tensor(
+                    [num_valid], dtype=torch.int32, device=self.device
+                ),
+                padded_id=NUM_EXPERTS,
+            )
+            msg = f"num_valid={num_valid}"
+            self.assertTrue(torch.equal(out_i[:num_valid], ref_i[:num_valid]), msg)
+            self.assertTrue(torch.equal(out_w[:num_valid], ref_w[:num_valid]), msg)
+            self.assertTrue(bool((out_i[num_valid:] == NUM_EXPERTS).all()), msg)
+            self.assertFalse(bool(out_w[num_valid:].any()), msg)
+
+    def test_select_experts_writes_the_megamoe_dropped_id_in_the_gate(self):
+        """With MegaMoE masking, the gate itself gives the padded rows id 384, with or
+        without the decode partials, and the real rows stay aiter's."""
+        from unittest.mock import patch
+
+        from sglang.srt.layers.moe import topk as topk_module
+        from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+
+        weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
+        config = TopKConfig(
+            top_k=TOPK,
+            renormalize=True,
+            correction_bias=self.bias_bf16,
+            routed_scaling_factor=1.5,
+            scoring_func="sqrtsoftplus",
+        )
+        for num_tokens, use_partials in ((6, True), (64, True), (96, False)):
+            x = self._randn(num_tokens, HIDDEN).to(torch.bfloat16)
+            num_valid = torch.tensor(
+                [num_tokens - 2], dtype=torch.int32, device=self.device
+            )
+            logits = torch.empty(num_tokens, NUM_EXPERTS, device=self.device)
+            kwargs = {}
+            if use_partials:
+                kwargs["router_logits_partials"] = rocm_router_gemv_split_k(x, weight)
+                rocm_router_reduce_partials(kwargs["router_logits_partials"], logits)
+            else:
+                logits = (x @ weight.t()).to(torch.bfloat16)
+            ref_w, ref_i = _aiter_gate(logits, self.bias_bf16, TOPK, True, 1.5)
+            with (
+                patch.object(
+                    topk_module, "megamoe_topk_masks_padded_rows", return_value=True
+                ),
+                patch.object(topk_module, "_fill_padded_rows") as fill,
+            ):
+                out = select_experts(
+                    x,
+                    torch.empty_like(logits) if use_partials else logits,
+                    config,
+                    num_token_non_padded=num_valid,
+                    **kwargs,
+                )
+            msg = f"M={num_tokens} partials={use_partials}"
+            fill.assert_not_called()
+            real = num_tokens - 2
+            self.assertTrue(torch.equal(out.topk_ids[:real], ref_i[:real]), msg)
+            self.assertTrue(torch.equal(out.topk_weights[:real], ref_w[:real]), msg)
+            self.assertTrue(bool((out.topk_ids[real:] == NUM_EXPERTS).all()), msg)
+            self.assertFalse(bool(out.topk_weights[real:].any()), msg)
+
     def test_select_experts_partials_with_fused_shared_expert(self):
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
