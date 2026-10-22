@@ -4,15 +4,19 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.mega_moe_flydsl import (
     _config_tokens,
     _forward_accepts_config_tokens,
     _should_overlap_shared_and_routed,
 )
+from sglang.srt.layers.moe.topk import TopKConfig
+from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.scheduler_components.dp_attn import (
     ForwardMode,
     _update_gather_batch,
 )
+from sglang.srt.runtime_context import get_context, get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -96,6 +100,112 @@ def test_idle_flash_rank_enters_with_the_widest_rank_config(monkeypatch):
     )
     mega._run_mega_routed(moe, torch.zeros(0, _FLASH[0]), None, None)
     assert seen == {"rows": 0, "config_tokens": 16384}
+
+
+@pytest.mark.parametrize(
+    "a2a_backend, flydsl, recorder_mode, remap, dropped",
+    [
+        # MegaMoE drops the out-of-range id 8 along with its weight.
+        (MoeA2ABackend.MEGAMOE, True, None, False, True),
+        # A remap table, the recorder or another consumer needs in-range ids.
+        (MoeA2ABackend.MEGAMOE, True, "stat", False, False),
+        (MoeA2ABackend.MEGAMOE, True, None, True, False),
+        (MoeA2ABackend.MEGAMOE, False, None, False, False),
+        (MoeA2ABackend.NONE, True, None, False, False),
+    ],
+)
+def test_hip_megamoe_padded_rows_leave_topk_with_a_dropped_id(
+    monkeypatch, a2a_backend, flydsl, recorder_mode, remap, dropped
+):
+    monkeypatch.setenv("SGLANG_AMD_USE_FLYDSL_MEGA_MOE", "1" if flydsl else "0")
+    monkeypatch.setattr(topk_module, "_is_cuda", False)
+    monkeypatch.setattr(topk_module, "_is_hip", True)
+    monkeypatch.setattr(topk_module, "_skip_hip_pad_mask", False)
+    monkeypatch.setattr(topk_module, "is_expert_remapping_enabled", lambda: remap)
+    monkeypatch.setattr(topk_module, "topk_ids_logical_to_physical", lambda ids, _: ids)
+    config = get_context().override_server_args(
+        expert_distribution_recorder_mode=recorder_mode
+    )
+    config.install()
+    ids = torch.tensor([[3, 1], [2, 5], [7, 6]], dtype=torch.int32)
+    weights = torch.tensor([[0.6, 0.4], [0.7, 0.3], [0.9, 0.1]])
+    try:
+        with get_flags().moe.override(a2a_backend=a2a_backend):
+            out_ids, out_weights, _ = topk_module._post_process_topk_ids(
+                ids.clone(),
+                weights.clone(),
+                topk_config=TopKConfig(top_k=2),
+                router_logits=torch.zeros(3, 8),
+                layer_id=0,
+                num_token_non_padded=torch.tensor(1),
+            )
+    finally:
+        config.restore()
+    assert out_ids[:1].tolist() == ids[:1].tolist()
+    torch.testing.assert_close(out_weights[:1], weights[:1])
+    if dropped:
+        assert out_ids[1:].tolist() == [[8, 8], [8, 8]]
+        torch.testing.assert_close(out_weights[1:], weights[1:])
+    else:
+        assert out_ids[1:].tolist() == [[0, 0], [0, 0]]
+        assert not out_weights[1:].any()
+
+
+@pytest.mark.parametrize(
+    "is_hash, topk_masks, filled",
+    [(False, True, False), (False, False, True), (True, True, True)],
+)
+def test_mega_routed_fills_only_the_rows_topk_left_unmasked(
+    monkeypatch, is_hash, topk_masks, filled
+):
+    import sglang.srt.layers.moe.mega_moe_flydsl as mega
+
+    seen = {"fill": None}
+
+    class Router:
+        topk_config = TopKConfig(top_k=6)
+
+        def __call__(self, hidden_states, router_logits, **kwargs):
+            seen["topk_kwargs"] = kwargs
+            return SimpleNamespace(
+                topk_ids=torch.zeros(4, 6, dtype=torch.int32),
+                topk_weights=torch.ones(4, 6),
+            )
+
+        def routing_inputs(self):
+            return torch.tensor(2), None
+
+    class Op:
+        def forward(self, x, wts, ids, *, slice_output=True, config_tokens=None):
+            return x
+
+    monkeypatch.setattr(mega, "megamoe_topk_masks_padded_rows", lambda c: topk_masks)
+    monkeypatch.setattr(
+        mega, "_fill_padded_rows", lambda ids, n, value: seen.update(fill=value)
+    )
+    monkeypatch.setattr(mega, "get_dp_global_num_tokens", lambda: [4, 0])
+    monkeypatch.setattr(mega, "_select_mtpr", lambda forward_batch: 512)
+    monkeypatch.setattr(mega, "_get_or_build_mega_moe", lambda *a, **k: Op())
+    monkeypatch.setattr(mega, "_swap_layer_weights", lambda op, layer: None)
+    moe = SimpleNamespace(
+        config=SimpleNamespace(
+            hidden_size=_FLASH[0],
+            num_experts_per_tok=6,
+            moe_intermediate_size=_FLASH[1],
+            swiglu_limit=0.0,
+        ),
+        num_fused_shared_experts=0,
+        experts=SimpleNamespace(num_experts=_FLASH[2]),
+        routed_scaling_factor=1.0,
+        routed_scaling_factor_fused_in_topk=True,
+        is_hash=is_hash,
+        gate=lambda hidden_states, **kwargs: torch.zeros(
+            hidden_states.shape[0], _FLASH[2]
+        ),
+        topk=Router(),
+    )
+    mega._run_mega_routed(moe, torch.zeros(4, _FLASH[0]), None, "ids")
+    assert seen["fill"] == (_FLASH[2] if filled else None)
 
 
 def test_mlp_sync_retains_full_vector_without_tp_gather():

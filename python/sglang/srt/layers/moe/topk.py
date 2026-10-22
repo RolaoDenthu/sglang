@@ -1879,6 +1879,21 @@ def is_expert_remapping_enabled() -> bool:
     )
 
 
+def megamoe_topk_masks_padded_rows(topk_config: TopKConfig) -> bool:
+    """Whether select_experts gives the padded rows of an aiter MegaMoE layer the
+    out-of-range expert id its dispatch drops, weight and all. In-range ids and
+    zeroed weights are only needed by a remap table, the distribution recorder or
+    the fused shared experts."""
+    return (
+        _is_hip
+        and topk_config.shared_experts.num_fused_shared_experts == 0
+        and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+        and get_moe_a2a_backend().is_megamoe()
+        and not is_expert_remapping_enabled()
+        and get_exec().moe.expert_distribution_recorder_mode is None
+    )
+
+
 def _fused_gate_masks_padded_rows(scoring_func: str) -> bool:
     # Sigmoid is excluded: a padding count bypasses moe_fused_gate's radix fast
     # path, and HIP fills padded ids with 0, not -1.
@@ -2570,6 +2585,7 @@ def _post_process_topk_ids(
     _fold_pad_into_append = False
     recorder_was_fused = False
     _fold_pad_weights_into_append = False
+    _megamoe_pad_mask = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2646,7 +2662,12 @@ def _post_process_topk_ids(
         _fold_pad_weights_into_append = (
             _fold_pad_into_append and not use_per_rank_shared_slots
         )
-        if not _fold_pad_into_append:
+        _megamoe_pad_mask = megamoe_topk_masks_padded_rows(topk_config)
+        if _megamoe_pad_mask:
+            _mask_topk_ids_padded_region(
+                topk_ids, num_token_non_padded, fill_value=router_logits.shape[1]
+            )
+        elif not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
             envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
@@ -2798,7 +2819,12 @@ def _post_process_topk_ids(
                 (rows >= num_token_non_padded)[:, None], -1
             )
 
-    if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
+    if (
+        _is_hip
+        and not _skip_hip_pad_mask
+        and not _fold_pad_weights_into_append
+        and not _megamoe_pad_mask
+    ):
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.

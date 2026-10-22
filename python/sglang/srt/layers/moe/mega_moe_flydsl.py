@@ -20,6 +20,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_is_extend_in_batch,
 )
+from sglang.srt.layers.moe.topk import megamoe_topk_masks_padded_rows
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.amd.deepseek_v2_hip_moe import batch_has_images
@@ -325,12 +326,13 @@ def _run_mega_routed(
     topk = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
     experts = moe.experts.num_experts
     if num_tokens:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        if (
+        use_vision_topk = (
             not moe.is_hash
             and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
             and batch_has_images(forward_batch)
-        ):
+        )
+        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+        if use_vision_topk:
             topk_output = vision_topk(moe, router_logits, input_ids_global)
         else:
             topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
@@ -343,7 +345,12 @@ def _run_mega_routed(
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights.to(torch.float32)
         num_token_non_padded, _ = moe.topk.routing_inputs()
-        if num_token_non_padded is not None:
+        topk_masked_padded_rows = (
+            not use_vision_topk
+            and not moe.is_hash
+            and megamoe_topk_masks_padded_rows(moe.topk.topk_config)
+        )
+        if num_token_non_padded is not None and not topk_masked_padded_rows:
             _fill_padded_rows(
                 topk_ids,
                 num_token_non_padded,
