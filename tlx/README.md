@@ -20,9 +20,10 @@ Needs an MI355X (gfx950).
 1. Build the uTLX image from the repo root and start a container:
 
    ```bash
-   docker build --network=host -f docker/rocm-triton-ext.Dockerfile -t sglang-rocm:triton-ext .
+   docker build --network=host --build-arg GPU_ARCH=gfx950-rocm1000 --build-arg ENABLE_UTLX=1 \
+     -f docker/rocm.Dockerfile -t sglang-rocm:utlx .
    docker run -it --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host \
-     --security-opt seccomp=unconfined sglang-rocm:triton-ext bash
+     --security-opt seccomp=unconfined sglang-rocm:utlx bash
    ```
 
 2. Inside the container, put the image's sglang checkout on this branch (the

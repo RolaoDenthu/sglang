@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Create the fbtriton venv the benchmarks compare against, inside the uTLX image
-# (docker/rocm-triton-ext.Dockerfile). The venv reuses /opt/venv's packages
+# (docker/rocm.Dockerfile with ENABLE_UTLX=1). The venv reuses /opt/venv's packages
 # (torch, sglang, aiter, ...) and only swaps in fbtriton as `triton`;
 # /opt/venv is left untouched.
 #
