@@ -642,7 +642,7 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
         and rope rows without a slot."""
         dev = "cuda"
         num_tokens, heads, pos_dtype, seed = 300, 16, torch.int32, 2
-        for layout in (KVLayout.V4, KVLayout.V41):
+        for layout in (KVLayout.V4, KVLayout.V41, KVLayout.V41_NEW):
             with self.subTest(layout=layout):
                 torch.manual_seed(seed)
                 kv = torch.randn(num_tokens, HEAD_DIM, device=dev, dtype=torch.bfloat16)
