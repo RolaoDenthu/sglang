@@ -198,7 +198,8 @@ def resolve_compressed_kv_layout(
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     """The (main-cache layout, compressed-cache option) for a new DeepSeek-V4
     family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA or gfx950
-    AITER attention."""
+    AITER attention (block-split v41 for aiter_sparse, interleaved v41_new for
+    aiter's mla_sparse_prefill_v41)."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
     if get_exec().kernel.dsv4_attn_backend == "flashmla_mega" and mode != "v41_new":
@@ -222,11 +223,26 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         )
         if mode == "auto" and not supported:
             return KVLayout.V4, None
-        if not supported or mode == "v41_new":
+        if not supported:
             raise ValueError(
-                "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention, "
-                "which reads the block-split v41 layout"
+                "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
             )
+        if mode == "v41_new":
+            # mla_sparse_prefill_v41 reads fp8 rows of one stride from both sources.
+            if option not in ("auto", "fp8"):
+                raise ValueError(
+                    "v41_new on HIP keeps every compressed cache fp8, got "
+                    f"SGLANG_DSV4_COMPRESSED_KV_LAYOUT={option!r}"
+                )
+            try:
+                from aiter.ops.mla_sparse_prefill import (  # noqa: F401
+                    mla_sparse_prefill_v41,
+                )
+            except ImportError as e:
+                raise ValueError(
+                    "v41_new on HIP needs aiter's mla_sparse_prefill_v41 (ROCm/aiter#6675)"
+                ) from e
+            return KVLayout.V41_NEW, "fp8"
         return KVLayout.V41, option
     if mode == "auto" and not is_sm100:
         return KVLayout.V4, None
