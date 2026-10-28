@@ -1,7 +1,8 @@
 """V41_NEW pools on gfx950: the CSR and query-row kernels match their references,
 and the HIP backend's mla_sparse_prefill_v41 attention matches a torch
 softmax-with-sink over the dequantized rows, with the split count deterministic
-inference pins."""
+inference pins. The DSpark draft that hands attention the rows of q still feeds
+wo_b its activation dtype."""
 
 import math
 import sys
@@ -90,6 +91,71 @@ class TestV41NewRowsSplitCount(CustomTestCase):
         for deterministic in (False, True):
             with self.subTest(deterministic=deterministic):
                 self.assertEqual(self._splits(1024, deterministic), 1)
+
+
+class TestV41NewDSparkDraft(CustomTestCase):
+    def test_reference_wo_a_keeps_the_activation_dtype(self):
+        """With SGLANG_DSPARK_FAST_KERNEL=0 the unpadded draft still hands attention
+        the uint8 V41_NEW rows of q; its torch wo_a must not take their dtype."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models import deepseek_v4_dspark as dspark
+
+        tokens, groups, rank = 3, 8, 16
+        q_rows = torch.zeros(tokens, HEADS, 528, dtype=torch.uint8)
+        o = torch.randn(tokens, HEADS, HEAD_DIM).to(torch.bfloat16)
+        wo_a = torch.randn(groups * rank, HEADS * HEAD_DIM // groups)
+        backend = mock.Mock()
+        backend.forward.return_value = o.clone()
+
+        attn = object.__new__(dspark.DSparkAttention)
+        torch.nn.Module.__init__(attn)
+        attn.n_local_heads, attn.head_dim = HEADS, HEAD_DIM
+        attn.rope_head_dim = ROPE_DIM
+        attn.n_local_groups, attn.o_lora_rank = groups, rank
+        attn.q_head_norm, attn._use_fast_kernel, attn.alt_streams = False, False, None
+        attn.attn = object()
+        attn.wq_a = lambda x: (x, None)
+        attn.q_norm = lambda x: x
+        attn.wq_b = lambda x: (x.new_zeros(x.shape[0], HEADS * HEAD_DIM), None)
+        attn.kv_proj_only = lambda x: x.new_zeros(x.shape[0], HEAD_DIM)
+        attn._store_block_kv = lambda **kwargs: None
+        attn._local_attn_sink = lambda: None
+        # rotations by zero, so the inverse RoPE leaves o as attention returned it
+        attn.freqs_cis = torch.ones(8, ROPE_DIM // 2, dtype=torch.complex64)
+        attn.wo_a = types.SimpleNamespace(weight=wo_a.to(torch.bfloat16))
+        attn.wo_b = lambda x, **kwargs: (x, None)
+        with (
+            mock.patch.object(dspark, "_is_hip", True),
+            mock.patch.object(dspark, "_is_npu", False),
+            mock.patch.object(
+                dspark,
+                "_hip",
+                types.SimpleNamespace(rope_q_as_v41_rows=lambda *args: q_rows),
+                create=True,
+            ),
+            mock.patch.object(
+                dspark,
+                "_resolve_dspark_pool",
+                return_value=types.SimpleNamespace(uniform_fp8=False),
+            ),
+            mock.patch(
+                "sglang.srt.model_executor.forward_context.get_attn_backend",
+                return_value=backend,
+            ),
+        ):
+            out = attn.forward(
+                torch.zeros(tokens, dtype=torch.int64),
+                torch.randn(tokens, 32).to(torch.bfloat16),
+                types.SimpleNamespace(forward_mode=ForwardMode.DECODE),
+            )
+        self.assertIs(backend.forward.call_args.kwargs["q"], q_rows)
+        want = torch.einsum(
+            "bgd,grd->bgr",
+            o.view(tokens, groups, -1).float(),
+            wo_a.to(torch.bfloat16).view(groups, rank, -1).float(),
+        )
+        self.assertEqual(out.dtype, torch.bfloat16)
+        torch.testing.assert_close(out, want.to(torch.bfloat16).reshape(tokens, -1))
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 Triton kernels")

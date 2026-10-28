@@ -1803,6 +1803,13 @@ class MQALayer(MqaAttentionBase):
                     positions,
                 )
                 return q_out
+            if _is_hip and q_out is None:
+                # uint8 V41_NEW rows instead of the bf16 q, over a V41_NEW pool only
+                q_rows = _hip.rope_q_as_v41_rows(
+                    get_token_to_kv_pool(), q, self.freqs_cis, positions
+                )
+                if q_rows is not None:
+                    return q_rows
             fused_rope_inplace(
                 q[..., -self.qk_rope_head_dim :],
                 None,

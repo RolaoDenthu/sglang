@@ -8,9 +8,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.dsv4.v41_q_rows_hip import q_to_v41_rows
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
 from sglang.srt.layers.attention.hip_flash_mla import (
     hip_attention_needs_head_pad,
     resolve_hip_flashmla_backend,
@@ -108,6 +111,21 @@ def fuses_q_rope_into_k_store(
         and not attn.q_head_norm
         and not envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get()
     )
+
+
+def rope_q_as_v41_rows(
+    pool, q: torch.Tensor, freqs_cis: torch.Tensor, positions: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """The unroped bf16 q [T, H, 512] roped and quantized in one launch into the
+    V41_NEW rows (uint8 [T, H, 528]) the gfx950 attention over a V41_NEW pool
+    reads; None where attention takes the bf16 query, which the caller ropes."""
+    if (
+        not _is_gfx95_supported
+        or pool.get_swa_key_layout() is not KVLayout.V41_NEW
+        or is_unified_kv_triton()
+    ):
+        return None
+    return q_to_v41_rows(q, freqs_cis, positions)
 
 
 def wq_b_unroped(attn, q) -> torch.Tensor:
