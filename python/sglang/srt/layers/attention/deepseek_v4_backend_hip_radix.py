@@ -55,8 +55,14 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     Csr,
     combined_to_csr,
     opus_sparse_prefill,
+    rows_to_csr,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
+from sglang.kernels.ops.attention.dsv4.v41_q_rows_hip import (
+    is_v41_rows,
+    q_to_v41_rows,
+    v41_rows_split,
+)
 from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.amd.binding import is_metadata_unread
@@ -96,6 +102,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillKVBuffer,
 )
 from sglang.srt.layers.attention.hip_flash_mla import (
+    _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS,
     _apply_inverse_rope,
     flash_mla_with_kvcache_entrypoint,
     hip_attn_kv_splits,
@@ -175,6 +182,18 @@ class _OpusPrefillState:
     # ratio -> CSR of the top-k into compressed_kv[ratio]; dropped when the indexer
     # rewrites that ratio's top-k
     topk_csr: Dict[int, Csr] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _V41Csrs:
+    """The CSRs one V41_NEW forward built from one index list."""
+
+    metadata: object
+    indices: torch.Tensor
+    num_tokens: int
+    rows: Csr
+    # SWA only: a CSR naming no row, for the extend source a ratio-0 layer leaves empty
+    no_rows: Optional[Csr]
 
 
 def _fold_lengths_into_index_lists(
@@ -890,7 +909,9 @@ class DeepseekV4HipRadixBackend(
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
     _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
     write_tail_source_kv = DeepseekV4AttnBackend.write_tail_source_kv
-    # No two-level candidates on HIP: the ratio-1/2 sources stay one eager break.
+    # No two-level candidates on HIP: the ratio-1/2 sources stay one eager break,
+    # whose _low_ratio_index_topk drops the V41_NEW CSRs of the top-k it rewrites;
+    # the prefill graph's captured top-k would not.
     low_ratio_prefill_graph = False
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
@@ -1079,6 +1100,8 @@ class DeepseekV4HipRadixBackend(
         }
         # Reset with the metadata: its inputs belong to one prefill forward.
         self._opus_prefill_state: Optional[_OpusPrefillState] = None
+        # V41_NEW CSRs of one forward: 0 -> SWA rows, ratio -> that ratio's top-k.
+        self._v41_csr_cache: Dict[int, _V41Csrs] = {}
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1692,6 +1715,8 @@ class DeepseekV4HipRadixBackend(
         if isinstance(metadata, DSV4Metadata):
             # the bucket object outlives the step; a warmup's length-fold cache must not be replayed
             metadata.core_attn_metadata._aiter_sparse_masked_indices = None
+        # nor its V41_NEW CSRs, which a capture must record rather than find cached
+        self._v41_csr_cache = {}
 
         window = self.token_to_kv_pool.request_window
         if window is not None and isinstance(metadata, DSV4Metadata):
@@ -3266,6 +3291,118 @@ class DeepseekV4HipRadixBackend(
     def _drop_opus_topk_csr(self, compress_ratio: int) -> None:
         if self._opus_prefill_state is not None:
             self._opus_prefill_state.topk_csr.pop(compress_ratio, None)
+        self._v41_csr_cache.pop(compress_ratio, None)
+
+    def _v41_rows_csr(
+        self,
+        key: int,
+        indices: torch.Tensor,
+        lengths: torch.Tensor,
+        num_tokens: int,
+        num_rows: int,
+    ) -> _V41Csrs:
+        """CSR of the live pool rows in ``indices`` [T, W], built once per forward
+        and index source: SWA rows (key 0) are shared by every layer, a ratio's
+        top-k by the layers after its index source. Never reused across forwards,
+        whose tensors may be uninitialized graph-capture buffers or refreshed in
+        place. The identity check cannot see an index source rewriting its top-k
+        in place either; _low_ratio_index_topk drops that entry first."""
+        entry = self._v41_csr_cache.get(key)
+        if (
+            entry is not None
+            and entry.metadata is self.forward_metadata
+            and entry.indices is indices
+            and entry.num_tokens == num_tokens
+        ):
+            return entry
+        rows, no_rows = rows_to_csr(
+            indices.reshape(indices.shape[0], -1),
+            lengths,
+            num_tokens,
+            num_rows,
+            with_empty=key == 0,
+        )
+        entry = _V41Csrs(self.forward_metadata, indices, num_tokens, rows, no_rows)
+        self._v41_csr_cache[key] = entry
+        return entry
+
+    def _forward_attention_v41_rows(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: int,
+        core_attn_metadata: DSV4AttnMetadata,
+        attn_sink: Optional[torch.Tensor],
+        inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Sparse attention over V41_NEW pools for every forward mode: aiter's
+        mla_sparse_prefill_v41 reads the SWA rows and, for ratios 1 / 2, the top-k
+        compressed rows in place, by pool slot; it splits the keys when the step has
+        too few tokens to fill the GPU, over the count hip_attn_kv_splits() pins
+        under deterministic inference. q is the roped bf16 query, or the model's
+        V41_NEW rows of it (uint8 [T, H, 528])."""
+        from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
+
+        pool = self.token_to_kv_pool
+        core = core_attn_metadata
+        num_tokens = q.shape[0]
+        if not is_v41_rows(q):
+            q = q_to_v41_rows(q.reshape(num_tokens, -1, q.shape[-1]))
+        q_values, q_scales = v41_rows_split(q)
+
+        swa_values, swa_scales = _v41_new_rows(
+            pool.get_swa_key_buffer_radix(layer_id), pool.swa_page_size
+        )
+        swa = self._v41_rows_csr(
+            0,
+            core.swa_page_indices,
+            core.swa_topk_lengths,
+            num_tokens,
+            swa_values.shape[0],
+        )
+        if compress_ratio in (1, 2):
+            assert pool.get_extra_key_layout(layer_id) is KVLayout.V41_NEW, (
+                "V41_NEW pools keep fp8 compressed rows"
+            )
+            prefix_values, prefix_scales = _v41_new_rows(
+                pool.get_extra_key_buffer(layer_id),
+                pool.get_extra_key_page_size(layer_id),
+            )
+            prefix_csr = self._v41_rows_csr(
+                compress_ratio,
+                core.sparse_page_indices(compress_ratio),
+                core.sparse_topk_lengths(compress_ratio),
+                num_tokens,
+                prefix_values.shape[0],
+            ).rows
+            extend_csr = swa.rows
+        else:
+            assert compress_ratio == 0, compress_ratio
+            prefix_values, prefix_scales, prefix_csr = swa_values, swa_scales, swa.rows
+            extend_csr = swa.no_rows
+
+        out = mla_sparse_prefill_v41(
+            q_values,
+            q_scales,
+            prefix_values,
+            prefix_scales,
+            *prefix_csr,
+            swa_values,
+            swa_scales,
+            *extend_csr,
+            attn_sink,
+            self.softmax_scale,
+            # pinned under deterministic inference: aiter's own count follows the
+            # step's token count, so a request would reduce differently per batch
+            num_kv_splits=(
+                1
+                if num_tokens >= _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS
+                else hip_attn_kv_splits() or None
+            ),
+        )
+        if inv_rope is not None:
+            _apply_inverse_rope(out, inv_rope)
+        return out
 
     def _forward_attention(
         self,
@@ -3286,7 +3423,9 @@ class DeepseekV4HipRadixBackend(
         """inv_rope=(freqs_real, positions) has the kernel apply the inverse RoPE
         to the last freqs_real.shape[-1] dims of every output head."""
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
+            # attention over V41_NEW rows of q returns bf16
+            dtype = torch.bfloat16 if is_v41_rows(q) else q.dtype
+            return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim, dtype=dtype)
 
         assert k is v, "DeepseekV4 shares k and v"
         swa_k = k
@@ -3323,6 +3462,15 @@ class DeepseekV4HipRadixBackend(
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
+            if token_to_kv_pool.get_swa_key_layout() is KVLayout.V41_NEW:
+                return self._forward_attention_v41_rows(
+                    q,
+                    layer_id,
+                    compress_ratio,
+                    core_attn_metadata,
+                    attn_sink,
+                    inv_rope,
+                )
             if self._opus_prefill_applies(q, forward_batch, compress_ratio):
                 return self._forward_prefill_opus(
                     q,
@@ -3801,6 +3949,24 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
     def on_after_cuda_graph_warmup(self):
         for backend in self.attn_backends:
             backend.on_after_cuda_graph_warmup()
+
+
+def _v41_new_rows(
+    buffer: torch.Tensor, page_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """A V41_NEW pool as (values [slots, 512] e4m3, scales [slots, 16] e8m0) views
+    at its 528-byte row stride: pages hold whole rows, so a slot is a row."""
+    layout = KVLayout.V41_NEW
+    row_bytes = page_size * layout.bytes_per_token
+    assert buffer.shape[-1] == layout.page_bytes(page_size) == row_bytes, (
+        buffer.shape,
+        page_size,
+    )
+    rows = buffer.view(torch.uint8).view(-1, layout.bytes_per_token)
+    return (
+        rows[:, : layout.data_bytes].view(torch.float8_e4m3fn),
+        rows[:, layout.data_bytes :],
+    )
 
 
 def _match_num_queries(
