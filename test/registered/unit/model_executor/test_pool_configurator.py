@@ -1640,6 +1640,26 @@ class TestSWAPoolFloor(CustomTestCase):
                 0.1 * cfg.bytes_per_swa_token + 585 / 4 + 864 / 128 + 132 / 4,
             )
 
+    def test_dsv4_low_ratio_slot_bytes_follow_v41_new_rows(self):
+        """HIP's V41_NEW ratio-1 / ratio-2 pools are priced at their 528-byte fp8
+        rows, not the 584-byte FP8 FlashMLA slot."""
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+
+        cfg = self._dsv4_configurator_for_budget()
+        cfg._unified = False
+        cfg.page_size = 256
+        cfg.kv_bytes = 584
+        cfg.low_ratio_index_bytes = 68
+        _publish_config(self, dsv4_attn_backend="flashmla")
+        with patch(
+            "sglang.srt.mem_cache.deepseek_v4_memory_pool.select_dsv4_kv_layout",
+            return_value=(KVLayout.V41_NEW, "fp8"),
+        ):
+            for ratio in (1, 2):
+                self.assertEqual(
+                    cfg._compressed_bytes_per_full_token(ratio), (528 + 68) / ratio
+                )
+
     def _dspark_replay_planner(self, *, draft_ring):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 

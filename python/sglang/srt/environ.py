@@ -1853,10 +1853,12 @@ class Envs:
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches), "v41_new" (the same bytes interleaved per token, for
-    # FlashMLA's 2026.09.30 kernels) or "auto" (v41 on SM100, v4 elsewhere).
+    # FlashMLA's 2026.09.30 kernels and gfx950 aiter mla_sparse_prefill_v41) or
+    # "auto" (v41 on SM100, v4 elsewhere).
     SGLANG_DSV4_KV_LAYOUT = EnvStr("v4")
     # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
-    # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
+    # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all;
+    # "v41_new" on HIP takes fp8 only ("auto" resolves to it).
     SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")
     # unified_kv only: split the pool into an fp8 nope pool plus a parallel
     # bf16 rope pool, 640 B/token instead of 1024. The unified pool takes no

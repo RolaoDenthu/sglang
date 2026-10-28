@@ -1,8 +1,10 @@
-"""V41_NEW pools on gfx950: the CSR and query-row kernels match their references,
-and the HIP backend's mla_sparse_prefill_v41 attention matches a torch
-softmax-with-sink over the dequantized rows, with the split count deterministic
-inference pins. The DSpark draft that hands attention the rows of q still feeds
-wo_b its activation dtype."""
+"""V41_NEW pools on gfx950: the layout is only selected with fp8 compressed caches
+and aiter's mla_sparse_prefill_v41 and only serves V4.1's compress ratios, the c1 /
+c2 compressed writes hold the same rows as in V41, the CSR and query-row kernels
+match their references, and the HIP backend's mla_sparse_prefill_v41 attention
+matches a torch softmax-with-sink over the dequantized rows, with the split count
+deterministic inference pins. The DSpark draft that hands attention the rows of q
+still feeds wo_b its activation dtype."""
 
 import math
 import sys
@@ -31,9 +33,89 @@ def _has_v41_prefill() -> bool:
     return True
 
 
+def _freqs(max_pos: int = 8192) -> torch.Tensor:
+    angles = torch.rand(max_pos, ROPE_DIM // 2, device="cuda") * 2 * math.pi
+    polar = torch.polar(torch.ones_like(angles), angles)
+    return torch.view_as_real(polar).flatten(-2)
+
+
 def _dequant(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     groups = values.float().unflatten(-1, (-1, 32))
     return (groups * torch.exp2(scales.float() - 127)[..., None]).flatten(-2)
+
+
+class TestV41NewLayoutSelection(CustomTestCase):
+    def _select(self, option, aiter_module=None):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache import deepseek_v4_memory_pool as pool
+
+        modules = {}
+        if aiter_module is not None:
+            modules["aiter.ops.mla_sparse_prefill"] = aiter_module
+        with (
+            envs.SGLANG_DSV4_KV_LAYOUT.override("v41_new"),
+            envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.override(option),
+            mock.patch.object(pool, "_is_hip", True),
+            mock.patch.object(pool, "is_gfx95_supported", return_value=True),
+            mock.patch.object(
+                pool, "resolve_hip_flashmla_backend", return_value="aiter_sparse"
+            ),
+            mock.patch.object(
+                pool,
+                "get_exec",
+                return_value=types.SimpleNamespace(
+                    kernel=types.SimpleNamespace(dsv4_attn_backend="flashmla")
+                ),
+            ),
+            mock.patch.dict(sys.modules, modules),
+        ):
+            return pool.select_dsv4_kv_layout()
+
+    def test_v41_new_keeps_every_compressed_cache_fp8(self):
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+
+        with_kernel = types.ModuleType("aiter.ops.mla_sparse_prefill")
+        with_kernel.mla_sparse_prefill_v41 = object()
+        for option in ("auto", "fp8"):
+            with self.subTest(option=option):
+                self.assertEqual(
+                    self._select(option, with_kernel), (KVLayout.V41_NEW, "fp8")
+                )
+        with self.assertRaisesRegex(ValueError, "fp8"):
+            self._select("fp4", with_kernel)
+
+    def test_v41_new_needs_the_aiter_kernel(self):
+        without_kernel = types.ModuleType("aiter.ops.mla_sparse_prefill")
+        with self.assertRaisesRegex(ValueError, "mla_sparse_prefill_v41"):
+            self._select("auto", without_kernel)
+
+    def test_v41_new_attention_rejects_other_ratios_at_startup(self):
+        """A V4 model's ratios 4 / 128 fail when the backend starts, not at the
+        first forward of one of their layers."""
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.layers.attention import deepseek_v4_backend_hip_radix as hip
+
+        def pool(layout, ratios):
+            return types.SimpleNamespace(
+                get_swa_key_layout=lambda: layout, present_ratios=ratios
+            )
+
+        for layout, ratios in [
+            (KVLayout.V41_NEW, (1, 2)),
+            # the draft pool, whose layers are all ratio 0
+            (KVLayout.V41_NEW, ()),
+            (KVLayout.V41, (4, 128)),
+            (KVLayout.V4, (4, 128)),
+        ]:
+            with self.subTest(layout=layout, ratios=ratios):
+                hip._check_v41_new_ratios(pool(layout, ratios))
+        with self.assertRaisesRegex(ValueError, r"v41_new.*\[4, 128\]"):
+            hip._check_v41_new_ratios(pool(KVLayout.V41_NEW, (1, 4, 128)))
+        with mock.patch(
+            "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
+            return_value=True,
+        ):
+            hip._check_v41_new_ratios(pool(KVLayout.V41_NEW, (4, 128)))
 
 
 class TestV41NewRowsSplitCount(CustomTestCase):
@@ -156,6 +238,117 @@ class TestV41NewDSparkDraft(CustomTestCase):
         )
         self.assertEqual(out.dtype, torch.bfloat16)
         torch.testing.assert_close(out, want.to(torch.bfloat16).reshape(tokens, -1))
+
+
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported(), "the V4.1 writers are gfx950 JIT"
+)
+class TestV41NewCompressedWrites(CustomTestCase):
+    def _pool(self, layout, page_size, pages):
+        return torch.zeros(
+            pages, layout.page_bytes(page_size), device="cuda", dtype=torch.uint8
+        )
+
+    def test_c1_matches_block_split(self):
+        from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+            dequantize_k_cache_paged_v41,
+        )
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+            c1_decode_norm_rope_store,
+        )
+
+        torch.manual_seed(0)
+        num_tokens, pages = 777, 8
+        kv = torch.randn(num_tokens, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        weight = (1 + 0.1 * torch.randn(HEAD_DIM, device="cuda")).to(torch.bfloat16)
+        positions = torch.randint(0, 8192, (num_tokens,), device="cuda").int()
+        # slot 0 marks a padded graph row
+        out_loc = torch.randperm(pages * FULL_PAGE - 1, device="cuda")[:num_tokens] + 1
+        freqs = _freqs()
+        rows, latents = [], []
+        for layout in (KVLayout.V41, KVLayout.V41_NEW):
+            cache = self._pool(layout, FULL_PAGE, pages)
+            latents.append(
+                c1_decode_norm_rope_store(
+                    kv,
+                    weight,
+                    positions,
+                    out_loc,
+                    1e-6,
+                    freqs,
+                    cache,
+                    page_size=FULL_PAGE,
+                    layout=layout,
+                )
+            )
+            rows.append(
+                dequantize_k_cache_paged_v41(
+                    cache, out_loc.int(), FULL_PAGE, layout=layout
+                )
+            )
+        self.assertTrue(torch.equal(latents[0], latents[1]))
+        self.assertTrue(torch.equal(rows[0], rows[1]))
+        self.assertGreater(rows[0].abs().sum().item(), 0)
+
+    def test_c2_prefill_matches_block_split(self):
+        from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+            dequantize_k_cache_paged_v41,
+        )
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+            c2_prefill_norm_rope_store,
+        )
+
+        torch.manual_seed(1)
+        lens, ring_size, c2_page = [9, 6, 1, 33], 8, FULL_PAGE // 2
+        num_tokens = sum(lens)
+        kv = torch.randn(num_tokens, 2 * HEAD_DIM, device="cuda")
+        weight = (1 + 0.1 * torch.randn(HEAD_DIM, device="cuda")).to(torch.bfloat16)
+        req = torch.cat([torch.full((n,), r) for r, n in enumerate(lens)]).cuda()
+        positions = torch.cat([torch.arange(n) for n in lens]).int().cuda()
+        # each request's FULL slots start on an even base, so a pair shares a c2 slot
+        raw_out_loc = torch.cat(
+            [torch.arange(n) + 2 * FULL_PAGE * (r + 1) for r, n in enumerate(lens)]
+        ).cuda()
+        starts = torch.tensor([0, *torch.tensor(lens).cumsum(0)[:-1]]).int().cuda()
+        seq_lens = torch.tensor(lens).int().cuda()
+        written = raw_out_loc[positions % 2 == 1] // 2
+        freqs = _freqs()
+        rows, latents, states = [], [], []
+        for layout in (KVLayout.V41, KVLayout.V41_NEW):
+            cache = self._pool(layout, c2_page, 16)
+            state = torch.zeros(
+                len(lens) * ring_size + ring_size + 1, 2 * HEAD_DIM, device="cuda"
+            )
+            state[:, HEAD_DIM:] = float("-inf")
+            latent = c2_prefill_norm_rope_store(
+                kv,
+                state,
+                weight,
+                positions,
+                req,
+                raw_out_loc,
+                1e-6,
+                freqs,
+                cache,
+                starts,
+                seq_lens,
+                page_size=c2_page,
+                ring_size=ring_size,
+                layout=layout,
+            )
+            latents.append(latent[positions % 2 == 1])
+            states.append(state)
+            rows.append(
+                dequantize_k_cache_paged_v41(
+                    cache, written.int(), c2_page, layout=layout
+                )
+            )
+        self.assertTrue(torch.equal(latents[0], latents[1]))
+        self.assertTrue(torch.equal(states[0], states[1]))
+        self.assertTrue(torch.equal(rows[0], rows[1]))
+        self.assertGreater(rows[0].abs().sum().item(), 0)
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 Triton kernels")

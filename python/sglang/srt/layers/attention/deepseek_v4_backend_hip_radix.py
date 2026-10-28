@@ -971,6 +971,7 @@ class DeepseekV4HipRadixBackend(
         )
         self.has_c4: bool = 4 in self.present_ratios
         self.has_c128: bool = 128 in self.present_ratios
+        _check_v41_new_ratios(self.token_to_kv_pool)
         # rows whose compressed context fits index_topk take the sequential selection, unscored
         hf_text_config = model_runner.model_config.hf_text_config
         self.low_ratio_identity_skip: bool = bool(
@@ -3949,6 +3950,26 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
     def on_after_cuda_graph_warmup(self):
         for backend in self.attn_backends:
             backend.on_after_cuda_graph_warmup()
+
+
+def _check_v41_new_ratios(pool: DeepSeekV4TokenToKVPool) -> None:
+    """Reject at startup a V41_NEW pool whose model has compress ratios beyond V4.1's
+    1 / 2: mla_sparse_prefill_v41 reads only the SWA and the ratio-1 / 2 rows, and
+    the unified_kv path, which keeps its own pools, never reaches it."""
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+        is_unified_kv_triton,
+    )
+
+    unsupported = sorted(set(pool.present_ratios) - {1, 2})
+    if (
+        unsupported
+        and pool.get_swa_key_layout() is KVLayout.V41_NEW
+        and not is_unified_kv_triton()
+    ):
+        raise ValueError(
+            "SGLANG_DSV4_KV_LAYOUT=v41_new on HIP serves DeepSeek-V4.1's compress "
+            f"ratios 1 / 2 only; this model also has {unsupported}"
+        )
 
 
 def _v41_new_rows(
