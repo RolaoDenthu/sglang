@@ -73,13 +73,16 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
 _is_npu = is_npu()
+_is_hip = is_hip()
+if _is_hip:
+    from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip
 
 
 def apply_rotary_emb(
@@ -197,6 +200,13 @@ class DSparkAttention(MqaAttentionBase):
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
                 return q_out
+            if _is_hip and q_out is None:
+                # uint8 V41_NEW rows instead of the bf16 q, over a V41_NEW pool only
+                q_rows = _hip.rope_q_as_v41_rows(
+                    _resolve_dspark_pool(), q, self.freqs_cis, positions
+                )
+                if q_rows is not None:
+                    return q_rows
             if self._use_fast_kernel and not _is_npu:
                 fused_rope_inplace(
                     q[..., -self.rope_head_dim :],
@@ -380,7 +390,10 @@ class DSparkAttention(MqaAttentionBase):
                 fast_path=self.is_dsv41,
             )
         else:
-            o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
+            # q may be fp8 or the uint8 V41_NEW rows; wo_b takes the activation dtype
+            o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(
+                hidden_states.dtype
+            )
         value = o.reshape(o.shape[0], o.shape[1] * o.shape[2])
         out, _ = self.wo_b(value, skip_all_reduce=defer_all_reduce)
         return (
