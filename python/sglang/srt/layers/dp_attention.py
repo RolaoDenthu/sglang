@@ -1347,6 +1347,11 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # bucket on every EP rank. As for FlashInfer A2A above, this only
             # enables DP-count bookkeeping; expert inputs remain local.
             return True
+        elif _is_hip and moe_a2a_backend.is_megamoe():
+            # Aiter MegaMoEv2 ranks pick their route from the widest rank's rows, so
+            # each needs every DP count. Expert inputs stay local, but graph buckets
+            # align to the widest rank and gathered buffers are sized for the group.
+            return True
         elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
             # buffer means baking a fan-in size into a captured graph, and the

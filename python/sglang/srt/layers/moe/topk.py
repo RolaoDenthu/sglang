@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from dataclasses import dataclass, field
@@ -1881,13 +1882,30 @@ def is_expert_remapping_enabled() -> bool:
     )
 
 
+_megamoe_routing_active = False
+
+
+@contextlib.contextmanager
+def megamoe_routing():
+    """Marks the routing of a call that aiter MegaMoE dispatches. Under the megamoe
+    backend a layer can still fall back to the fused MoE (rows past the MTPR, layers
+    without MegaMoE weights), which must keep in-range ids with zeroed weights."""
+    global _megamoe_routing_active
+    previous, _megamoe_routing_active = _megamoe_routing_active, True
+    try:
+        yield
+    finally:
+        _megamoe_routing_active = previous
+
+
 def megamoe_topk_masks_padded_rows(topk_config: TopKConfig) -> bool:
     """Whether select_experts gives the padded rows of an aiter MegaMoE layer the
     out-of-range expert id its dispatch drops, weight and all. In-range ids and
-    zeroed weights are only needed by a remap table, the distribution recorder or
-    the fused shared experts."""
+    zeroed weights are only needed by a remap table, the distribution recorder,
+    the fused shared experts or a call outside megamoe_routing()."""
     return (
         _is_hip
+        and _megamoe_routing_active
         and topk_config.shared_experts.num_fused_shared_experts == 0
         and get_moe_a2a_backend().is_megamoe()
         and not is_expert_remapping_enabled()

@@ -32,6 +32,9 @@ class _FakeMega:
     """Routed experts multiply x by their physical ID + 1; the rank-1 shared slot
     (ID 5) is an identity expert, and the out-of-range fill ID contributes nothing."""
 
+    small_m_mtpr = 512
+    large_m_available = False
+
     def __init__(self, num_experts):
         self.num_experts = num_experts
         self.calls = []
@@ -55,6 +58,7 @@ class TestAiterMegaMoeVisionRouting(CustomTestCase):
                 moe_intermediate_size=8,
                 image_token_id=IMAGE_TOKEN_ID,
                 swiglu_limit=None,
+                num_hidden_layers=43,
             ),
             experts=SimpleNamespace(
                 num_experts=NUM_ROUTED_EXPERTS + 2 * fused_shared,
