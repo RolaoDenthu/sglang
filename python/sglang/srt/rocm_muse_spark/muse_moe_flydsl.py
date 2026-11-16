@@ -114,6 +114,17 @@ def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
         cfg["num_warps"] = 8 if use_wide_bf16_m else 4
         cfg["BLOCK_M"] = 32 if mxfp4 and M <= 1024 else (128 if use_wide_bf16_m else 64)
         cfg["FLYDSL_K_UNROLL"] = (2 if M >= 4096 else 4) if mxfp4 else 1
+    if not mxfp4 and 128 < M <= 320:
+        # Wider EP4 verify widths keep the 33..64-row tile instead of the prefill tile above (MI355X per layer,
+        # 136..320 rows: 1.22-1.29x uniform routing, 1.03-1.18x with six hot experts up to 256 rows).
+        cfg.update(
+            BLOCK_M=32,
+            BLOCK_N=64,
+            BLOCK_K=64,
+            num_warps=4,
+            GEMM1_FLYDSL_K_UNROLL=2,
+            GEMM2_FLYDSL_K_UNROLL=4,
+        )
     if mxfp4 and M <= 1024:
         # Through M=1024 an MXFP4 launch is pure weight streaming: alignment
         # gives every local expert its own BLOCK_M tile, so no tile choice buys
