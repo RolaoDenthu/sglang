@@ -60,7 +60,10 @@ ROW_MAJOR = {
     (2048, 8192, 32): (64, 128, 8, 4, 3),
     (2048, 8192, 64): (32, 256, 4, 4, 3),
     (2048, 8192, 128): (64, 128, 8, 4, 3),
-    # QKV [2560, 8192] (12.6 vs 14.6 at 32, 15.4 vs 15.8 at 64, 20.1 vs 21.1 at 128),
+    # QKV [2560, 8192] (12.6 vs 14.6 at 32, 15.4 vs 15.8 at 64, 20.1 vs 21.1 at 128); at 1..16 rows the
+    # alternative is aiter's tuned FlyDSL split-K kernel, whose bf16 atomic adds make the draft run-to-run
+    # nondeterministic (FP32 partials summed in order here),
+    (2560, 8192, 16): (128, 128, 8, 8, 3),
     (2560, 8192, 32): (128, 128, 8, 8, 3),
     (2560, 8192, 64): (128, 128, 8, 8, 3),
     (2560, 8192, 128): (64, 128, 4, 4, 3),
