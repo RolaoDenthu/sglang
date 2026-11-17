@@ -43,6 +43,19 @@ def _as_grouped_gate_view(
 
 
 @triton.jit
+def _lane_tree_row_sum(v, BLOCK_M: tl.constexpr):
+    """Row sums of ``v`` [BLOCK_M, 64] in the order the default launch's layout reduces them with 16-byte-aligned
+    rows (2 values per thread, 32 lanes per row): adjacent pairs, then lane partners t ^ 16, 8, 4, 2, 1. Each step
+    adds two values, so any launch config gets the same bits."""
+    s = tl.sum(tl.reshape(v, (BLOCK_M, 32, 2)), axis=2)
+    s = tl.sum(tl.reshape(s, (BLOCK_M, 2, 16)), axis=1)
+    s = tl.sum(tl.reshape(s, (BLOCK_M, 2, 8)), axis=1)
+    s = tl.sum(tl.reshape(s, (BLOCK_M, 2, 4)), axis=1)
+    s = tl.sum(tl.reshape(s, (BLOCK_M, 2, 2)), axis=1)
+    return tl.sum(s, axis=1)
+
+
+@triton.jit
 def _rms_norm_gate_fwd_kernel(
     X,  # [N, D] input (contiguous, row-stride = D)
     G,  # [T, groups, heads_per_group*D] gate values
@@ -104,6 +117,55 @@ def _rms_norm_gate_fwd_kernel(
         x = x * tl.sigmoid(g)
 
     tl.store(Y + rows[:, None] * D + cols[None, :], x, mask=mask)
+
+
+@triton.jit
+def _rms_norm_gate_quant_fp8_kernel(
+    X,  # [W, M, HPW * D] Ulysses output all-to-all result (contiguous)
+    G,  # [W, M, HPW * D] kept gate, contiguous rows
+    XQ,  # [M, W * HPW * D] FP8 e4m3
+    XS,  # [M] FP32
+    eps,
+    M,
+    stride_gw,
+    stride_gm,
+    WB: tl.constexpr,
+    HPW: tl.constexpr,
+    D: tl.constexpr,
+):
+    # One token row: its W * HPW heads, each normed and gated exactly as _rms_norm_gate_fwd_kernel's default launch
+    # (_lane_tree_row_sum), rounded to BF16, then quantized per row as fp8_prefill_gemm._quantize_rows_kernel does.
+    r = tl.program_id(0)
+    j = tl.arange(0, WB * HPW)
+    c = tl.arange(0, D)
+    w = (j // HPW).to(tl.int64)
+    h = j % HPW
+    live = (r < M) & (j < WB * HPW)
+    x = tl.load(
+        X
+        + w[:, None] * M * HPW * D
+        + r.to(tl.int64) * HPW * D
+        + h[:, None] * D
+        + c[None, :]
+    ).to(tl.float32)
+    squares = tl.where(live[:, None], x * x, 0.0)
+    var = _lane_tree_row_sum(squares, WB * HPW) / D
+    rstd = 1.0 / tl.sqrt(var + eps)
+    x = x * rstd[:, None]
+    g = tl.load(
+        G
+        + w[:, None] * stride_gw
+        + r.to(tl.int64) * stride_gm
+        + h[:, None] * D
+        + c[None, :]
+    ).to(tl.float32)
+    x = (x * tl.sigmoid(g)).to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.max(tl.abs(x), axis=1), axis=0), 1e-20)
+    scale = tl.div_rn(amax, 448.0)
+    inv = tl.div_rn(448.0, amax)
+    xq = (x * inv).to(tl.float8e4nv)
+    tl.store(XQ + r.to(tl.int64) * WB * HPW * D + j[:, None] * D + c[None, :], xq)
+    tl.store(XS + r, scale)
 
 
 def _rms_norm_gate_config(
@@ -194,6 +256,47 @@ class FusedRMSNormGate(BaseFusedOp):
             state, x.shape, x.dtype, g if self._use_o_gate else None,
             self._eps, self._effective_weight,
         )  # fmt: skip
+
+    def quant_fp8_heads_applies(self, heads: torch.Tensor, gate: torch.Tensor) -> bool:
+        """Whether ``forward_quant_fp8_heads`` serves these inputs: norm and gate on, no weight, head dim 64,
+        16-byte-aligned contiguous BF16 heads (the layout whose row-sum order _lane_tree_row_sum replays) on the Triton
+        backend."""
+        if not (
+            self._use_o_norm
+            and self._use_o_gate
+            and self._effective_weight is None
+            and self._head_dim == 64
+            and heads.dim() == 3
+            and heads.dtype == torch.bfloat16
+            and heads.is_contiguous()
+            and heads.data_ptr() % 16 == 0
+            and gate.shape == heads.shape
+            and gate.dtype == torch.bfloat16
+            and gate.stride(-1) == 1
+        ):
+            return False
+        # The tile is one token row's heads: a power-of-two count (128 at TP4 and TP8).
+        heads_per_row = heads.shape[0] * heads.shape[2] // 64
+        if heads_per_row & (heads_per_row - 1):
+            return False
+        # _gated_heads passes a flat gate, which every backend accepts.
+        flat = heads.view(-1, heads.shape[-1])
+        return self._resolve_backend(flat, None) == FusedOpBackend.TRITON
+
+    def forward_quant_fp8_heads(
+        self, heads: torch.Tensor, gate: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``quantize_head_rows_fp8`` of the norm-gate of ``heads`` [W, M, HW] with ``gate`` [W, M, HW], in one pass
+        (bitwise the two launches; call only when ``quant_fp8_heads_applies``)."""
+        w, m, hw = heads.shape
+        xq = torch.empty((m, w * hw), device=heads.device, dtype=torch.float8_e4m3fn)
+        xs = torch.empty((m,), device=heads.device, dtype=torch.float32)
+        if m:
+            _rms_norm_gate_quant_fp8_kernel[(m,)](
+                heads, gate, xq, xs, self._eps, m, gate.stride(0), gate.stride(1),
+                WB=w, HPW=hw // 64, D=64, num_warps=8,
+            )  # fmt: skip
+        return xq, xs
 
     def forward_native(
         self,

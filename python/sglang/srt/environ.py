@@ -2509,6 +2509,9 @@ class Envs:
     # Ulysses all-to-alls in row chunks on a side stream, overlapped with the chunks' QKV / O projections
     # (needs SGLANG_ROCM_MUSE_ULYSSES_LOCAL_GATE).
     SGLANG_ROCM_MUSE_ULYSSES_PIPELINE = EnvBool(True)
+    # Ulysses FP8 O projection: its input's norm-gate and per-row FP8 quantization as one kernel (bitwise the two
+    # launches; =0 runs them separately). Whether the O projection runs in FP8 is SGLANG_ROCM_MUSE_PREFILL_DENSE_FP8.
+    SGLANG_ROCM_MUSE_ULYSSES_FUSED_NORM_GATE_QUANT = EnvBool(True)
     # TP4 / TP8 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
     # FlyDSL finalize + aiter two-stage all-reduce).
     SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH = EnvBool(True)

@@ -61,6 +61,9 @@ _PREFILL_SP = envs.SGLANG_ROCM_MUSE_PREFILL_SP.get()
 _PREFILL_ULYSSES = envs.SGLANG_ROCM_MUSE_PREFILL_ULYSSES.get()
 _ULYSSES_LOCAL_GATE = envs.SGLANG_ROCM_MUSE_ULYSSES_LOCAL_GATE.get()
 _ULYSSES_PIPELINE = envs.SGLANG_ROCM_MUSE_ULYSSES_PIPELINE.get()
+_ULYSSES_FUSED_NORM_GATE_QUANT = (
+    envs.SGLANG_ROCM_MUSE_ULYSSES_FUSED_NORM_GATE_QUANT.get()
+)
 _comm_stream = None
 _VERIFY_SP = os.environ.get("SGLANG_ROCM_MUSE_VERIFY_SP", "1") == "1"
 # From 128-row verify widths; narrower ones keep the all-reduce path.
@@ -741,11 +744,21 @@ def _gated_heads(attention, heads: torch.Tensor, gate: torch.Tensor) -> torch.Te
     ).view(world, rows, -1)
 
 
+def _gated_heads_fp8(
+    attention, heads: torch.Tensor, gate: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token-row FP8 copy (``quantize_head_rows_fp8``) of ``_gated_heads(attention, heads, gate)``."""
+    op = attention._fused_o_norm_gate
+    if _ULYSSES_FUSED_NORM_GATE_QUANT and op.quant_fp8_heads_applies(heads, gate):
+        return op.forward_quant_fp8_heads(heads, gate)
+    return quantize_head_rows_fp8(_gated_heads(attention, heads, gate))
+
+
 def _o_projection(attention, heads: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    heads = _gated_heads(attention, heads, gate)
     if attention.ulysses_o_fp8 is not None:
-        xq, xs = quantize_head_rows_fp8(heads)
+        xq, xs = _gated_heads_fp8(attention, heads, gate)
         return fp8_prefill_gemm(xq, xs, attention.ulysses_o_fp8)
+    heads = _gated_heads(attention, heads, gate)
     rows = heads.shape[1]
     return F.linear(heads.transpose(0, 1).reshape(rows, -1), attention.ulysses_o_weight)
 
@@ -903,7 +916,7 @@ def _pipelined_o_projection(attention, out, gates, group, o_chunks, hidden):
     for (lo, hi), (heads, ready), gate in zip(o_chunks, received, gates):
         main.wait_event(ready)
         heads.record_stream(main)
-        xq, xs = quantize_head_rows_fp8(_gated_heads(attention, heads, gate))
+        xq, xs = _gated_heads_fp8(attention, heads, gate)
         # Written in place: a per-chunk copy runs at a sixth of its speed next to the RCCL kernels.
         _fp8_prefill_gemm_into(result[lo:hi], xq, xs, attention.ulysses_o_fp8)
     return result
