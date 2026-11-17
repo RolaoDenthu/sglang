@@ -536,6 +536,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
         self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
+        # The ROCm Muse Spark fast paths of this worker apply to a Muse Spark target only.
+        self._muse_target = self._is_muse_target(self.model_runner.model_config)
 
         self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
@@ -769,6 +771,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._new_seq_lens_bufs: List[torch.Tensor] = []
         self._sharded_greedy_logits = (
             is_hip() and envs.SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS.get()
+        )
+        self._compact_block_embed = (
+            is_hip() and self._muse_target and self.selector is not None
         )
         self._target_logits_processor = self._defer_target_verify_gather()
         self._aux_graphs = {}
@@ -1563,6 +1568,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     @staticmethod
+    def _is_muse_target(model_config) -> bool:
+        architectures = getattr(model_config.hf_config, "architectures", None) or [None]
+        return is_muse_spark_architecture(architectures[0])
+
+    @staticmethod
     def _compact_draft_alignment_for_backend(
         page_size: int, backend: str, architectures: Optional[List[str]] = None
     ) -> int:
@@ -1783,6 +1793,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # Reconstruct on the table's own group before DP ranks can go idle.
         self._full_embed_gpu = gather_draft_embedding(embedding)
+
+    def _embed_block_compact(
+        self, embed_module: torch.nn.Module, block_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """embed_module(block_ids) for draft blocks (the bonus token, then mask tokens) from their distinct rows:
+        one lookup and all-reduce of the bs bonus ids plus the mask id. Bit-identical per row."""
+        bs, block_size = block_ids.shape
+        ids = torch.cat(
+            [block_ids[:, 0], block_ids.new_full((1,), int(self._mask_token_id))]
+        )
+        rows = embed_module(ids)
+        mask_rows = rows[bs:].expand(bs, block_size - 1, rows.shape[-1])
+        return torch.cat([rows[:bs, None], mask_rows], dim=1)
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -3269,6 +3292,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             # other DP replicas are idle or looking up different token IDs.
             noise_embedding = torch.nn.functional.embedding(
                 block_ids, self._full_embed_gpu
+            )
+        elif self._compact_block_embed:
+            noise_embedding = self._embed_block_compact(
+                embed_module=embed_module, block_ids=block_ids
             )
         else:
             noise_embedding = embed_module(block_ids)

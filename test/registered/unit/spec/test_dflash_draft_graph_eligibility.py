@@ -52,6 +52,7 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         worker._use_triton_prepare_block = False
         worker._mask_token_id = 2
         worker._full_embed_gpu = None
+        worker._compact_block_embed = False
         worker._noise_embed_scale = 1.0
         worker.use_compact_draft_cache = False
         worker.draft_kv_ring = None
