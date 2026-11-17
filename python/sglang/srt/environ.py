@@ -2466,6 +2466,9 @@ class Envs:
     # DFlash selector candidates under TP: each rank's top-k values and global ids share one FP32 all-gather, and
     # one kernel merges them into the global top-k with the unary-logit transform.
     SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES = EnvBool(True)
+    # DFlash context projection (fc) under TP: each rank projects onto its 1 / TP of the output features and the group
+    # all-gathers the slices in rank order (not bitwise the replicated GEMM; draft context only).
+    SGLANG_ROCM_MUSE_DFLASH_FC_SHARD = EnvBool(True)
     # Split-K 17..128-row GEMMs (tiled copy or row-major) for the weight shapes the
     # ROCm Muse Spark model registers (O projection, MoE pooler / unpooler, DFlash draft MLP).
     SGLANG_ROCM_MUSE_DENSE_TILED = EnvBool(True)

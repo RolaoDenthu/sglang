@@ -595,6 +595,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        # The fc shard table (models/dflash.py) holds shapes measured with a Muse Spark target.
+        self.draft_model.fc_shard_enabled = self._muse_target
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu

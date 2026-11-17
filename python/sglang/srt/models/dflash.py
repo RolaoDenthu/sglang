@@ -108,6 +108,10 @@ if _muse_gfx95_like:
         rowmajor_gemm_applies,
         rowmajor_gemm_partials,
     )
+    from sglang.kernels.ops.gemm.muse_spark_fc_shard import (
+        fc_shard_applies,
+        fc_shard_gemm,
+    )
     from sglang.kernels.ops.speculative.dflash_candidates import (
         MAX_PACKED_ID,
         merge_candidates,
@@ -1916,6 +1920,39 @@ class DFlash2DraftModel(DFlashDraftModel):
             and envs.SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES.get()
             and int(config.vocab_size) < MAX_PACKED_ID
         )
+        tp_size = int(get_parallel().tp_size)
+        # MI355X (SGLANG_ROCM_MUSE_DFLASH_FC_SHARD): the replicated context projection as each rank's slice of the output
+        # features plus one all-gather; a slice's GEMM may round a few elements differently from the replicated one,
+        # accepted for the draft's context. The weight stays whole: AMD's draft monokernel slices fc.weight itself.
+        self.shard_fc = (
+            _is_gfx95
+            and envs.SGLANG_ROCM_MUSE_DFLASH_FC_SHARD.get()
+            and tp_size > 1
+            and isinstance(self.fc, nn.Linear)
+            and self.fc.bias is None
+            and self.fc.out_features % tp_size == 0
+            # fc already holds only this rank's output columns (SGLANG_OPT_DFLASH_TP_AUX_FC)
+            and self.fc_tp_columns is None
+        )
+        # Set by the DFlash worker for a Muse Spark target, the model the fc shard table was measured with.
+        self.fc_shard_enabled = False
+
+    def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        parallel = get_parallel()
+        if not (
+            self.shard_fc
+            and self.fc_shard_enabled
+            and fc_shard_applies(target_hidden, self.fc.weight, int(parallel.tp_size))
+        ):
+            return super().project_target_hidden(target_hidden)
+        local = fc_shard_gemm(
+            target_hidden,
+            self.fc.weight,
+            tp_rank=int(parallel.tp_rank),
+            tp_size=int(parallel.tp_size),
+        )
+        # Concatenated in rank order: every rank holds the same full projection.
+        return self.hidden_norm(parallel.tp_group.all_gather(local, dim=-1))
 
     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
