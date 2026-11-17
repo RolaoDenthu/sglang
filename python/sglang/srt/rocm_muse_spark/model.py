@@ -34,6 +34,8 @@ from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     prepare_tiled_weight,
     rowmajor_gemm,
     rowmajor_gemm_applies,
+    rowmajor_gemm_partials,
+    rowmajor_gemm_partials_split,
     tiled_gemm,
     tiled_gemm_applies,
 )
@@ -1569,6 +1571,20 @@ class MuseSpark1xMoE(nn.Module):
             )
         return output
 
+    def unpool_partials(self, output: torch.Tensor) -> torch.Tensor:
+        """``unpool(output)``, or the FP32 ``[2, M, H]`` split-K partials of its GEMM when ``_dense_linear`` would run
+        it on the row-major kernel split two ways: the FFN boundary kernel then sums them as that GEMM would."""
+        proj = self.post_expert_proj
+        if (
+            proj is not None
+            and _DENSE_TILED
+            and proj.bias is None
+            and rowmajor_gemm_applies(output, proj.weight)
+            and rowmajor_gemm_partials_split(output.shape[0], *proj.weight.shape) == 2
+        ):
+            return rowmajor_gemm_partials(output, proj.weight)
+        return self.unpool(output)
+
 
 class MuseSpark1xDecoderLayer(nn.Module):
     def __init__(
@@ -1755,17 +1771,26 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 num_warps=16,
             )
             return stream, next_attn_input, None
-        ffn_output = (
-            self.mlp(
+        # The FFN boundary may take the unpooler's split-K partials and sum them itself.
+        fold_unpool = (
+            self.is_moe_layer
+            and ffn_boundary is not None
+            and sp is None
+            and not prefill_fp8
+        )
+        if self.is_moe_layer:
+            ffn_output = self.mlp(
                 ffn_input,
                 target_verify=target_verify,
                 sp=sp,
                 x_fp8=ffn_input_fp8,
                 prefill_fp8=prefill_fp8,
+                skip_post_expert_proj=fold_unpool,
             )
-            if self.is_moe_layer
-            else self.mlp(ffn_input)
-        )
+            if fold_unpool:
+                ffn_output = self.mlp.unpool_partials(ffn_output)
+        else:
+            ffn_output = self.mlp(ffn_input)
         if ffn_boundary is None:
             return self.post_feedforward_residual_gate(
                 stream, self.post_feedforward_layernorm(ffn_output)
@@ -1780,7 +1805,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
             and (
                 (
                     sp is None
-                    and 0 < ffn_output.shape[0] <= _FP8_MAX_ROWS
+                    and 0 < ffn_input.shape[0] <= _FP8_MAX_ROWS
                     and (
                         forward_batch.forward_mode.is_decode()
                         or forward_batch.forward_mode.is_target_verify()

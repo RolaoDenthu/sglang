@@ -65,6 +65,7 @@ def _fused_norm_residual_triton_kernel(
     BETA,
     post_norm_eps,
     pre_norm_eps,
+    split_stride,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     POST_NORM_IS_INPUT_SCALE: tl.constexpr,
@@ -76,12 +77,21 @@ def _fused_norm_residual_triton_kernel(
     PRE_NORM_BF16: tl.constexpr,
     M_BUCKET: tl.constexpr,
     HAS_FP8: tl.constexpr,
+    BRANCH_SPLITS: tl.constexpr = 1,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
     mask = offs < H
 
-    branch = tl.load(BRANCH + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    if BRANCH_SPLITS == 2:
+        # the branch's GEMM handed over its two FP32 split-K partials: the BF16 value its
+        # sum kernel (bf16_tiled_small_m_gemm._sum_partials) would have written
+        branch = tl.load(BRANCH + row * H + offs, mask=mask, other=0.0) + tl.load(
+            BRANCH + split_stride + row * H + offs, mask=mask, other=0.0
+        )
+        branch = branch.to(tl.bfloat16).to(tl.float32)
+    else:
+        branch = tl.load(BRANCH + row * H + offs, mask=mask, other=0.0).to(tl.float32)
 
     if POST_NORM_IS_INPUT_SCALE:
         post_input = branch
@@ -190,7 +200,8 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
 
         Args:
             stream: residual stream ``[T, H]`` in residual dtype (e.g. fp32).
-            branch: raw output from attention or MoE ``[T, H]`` in compute dtype.
+            branch: raw output from attention or MoE ``[T, H]`` in compute dtype, or the
+                FP32 ``[2, T, H]`` split-K partials of the GEMM that produces it.
             branch_dtype: dtype to cast pre-norm input to (default ``torch.bfloat16``).
             router_dtype: when set, also return the pre-norm output cast to this
                 dtype (e.g. ``torch.float32`` for MoE router input), fusing the
@@ -206,6 +217,8 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             router_input: pre-norm output cast to *router_dtype*, or ``None``
                 when *router_dtype* is not set.
         """
+        if branch.dim() == 3:
+            branch = (branch[0] + branch[1]).to(branch_dtype)
         normed_branch = self._post_norm(branch)
         new_stream = self._residual_add(stream, normed_branch)
         norm_input = (
@@ -224,15 +237,21 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         router_dtype: torch.dtype | None,
         pre_norm_dtype: torch.dtype | None,
     ) -> bool:
+        if branch.dim() == 3:
+            branch_ok = (
+                branch.dtype == torch.float32
+                and branch.shape[0] == 2
+                and branch.shape[1:] == stream.shape
+            )
+        else:
+            branch_ok = branch.dtype == torch.bfloat16 and branch.shape == stream.shape
         return (
-            branch.dtype == torch.bfloat16
+            branch_ok
             and branch_dtype == torch.bfloat16
             and stream.dtype == torch.float32
             and (router_dtype is None or router_dtype == torch.float32)
             and (pre_norm_dtype is None or pre_norm_dtype == torch.bfloat16)
-            and branch.dim() == 2
             and stream.dim() == 2
-            and branch.shape == stream.shape
             and branch.is_contiguous()
             and stream.is_contiguous()
         )
@@ -291,7 +310,8 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         fp8_out: bool = False,
     ):
         """Fused Triton implementation for the BF16/FP32 path. With ``fp8_out`` the pre-norm output also comes as
-        a per-row FP8 e4m3 copy + FP32 scales (two extra returns)."""
+        a per-row FP8 e4m3 copy + FP32 scales (two extra returns). ``branch`` may be the FP32 ``[2, M, H]`` split-K
+        partials of its GEMM, summed and rounded here as that GEMM's sum kernel would."""
         if branch.numel() == 0 or not self._triton_supported(
             stream, branch, branch_dtype, router_dtype, pre_norm_dtype
         ):
@@ -310,7 +330,7 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
 
             return (*res, *quantize_rows(res[0]))
 
-        M, H = branch.shape
+        M, H = stream.shape
 
         self._ensure_cached_weights(branch_dtype)
 
@@ -386,6 +406,7 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             self._cc_beta,
             self._post_norm.eps,
             self._pre_norm.eps,
+            M * H,
             H,
             block_h,
             self._post_norm_is_input_scale,
@@ -397,6 +418,7 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             pre_norm_dtype is torch.bfloat16,
             m_bucket,
             fp8_out,
+            2 if branch.dim() == 3 else 1,
             num_warps=num_warps,
             num_stages=num_stages,
             **extra,
