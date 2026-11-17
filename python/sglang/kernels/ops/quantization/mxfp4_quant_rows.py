@@ -8,6 +8,7 @@ run). Only those two parameters change here.
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
 
 @triton.jit(do_not_specialize=["M", "scaleM_pad"])
@@ -173,6 +174,34 @@ def _mxfp4_quant_rows(
         tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
 
 
+@triton.jit(do_not_specialize=["M"])
+def _mxfp4_quant_rows_wide(
+    x_ptr,
+    x_fp4_ptr,
+    bs_ptr,
+    M,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    QB: tl.constexpr,
+):
+    # BLOCK_M rows x QB MX blocks of a contiguous [M, N] input: 32 * QB contiguous columns per row.
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask = rows[:, None] < M
+    rows = rows.to(tl.int64)
+    cols = tl.program_id(1) * (32 * QB) + tl.arange(0, 32 * QB)
+    x = tl.load(x_ptr + rows[:, None] * N + cols[None, :], mask=mask).to(tl.float32)
+    x_fp4, bs_e8m0 = _mxfp4_quant_op(x, 32 * QB, BLOCK_M, 32)
+    fp4_cols = tl.program_id(1) * (16 * QB) + tl.arange(0, 16 * QB)
+    tl.store(x_fp4_ptr + rows[:, None] * (N // 2) + fp4_cols[None, :], x_fp4, mask=mask)
+    bs_cols = tl.program_id(1) * QB + tl.arange(0, QB)
+    tl.store(bs_ptr + rows[:, None] * (N // 32) + bs_cols[None, :], bs_e8m0, mask=mask)
+
+
+# 16 rows x 16 MX blocks per program. MI355X, 4096 columns: 4096 rows 20.1 -> 15.7 us,
+# 16384 rows 79.9 -> 59.6 us; equal below ~1k rows.
+WIDE_BLOCK_M, WIDE_QB = 16, 16
+
+
 def mxfp4_quant_rows(x: torch.Tensor):
     """[M, N] bf16 -> (fp4x2 [M, N/2], e8m0 [M, N/32]), identical to aiter dynamic_mxfp4_quant(x) unshuffled."""
     from aiter import dtypes
@@ -182,7 +211,11 @@ def mxfp4_quant_rows(x: torch.Tensor):
     x_fp4 = torch.empty((m, n // 2), dtype=torch.uint8, device=x.device)
     scale_n = n // 32
     bs = torch.empty((m, scale_n), dtype=torch.uint8, device=x.device)
-    if m:
+    if m and x.is_contiguous() and n % (32 * WIDE_QB) == 0:
+        _mxfp4_quant_rows_wide[(triton.cdiv(m, WIDE_BLOCK_M), n // (32 * WIDE_QB))](
+            x, x_fp4, bs, m, N=n, BLOCK_M=WIDE_BLOCK_M, QB=WIDE_QB, num_warps=4
+        )
+    elif m:
         _mxfp4_quant_rows[(triton.cdiv(m, 128), scale_n)](
             x,
             x_fp4,
