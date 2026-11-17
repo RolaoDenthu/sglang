@@ -69,6 +69,7 @@ from sglang.srt.configs.muse_spark import (
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -1990,6 +1991,21 @@ class MuseSpark1xModel(nn.Module):
                 and not sp.verify
                 else contextlib.nullcontext()
             )
+            # Sequence-parallel prefill: the captures go into one packed [shard rows, captures x hidden]
+            # BF16 block (AuxHiddenStatePacker), each cast straight into its slot, gathered once after the
+            # last layer. Sequence-parallel verify keeps the per-capture push-plane gathers.
+            sp_pack = (
+                AuxHiddenStatePacker(
+                    len(self.layers_to_capture),
+                    out=stream.new_empty(
+                        stream.shape[0],
+                        len(self.layers_to_capture) * stream.shape[1],
+                        dtype=torch.bfloat16,
+                    ),
+                )
+                if sp is not None and not sp.verify and self.layers_to_capture
+                else None
+            )
             with tuned:
                 for i, layer in enumerate(self.layers):
                     stream, attn_input, attn_input_fp8 = layer(
@@ -2003,15 +2019,27 @@ class MuseSpark1xModel(nn.Module):
                         attn_input_fp8=attn_input_fp8,
                     )
                     if i in self.layers_to_capture:
-                        aux_hidden_states.append(stream.to(torch.bfloat16))
+                        if sp_pack is not None:
+                            # the packer's next BF16 slot, written in place by the FP32 -> BF16 cast
+                            # (the meta tensor only gives slot() the capture's shape and dtype)
+                            sp_pack.slot(
+                                torch.empty(
+                                    stream.shape, dtype=torch.bfloat16, device="meta"
+                                )
+                            ).copy_(stream)
+                        else:
+                            aux_hidden_states.append(stream.to(torch.bfloat16))
             # == self.norm(norm_input).to(bf16) from the last boundary
             hidden_states = attn_input
             if sp is not None:
                 hidden_states = sp_gather(hidden_states, sp.num_tokens, push=sp.verify)
-                aux_hidden_states = [
-                    sp_gather(a, sp.num_tokens, push=sp.verify)
-                    for a in aux_hidden_states
-                ]
+                if sp_pack is not None:
+                    aux_hidden_states = sp_gather(sp_pack.finalize(), sp.num_tokens)
+                else:
+                    aux_hidden_states = [
+                        sp_gather(a, sp.num_tokens, push=sp.verify)
+                        for a in aux_hidden_states
+                    ]
         else:
             for i, layer in enumerate(self.layers):
                 stream = layer(positions, stream, forward_batch)
